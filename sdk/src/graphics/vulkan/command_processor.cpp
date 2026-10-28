@@ -2292,7 +2292,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   SCOPE_profile_cpu_f("gpu");
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(0);
-  const bool tiene_video_nativo = RexNativeVideoBeginSwap && RexNativeVideoBeginSwap();
+  const bool has_video_native = RexNativeVideoBeginSwap && RexNativeVideoBeginSwap();
 #endif
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -2308,7 +2308,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 #if REX_PLATFORM_SWITCH
   // Consume one marker per Swap, also when it carries no video. The guest work
   // is submitted first so that XDK events and callbacks are preserved.
-  if (tiene_video_nativo && RexNativeVideoPresent) {
+  if (has_video_native && RexNativeVideoPresent) {
     if (EndSubmission(true) &&
         RexNativeVideoPresent(GetVulkanDevice(),presenter,frontbuffer_width,frontbuffer_height)) return;
   }
@@ -4165,13 +4165,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   {
     // Draws per surface width (RB_SURFACE_INFO::surface_pitch): splits the work
     // among the game's passes by the size of their render target (1600 shadows,
-    // 1280 scene and post-processing, 640 reflection, 256 car cubemap). Counters
+    // 1280 scene and post-processing, 640 reflection, 256 cubemap). Counters
     // 28..32 of switch_perf.cpp.
-    const uint32_t ancho_superficie = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
-    RexSwitchPerfCount(ancho_superficie >= 1600   ? 28u
-                       : ancho_superficie >= 1280 ? 29u
-                       : ancho_superficie >= 640  ? 30u
-                       : ancho_superficie >= 256  ? 31u
+    const uint32_t surface_width = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    RexSwitchPerfCount(surface_width >= 1600   ? 28u
+                       : surface_width >= 1280 ? 29u
+                       : surface_width >= 640  ? 30u
+                       : surface_width >= 256  ? 31u
                                                   : 32u);
   }
 #endif

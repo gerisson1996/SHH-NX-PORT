@@ -64,7 +64,7 @@ SwitchWindowedAppContext& WindowSwitch::switch_app_context() const {
  */
 void WindowSwitch::QueryDisplayResolution(uint32_t& width_out, uint32_t& height_out) {
   const bool docked =
-      rex::ui::switch_saltynx::ModoBase(appletGetOperationMode() == AppletOperationMode_Console);
+      rex::ui::switch_saltynx::BaseMode(appletGetOperationMode() == AppletOperationMode_Console);
   s32 width = 0;
   s32 height = 0;
   if (R_SUCCEEDED(appletGetDefaultDisplayResolution(&width, &height)) && width > 0 && height > 0 &&
@@ -91,7 +91,7 @@ bool WindowSwitch::OpenImpl() {
   uint32_t width, height;
   QueryDisplayResolution(width, height);
   REXLOG_INFO("WindowSwitch: {} mode, display resolution {}x{}",
-              rex::ui::switch_saltynx::ModoBase(appletGetOperationMode() == AppletOperationMode_Console) ? "docked" : "handheld",
+              rex::ui::switch_saltynx::BaseMode(appletGetOperationMode() == AppletOperationMode_Console) ? "docked" : "handheld",
               width, height);
 
   // Actualize state for the common Window code. Listener dispatch is handled
@@ -187,51 +187,51 @@ void WindowSwitch::HandleCloseRequest() {
 namespace nx {
 
 // switch_imgui_input.h repeats these bits so it does not include switch.h.
-static_assert(kBotonA == HidNpadButton_A && kBotonB == HidNpadButton_B &&
-                  kBotonX == HidNpadButton_X && kBotonY == HidNpadButton_Y &&
-                  kBotonStickL == HidNpadButton_StickL && kBotonStickR == HidNpadButton_StickR &&
-                  kBotonL == HidNpadButton_L && kBotonR == HidNpadButton_R &&
-                  kBotonZL == HidNpadButton_ZL && kBotonZR == HidNpadButton_ZR &&
-                  kBotonPlus == HidNpadButton_Plus && kBotonMinus == HidNpadButton_Minus &&
-                  kBotonIzquierda == HidNpadButton_Left && kBotonArriba == HidNpadButton_Up &&
-                  kBotonDerecha == HidNpadButton_Right && kBotonAbajo == HidNpadButton_Down,
-              "switch_imgui_input.h: los bits no coinciden con HidNpadButton de libnx");
+static_assert(kButtonA == HidNpadButton_A && kButtonB == HidNpadButton_B &&
+                  kButtonX == HidNpadButton_X && kButtonY == HidNpadButton_Y &&
+                  kButtonStickL == HidNpadButton_StickL && kButtonStickR == HidNpadButton_StickR &&
+                  kButtonL == HidNpadButton_L && kButtonR == HidNpadButton_R &&
+                  kButtonZL == HidNpadButton_ZL && kButtonZR == HidNpadButton_ZR &&
+                  kButtonPlus == HidNpadButton_Plus && kButtonMinus == HidNpadButton_Minus &&
+                  kButtonLeft == HidNpadButton_Left && kButtonTop == HidNpadButton_Up &&
+                  kButtonRight == HidNpadButton_Right && kButtonBottom == HidNpadButton_Down,
+              "switch_imgui_input.h: the bits do not match libnx HidNpadButton");
 
-void LeerEntradaUi(EntradaUi& salida, float toque_a_logico_x, float toque_a_logico_y) {
+void ReadUiEntry(UiEntry& output, float touch_to_logical_x, float touch_to_logical_y) {
   // Only called by ImGuiDrawer::Draw, on the UI thread, so the state can be
   // static. The PadState is our own: the game's input driver reads its own from
   // the guest threads, and HID shared memory can be read from several threads at
   // once.
-  static bool preparado = false;
-  static PadState mando{};
-  if (!preparado) {
+  static bool prepared = false;
+  static PadState gamepad{};
+  if (!prepared) {
     // Reference-counted in libnx: the menu does not depend on the input driver
     // having started HID first.
     hidInitialize();
     hidInitializeTouchScreen();
-    padInitializeAny(&mando);
-    preparado = true;
+    padInitializeAny(&gamepad);
+    prepared = true;
   }
 
-  salida = EntradaUi{};
-  salida.por_posicion = REXCVAR_GET(input_xbox_layout);
-  padUpdate(&mando);
-  salida.mando_conectado = padIsConnected(&mando);
-  if (salida.mando_conectado) {
-    salida.botones = padGetButtons(&mando);
-    const HidAnalogStickState izquierdo = padGetStickPos(&mando, 0);
-    const HidAnalogStickState derecho = padGetStickPos(&mando, 1);
-    salida.stick_izq_x = izquierdo.x;
-    salida.stick_izq_y = izquierdo.y;
-    salida.stick_der_x = derecho.x;
-    salida.stick_der_y = derecho.y;
+  output = UiEntry{};
+  output.per_position = REXCVAR_GET(input_xbox_layout);
+  padUpdate(&gamepad);
+  output.connected_gamepad = padIsConnected(&gamepad);
+  if (output.connected_gamepad) {
+    output.buttons = padGetButtons(&gamepad);
+    const HidAnalogStickState left = padGetStickPos(&gamepad, 0);
+    const HidAnalogStickState right = padGetStickPos(&gamepad, 1);
+    output.stick_left_x = left.x;
+    output.stick_left_y = left.y;
+    output.stick_right_x = right.x;
+    output.stick_right_y = right.y;
   }
 
-  HidTouchScreenState toque{};
-  if (hidGetTouchScreenStates(&toque, 1) != 0 && toque.count > 0) {
-    salida.tocando = true;
-    salida.toque_x = float(toque.touches[0].x) * toque_a_logico_x;
-    salida.toque_y = float(toque.touches[0].y) * toque_a_logico_y;
+  HidTouchScreenState touch{};
+  if (hidGetTouchScreenStates(&touch, 1) != 0 && touch.count > 0) {
+    output.touching = true;
+    output.touch_x = float(touch.touches[0].x) * touch_to_logical_x;
+    output.touch_y = float(touch.touches[0].y) * touch_to_logical_y;
   }
 }
 

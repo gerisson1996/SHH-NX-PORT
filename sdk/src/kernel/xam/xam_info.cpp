@@ -28,6 +28,10 @@
 #include <fmt/format.h>
 #include <fmt/xchar.h>
 
+#include <rex/cvar.h>
+
+REXCVAR_DECLARE(uint32_t, user_language);  // defined in xam_user.cpp
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -182,20 +186,13 @@ u32 XGetGameRegion_entry() {
   return xeXGetGameRegion();
 }
 
+// sa2-nx: the system language is user_language (the app sets it from its "language" setting; on the Switch "auto"
+// follows the console's language). It was always English, whatever user_language said.
 u32 XGetLanguage_entry() {
-  auto desired_language = XLanguage::kEnglish;
-
-  // Switch the language based on game region.
-  // TODO(benvanik): pull from xex header.
-  uint32_t game_region = XEX_REGION_NTSCU;
-  if (game_region & XEX_REGION_NTSCU) {
-    desired_language = XLanguage::kEnglish;
-  } else if (game_region & XEX_REGION_NTSCJ) {
-    desired_language = XLanguage::kJapanese;
-  }
-  // Add more overrides?
-
-  return uint32_t(desired_language);
+  const uint32_t language = REXCVAR_GET(user_language);
+  return language > uint32_t(XLanguage::kInvalid) && language < uint32_t(XLanguage::kMaxLanguages)
+             ? language
+             : uint32_t(XLanguage::kEnglish);
 }
 
 u32 XamGetCurrentTitleId_entry() {

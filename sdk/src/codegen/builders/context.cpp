@@ -18,7 +18,11 @@
 #include <rex/logging.h>
 
 #include "../codegen_logging.h"
+#include "../ppc/disasm.h"
 #include <rex/system/export_resolver.h>
+
+#include <dis-asm.h>
+#include <ppc.h>
 
 namespace rex::codegen {
 
@@ -48,10 +52,28 @@ bool BuilderContext::localizeNonVolatiles() const {
   return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
 }
 
+// Same for r0, r2, r11, r12, f0 and v32-v63 (non_argument_as_local). A share_registers callee (an SEH
+// funclet, a fragment split off its owner) reads them from ctx, so it cannot keep them in locals; its
+// callers hand them over through ctx (emit_call_sharing_registers). So does a function that keeps only
+// these in ctx (keepsNonArgumentsInCtx: a callee that takes an argument in r11/r12 such as the stack
+// probe, or a caller that passes one through an indirect call such as the C++ EH dispatcher); its
+// callers hand them over too (emit_call_handing_non_arguments).
+bool BuilderContext::localizeNonArguments() const {
+  return config().nonArgumentRegistersAsLocalVariables && !fn.sharesRegisters() && !keepsNonArgumentsInCtx(fn);
+}
+
+// sa2-nx: non_argument_as_local_keep, and the save/restore helpers: __savegprlr_N / __savefpr_N store the
+// r12 their caller set up (the LR or a frame address), __restfpr_N and the vector helpers address through
+// r12 (and r11). Their calls are elided with non_volatile_as_local; without it they are real calls that
+// must find these arguments in ctx.
+bool BuilderContext::keepsNonArgumentsInCtx(const FunctionNode& function) const {
+  const auto& name = function.name();
+  return config().nonArgumentKeep.count(function.base()) != 0 || name.rfind("__save", 0) == 0 ||
+         name.rfind("__rest", 0) == 0;
+}
+
 std::string BuilderContext::r(size_t index) {
-  const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables &&
-       (index == 0 || index == 2 || index == 11 || index == 12)) ||
+  if ((localizeNonArguments() && (index == 0 || index == 2 || index == 11 || index == 12)) ||
       (localizeNonVolatiles() && index >= 14)) {
     locals.r[index] = true;
     return fmt::format("r{}", index);
@@ -60,9 +82,7 @@ std::string BuilderContext::r(size_t index) {
 }
 
 std::string BuilderContext::f(size_t index) {
-  const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
-      (localizeNonVolatiles() && index >= 14)) {
+  if ((localizeNonArguments() && index == 0) || (localizeNonVolatiles() && index >= 14)) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
   }
@@ -70,8 +90,7 @@ std::string BuilderContext::f(size_t index) {
 }
 
 std::string BuilderContext::v(size_t index) {
-  const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+  if ((localizeNonArguments() && (index >= 32 && index <= 63)) ||
       (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
@@ -114,6 +133,11 @@ const char* BuilderContext::reserved() {
 const char* BuilderContext::temp() {
   locals.temp = true;
   return "temp";
+}
+
+std::string BuilderContext::f_bits(size_t index) {
+  locals.f_bits[index] = true;
+  return fmt::format("fb{}", index);
 }
 
 const char* BuilderContext::v_temp() {
@@ -184,10 +208,15 @@ void BuilderContext::emit_function_call(uint32_t address) {
   if (address == cfg.setJmpAddress) {
     // Save PPCContext for restoration after longjmp
     println("\t{} = ctx;", env());
+    // Registers kept in C++ locals (cr/ctr/xer_as_local, non_volatile_as_local, ...) are not in ctx: copy them
+    // into env as well and take them back after a longjmp (from banjo-nx). The guest's longjmp gives the setjmp
+    // caller its registers as they were at the setjmp; C++ leaves a local that changed in between indeterminate.
+    // The full set of locals is known only at the end of the function, so FunctionGraph fills in the markers.
+    println("\t{}", kSetjmpSaveLocalsMarker);
     // Use custom ppc_setjmp that uses guest address as key
     println("\t{}.s64 = ppc_setjmp({}.u32);", temp(), r(3));
     // Restore PPCContext if returning from longjmp
-    println("\tif ({}.s64 != 0) ctx = {};", temp(), env());
+    println("\tif ({}.s64 != 0) {{ ctx = {}; {} }}", temp(), env(), kSetjmpRestoreLocalsMarker);
     println("\t{} = {};", r(3), temp());
     return;
   }
@@ -221,6 +250,19 @@ void BuilderContext::emit_function_call(uint32_t address) {
           if (edge.site == base)
             isTail = true;
         emit_call_sharing_registers(fmt::format("{}(ctx, base);", name), !isTail, "\t");
+        return;
+      }
+
+      // A callee that keeps r0/r2/r11/r12/f0/v32-v63 in ctx (non_argument_as_local_keep, or a
+      // save/restore helper that is not elided) reads its argument there and leaves its results
+      // there: hand over the localized ones, and take them back after a bl.
+      if (keepsNonArgumentsInCtx(*targetFn) && localizeNonArguments()) {
+        emitCtx.reference(name);
+        bool isTail = false;
+        for (const auto& edge : fn.tailCalls())
+          if (edge.site == base)
+            isTail = true;
+        emit_call_handing_non_arguments(fmt::format("{}(ctx, base);", name), !isTail, "\t");
         return;
       }
 
@@ -278,8 +320,8 @@ bool BuilderContext::localizesAnything() const {
   if (fn.sharesRegisters())
     return false;
   const auto& cfg = config();
-  return cfg.nonVolatileRegistersAsLocalVariables || cfg.crRegistersAsLocalVariables ||
-         cfg.ctrAsLocalVariable || cfg.xerAsLocalVariable;
+  return cfg.nonVolatileRegistersAsLocalVariables || cfg.nonArgumentRegistersAsLocalVariables ||
+         cfg.crRegistersAsLocalVariables || cfg.ctrAsLocalVariable || cfg.xerAsLocalVariable;
 }
 
 void BuilderContext::emit_call_sharing_registers(const std::string& call, bool copyBack,
@@ -291,15 +333,17 @@ void BuilderContext::emit_call_sharing_registers(const std::string& call, bool c
   // Every register the callee may read: those this function has localized so far. A
   // fragment reads what its owner set up, and the owner set it up before jumping. Copying
   // only those keeps the cost down on indirect tail jumps, which all go through here.
+  // With non_argument_as_local that includes r0, r2, r11, r12, f0 and v32-v63: the callee reads
+  // them as arguments, and a bl caller takes back whatever the callee leaves in them.
   std::vector<std::string> regs;
-  for (size_t i = 14; i < 32; ++i)
+  for (size_t i = 0; i < 32; ++i)
     if (locals.r[i])
       regs.push_back(r(i));
-  for (size_t i = 14; i < 32; ++i)
+  for (size_t i = 0; i < 32; ++i)
     if (locals.f[i])
       regs.push_back(f(i));
-  for (size_t i = 14; i < 128; ++i)
-    if ((i < 32 || i >= 64) && locals.v[i])
+  for (size_t i = 0; i < 128; ++i)
+    if (locals.v[i])
       regs.push_back(v(i));
   for (size_t i = 0; i < 8; ++i)
     if (locals.cr[i])
@@ -320,6 +364,37 @@ void BuilderContext::emit_call_sharing_registers(const std::string& call, bool c
   for (const auto& reg : regs) {
     const bool back = copyBack && (reg[0] == 'r' || reg[0] == 'f' || reg[0] == 'v');
     if (back)
+      println("{}\t{} = ctx.{};", indent, reg, reg);
+    println("{}\tctx.{} = s_{};", indent, reg, reg);
+  }
+  println("{}}}", indent);
+}
+
+void BuilderContext::emit_call_handing_non_arguments(const std::string& call, bool copyBack,
+                                                     const char* indent) {
+  // The localized ones so far, as in emit_call_sharing_registers: a value the callee reads here was
+  // set up before the call (`li r12,-N` / `addi r12,r31,N` right before the bl).
+  std::vector<std::string> regs;
+  if (localizeNonArguments()) {
+    for (size_t i : {size_t(0), size_t(2), size_t(11), size_t(12)})
+      if (locals.r[i])
+        regs.push_back(r(i));
+    if (locals.f[0])
+      regs.push_back(f(0));
+    for (size_t i = 32; i < 64; ++i)
+      if (locals.v[i])
+        regs.push_back(v(i));
+  }
+  if (regs.empty()) {
+    println("{}{}", indent, call);
+    return;
+  }
+  println("{}{{", indent);
+  for (const auto& reg : regs)
+    println("{}\tconst auto s_{} = ctx.{}; ctx.{} = {};", indent, reg, reg, reg, reg);
+  println("{}\t{}", indent, call);
+  for (const auto& reg : regs) {
+    if (copyBack)
       println("{}\t{} = ctx.{};", indent, reg, reg);
     println("{}\tctx.{} = s_{};", indent, reg, reg);
   }
@@ -351,6 +426,9 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
           if (targetFn->sharesRegisters())
             emit_call_sharing_registers(fmt::format("{}(ctx, base);", targetFn->name()), false,
                                         "\t\t");
+          else if (keepsNonArgumentsInCtx(*targetFn))
+            emit_call_handing_non_arguments(fmt::format("{}(ctx, base);", targetFn->name()), false,
+                                            "\t\t");
           else
             println("\t\t{}(ctx, base);", targetFn->name());
           println("\t\treturn;");
@@ -392,6 +470,458 @@ void BuilderContext::emit_set_flush_mode(bool enable) {
 
     csrState = newState;
   }
+}
+
+void BuilderContext::emit_flush_mode_for_move() {
+  if (!config().fpMovesModeless) {
+    emit_set_flush_mode(false);
+  }
+}
+
+bool BuilderContext::single_conversion_any_mode() {
+  if (config().fpMovesModeless) {
+    if (config().fpModeLookahead) {
+      if (conversion_prefers_any_mode()) {
+        return true;
+      }
+    } else if (csrState == CSRState::VMX) {
+      return true;
+    }
+  }
+  emit_set_flush_mode(false);
+  return false;
+}
+
+namespace {
+bool IsSingleLoad(const ppc_insn& insn) {
+  return insn.opcode != nullptr && (insn.opcode->id == PPC_INST_LFS || insn.opcode->id == PPC_INST_LFSX);
+}
+bool IsSingleStore(const ppc_insn& insn) {
+  return insn.opcode != nullptr && (insn.opcode->id == PPC_INST_STFS || insn.opcode->id == PPC_INST_STFSX);
+}
+}  // namespace
+
+namespace {
+constexpr uint32_t kFloatCopyReach = 64;  // how far back a store looks for its load
+
+// An instruction that touches no float or vector register and no float status, and is no branch, call, system call
+// or trap. By the mnemonic: every PowerPC float instruction starts with f, lf, stf, mff or mtf, every vector one
+// with v, lv, stv, mfv or mtv, every branch with b; sc, tw and td are the system call and the traps. Anything
+// unknown does not qualify.
+bool IsPlainIntegerInstruction(const ppc_insn& insn) {
+  if (insn.opcode == nullptr || insn.opcode->name == nullptr) {
+    return false;
+  }
+  const std::string_view name = insn.opcode->name;
+  for (const std::string_view prefix : {"f", "lf", "stf", "mff", "mtf", "v", "lv", "stv", "mfv", "mtv", "b", "sc",
+                                         "tw", "td"}) {
+    if (name.substr(0, prefix.size()) == prefix) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// fp_copy_pairs: the address of the lfs / lfsx whose bits the stfs / stfsx at `store` (its word at `storeData`)
+// writes, or 0. Going back from the store inside its block: the first instruction that writes the store's register
+// must be an lfs / lfsx of it; before that only other lfs / lfsx / stfs / stfsx (they write their own register or
+// none) and plain integer instructions. No label after the load up to the store (a jump would arrive without the
+// load), no mid-asm hook from the load to the store (it could change the register).
+//
+// banjo-nx (fp_copy_forwarding): other instructions may stand between as well, unless they write the store's register
+// or branch; an fneg / fabs / fnabs of the register in place is followed through, and `sign` receives what the
+// sign operations do to the single's bits: (bits & keep) ^ flip.
+bool StartsWith(std::string_view name, std::string_view prefix) {
+  return name.substr(0, prefix.size()) == prefix;
+}
+
+uint32_t FloatCopyLoadOf(const BuilderContext& ctx, uint32_t store, const uint32_t* storeData,
+                         FloatCopySign* sign = nullptr) {
+  if (!ctx.config().fpCopyPairs || ctx.labels == nullptr) {
+    return 0;
+  }
+  const bool forwarding = ctx.config().fpCopyForwarding;
+  FloatCopySign ops;
+  ppc_insn self;
+  rex::codegen::ppc::Disassemble(storeData, 4, store, self);
+  const auto& hooks = ctx.config().midAsmHooks;
+  if (!IsSingleStore(self) || hooks.find(store) != hooks.end() ||
+      ctx.labels->find(store) != ctx.labels->end()) {
+    return 0;
+  }
+  uint32_t start = 0xFFFFFFFFu;
+  for (const auto& block : ctx.fn.blocks()) {
+    if (store >= block.base && store < block.end()) {
+      start = block.base;
+      break;
+    }
+  }
+  uint32_t address = store - 4;
+  const uint32_t* p = storeData - 1;
+  for (uint32_t n = 0; address >= start && address < store && n < kFloatCopyReach; ++n, --p, address -= 4) {
+    if (hooks.find(address) != hooks.end()) {
+      return 0;
+    }
+    ppc_insn previous;
+    rex::codegen::ppc::Disassemble(p, 4, address, previous);
+    if (IsSingleLoad(previous)) {
+      if (previous.operands[0] == self.operands[0]) {
+        if (sign) {
+          *sign = ops;
+        }
+        return address;  // a label AT the load is fine: whoever jumps there runs the load
+      }
+    } else if (forwarding) {
+      if (previous.opcode == nullptr || previous.opcode->name == nullptr) {
+        return 0;
+      }
+      const std::string_view name = previous.opcode->name;
+      if (StartsWith(name, "b") || StartsWith(name, "sc") || StartsWith(name, "tw") || StartsWith(name, "td")) {
+        return 0;
+      }
+      // The instructions that write a float register write their first operand: every f* but the compares, every
+      // lf*, mffs. (Stores, mtfsf / mtfsb, vector and integer instructions write none.)
+      const bool fpr_write =
+          (StartsWith(name, "f") && !StartsWith(name, "fcmp")) || StartsWith(name, "lf") || StartsWith(name, "mffs");
+      if (fpr_write && previous.operands[0] == self.operands[0]) {
+        uint32_t keep, flip;
+        if (StartsWith(name, "fneg")) {
+          keep = 0xFFFFFFFFu, flip = 0x80000000u;
+        } else if (StartsWith(name, "fabs")) {
+          keep = 0x7FFFFFFFu, flip = 0;
+        } else if (StartsWith(name, "fnabs")) {
+          keep = 0x7FFFFFFFu, flip = 0x80000000u;
+        } else {
+          return 0;
+        }
+        if (previous.operands[1] != self.operands[0]) {
+          return 0;  // from another register
+        }
+        // This operation comes before the ones found so far: those apply to its result.
+        ops = FloatCopySign{keep & ops.keep, (flip & ops.keep) ^ ops.flip};
+      }
+    } else if (!IsSingleStore(previous) && !IsPlainIntegerInstruction(previous)) {
+      return 0;
+    }
+    if (ctx.labels->find(address) != ctx.labels->end()) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+// fp_copy_forwarding: whether a store after the load at `base` in its block writes the bits it loads (the store's
+// own test, FloatCopyLoadOf, names this load).
+bool FeedsCopyStore(const BuilderContext& ctx, uint32_t load, const uint32_t* loadData) {
+  uint32_t end = 0;
+  for (const auto& block : ctx.fn.blocks()) {
+    if (load >= block.base && load < block.end()) {
+      end = block.end();
+      break;
+    }
+  }
+  const uint32_t* p = loadData + 1;
+  for (uint32_t address = load + 4, n = 0; address < end && n < kFloatCopyReach; address += 4, ++p, ++n) {
+    ppc_insn next;
+    rex::codegen::ppc::Disassemble(p, 4, address, next);
+    if (IsSingleStore(next) && FloatCopyLoadOf(ctx, address, p) == load) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+bool BuilderContext::float_copy_pair_load() const {
+  if (!config().fpCopyPairs || !IsSingleLoad(insn) || has_mid_asm_hook()) {
+    return false;
+  }
+  // fp_copy_forwarding: also whenever one of its stores takes the form (they need the bits local).
+  return float_copy_pair_pays() || (config().fpCopyForwarding && FeedsCopyStore(*this, base, data));
+}
+
+bool BuilderContext::float_copy_pair_store(FloatCopySign* sign) const {
+  // Its load took the copy form: the tracked mode can only have become FPU between the two (nothing there sets
+  // VMX mode or forgets the mode), and then this store does not take the form either. fp_copy_forwarding: any mode;
+  // the load takes the form because this store names it (FeedsCopyStore).
+  return config().fpCopyPairs && (float_copy_pair_pays() || config().fpCopyForwarding) &&
+         FloatCopyLoadOf(*this, base, data, sign) != 0;
+}
+
+void BuilderContext::emit_flush_mode_for_modeless() {
+  if (!config().fpComparesModeless) {
+    emit_set_flush_mode(false);
+  }
+}
+
+namespace {
+enum class FloatKind { kOther, kBranch, kVmx, kFpuOnly, kSingleArithmetic };
+
+// What an instruction asks of the flush mode. The lists are the builders that call emit_set_flush_mode(true)
+// (vector.cpp) and emit_set_flush_mode(false) (floating_point.cpp); fsel, fcfid, fctiwz and fctidz need no mode
+// with fp_compares_modeless, which fp_mode_lookahead builds on.
+FloatKind ClassifyFloat(const ppc_insn& insn) {
+  if (insn.opcode == nullptr) {
+    return FloatKind::kOther;
+  }
+  switch (insn.opcode->id) {
+    case PPC_INST_VADDFP:
+    case PPC_INST_VADDFP128:
+    case PPC_INST_VCFPSXWS128:
+    case PPC_INST_VCFPUXWS128:
+    case PPC_INST_VCFSX:
+    case PPC_INST_VCFUX:
+    case PPC_INST_VCMPBFP:
+    case PPC_INST_VCMPBFP128:
+    case PPC_INST_VCMPEQFP:
+    case PPC_INST_VCMPEQFP128:
+    case PPC_INST_VCMPGEFP:
+    case PPC_INST_VCMPGEFP128:
+    case PPC_INST_VCMPGTFP:
+    case PPC_INST_VCMPGTFP128:
+    case PPC_INST_VCSXWFP128:
+    case PPC_INST_VCTSXS:
+    case PPC_INST_VCTUXS:
+    case PPC_INST_VCUXWFP128:
+    case PPC_INST_VEXPTEFP:
+    case PPC_INST_VEXPTEFP128:
+    case PPC_INST_VLOGEFP:
+    case PPC_INST_VLOGEFP128:
+    case PPC_INST_VMADDCFP128:
+    case PPC_INST_VMADDFP:
+    case PPC_INST_VMADDFP128:
+    case PPC_INST_VMAXFP:
+    case PPC_INST_VMAXFP128:
+    case PPC_INST_VMINFP:
+    case PPC_INST_VMINFP128:
+    case PPC_INST_VMSUM3FP128:
+    case PPC_INST_VMSUM4FP128:
+    case PPC_INST_VMULFP128:
+    case PPC_INST_VNMSUBFP:
+    case PPC_INST_VNMSUBFP128:
+    case PPC_INST_VPKD3D128:
+    case PPC_INST_VREFP:
+    case PPC_INST_VREFP128:
+    case PPC_INST_VRFIM:
+    case PPC_INST_VRFIM128:
+    case PPC_INST_VRFIN:
+    case PPC_INST_VRFIN128:
+    case PPC_INST_VRFIP:
+    case PPC_INST_VRFIP128:
+    case PPC_INST_VRFIZ:
+    case PPC_INST_VRFIZ128:
+    case PPC_INST_VRSQRTEFP:
+    case PPC_INST_VRSQRTEFP128:
+    case PPC_INST_VSUBFP:
+    case PPC_INST_VSUBFP128:
+      return FloatKind::kVmx;
+    case PPC_INST_FADD:
+    case PPC_INST_FCTID:
+    case PPC_INST_FCTIW:
+    case PPC_INST_FDIV:
+    case PPC_INST_FMADD:
+    case PPC_INST_FMADDS:
+    case PPC_INST_FMSUB:
+    case PPC_INST_FMSUBS:
+    case PPC_INST_FMUL:
+    case PPC_INST_FNMADD:
+    case PPC_INST_FNMADDS:
+    case PPC_INST_FNMSUB:
+    case PPC_INST_FNMSUBS:
+    case PPC_INST_FRES:
+    case PPC_INST_FRSQRTE:
+    case PPC_INST_FSQRT:
+    case PPC_INST_FSQRTS:
+    case PPC_INST_FSUB:
+      return FloatKind::kFpuOnly;
+    case PPC_INST_FADDS:
+    case PPC_INST_FSUBS:
+    case PPC_INST_FMULS:
+    case PPC_INST_FDIVS:
+      return FloatKind::kSingleArithmetic;
+    default:
+      break;
+  }
+  // Every PowerPC branch mnemonic starts with 'b' (b, bl, bc*, beq..., blr, bctr, bctrl, bdnz...), and nothing else does.
+  return insn.opcode->name != nullptr && insn.opcode->name[0] == 'b' ? FloatKind::kBranch : FloatKind::kOther;
+}
+}  // namespace
+
+BuilderContext::FloatDemand BuilderContext::next_float_demand() const {
+  uint32_t end = 0;
+  for (const auto& block : fn.blocks()) {
+    if (base >= block.base && base < block.end()) {
+      end = block.end();
+      break;
+    }
+  }
+  // The scalar single operations in a row, this instruction included when it is one: the third one makes the run a
+  // switch to FPU mode (two mode writes for the run cost less than three or more operations with their checks).
+  uint32_t run = ClassifyFloat(insn) == FloatKind::kSingleArithmetic ? 1 : 0;
+  const uint32_t* p = data + 1;
+  uint32_t address = base + 4;
+  for (uint32_t n = 0; address < end && n < 24; ++n, ++p, address += 4) {
+    ppc_insn next;
+    rex::codegen::ppc::Disassemble(p, 4, address, next);
+    switch (ClassifyFloat(next)) {
+      case FloatKind::kVmx:
+        return FloatDemand::kVmx;
+      case FloatKind::kFpuOnly:
+        return FloatDemand::kFpu;
+      case FloatKind::kSingleArithmetic:
+        if (++run > 2) {
+          return FloatDemand::kFpu;
+        }
+        break;
+      case FloatKind::kBranch:
+        return FloatDemand::kNone;
+      case FloatKind::kOther:
+        break;
+    }
+  }
+  return FloatDemand::kNone;
+}
+
+namespace {
+// What a function's float instructions ask of the mode, counted once per function (the builders run function by
+// function on one thread).
+struct FloatProfile {
+  uint32_t base = 0xFFFFFFFFu;
+  uint32_t vmx = 0;           // VMX float instructions
+  uint32_t fpu = 0;           // scalar instructions that need FPU mode (arithmetic, with or without any-mode forms)
+  uint32_t convertible = 0;   // lfs / stfs forms, frsp, fcmpu / fcmpo
+  uint32_t copies = 0;        // ... of those, lfs / lfsx and stores of loaded bits (fp_copy_pairs)
+  uint32_t copy_stores = 0;   // ... of those, the stores
+};
+
+bool IsConvertible(const ppc_insn& insn) {
+  if (insn.opcode == nullptr) {
+    return false;
+  }
+  switch (insn.opcode->id) {
+    case PPC_INST_LFS:
+    case PPC_INST_LFSU:
+    case PPC_INST_LFSUX:
+    case PPC_INST_LFSX:
+    case PPC_INST_STFS:
+    case PPC_INST_STFSU:
+    case PPC_INST_STFSUX:
+    case PPC_INST_STFSX:
+    case PPC_INST_FRSP:
+    case PPC_INST_FCMPU:
+    case PPC_INST_FCMPO:
+      return true;
+    default:
+      return false;
+  }
+}
+
+const FloatProfile& ProfileOf(const BuilderContext& ctx) {
+  static thread_local FloatProfile profile;
+  if (profile.base == ctx.fn.base()) {
+    return profile;
+  }
+  profile = FloatProfile{};
+  profile.base = ctx.fn.base();
+  for (const auto& block : ctx.fn.blocks()) {
+    const auto* p = reinterpret_cast<const uint32_t*>(ctx.emitCtx.binary.translate(block.base));
+    if (p == nullptr) {
+      continue;
+    }
+    for (uint32_t address = block.base; address < block.end(); address += 4, ++p) {
+      ppc_insn other;
+      rex::codegen::ppc::Disassemble(p, 4, address, other);
+      switch (ClassifyFloat(other)) {
+        case FloatKind::kVmx:
+          ++profile.vmx;
+          break;
+        case FloatKind::kFpuOnly:
+        case FloatKind::kSingleArithmetic:
+          ++profile.fpu;
+          break;
+        default:
+          if (IsConvertible(other)) {
+            ++profile.convertible;
+            if (IsSingleLoad(other)) {
+              if (ctx.config().midAsmHooks.find(address) == ctx.config().midAsmHooks.end()) {
+                ++profile.copies;
+              }
+            } else if (FloatCopyLoadOf(ctx, address, p) != 0) {
+              ++profile.copies;
+              ++profile.copy_stores;
+            }
+          }
+          break;
+      }
+    }
+  }
+  return profile;
+}
+}  // namespace
+
+bool BuilderContext::function_has_vmx_float() const {
+  return ProfileOf(*this).vmx != 0;
+}
+
+bool BuilderContext::function_is_copy_only() const {
+  const FloatProfile& profile = ProfileOf(*this);
+  return profile.fpu == 0 && profile.copy_stores != 0 && profile.convertible == profile.copies;
+}
+
+bool BuilderContext::float_copy_pair_pays() const {
+  return csrState == CSRState::VMX ||
+         (config().fpCopyOnlyFunctions && csrState == CSRState::Unknown && function_is_copy_only());
+}
+
+bool BuilderContext::function_is_mode_free() const {
+  const FloatProfile& profile = ProfileOf(*this);
+  return profile.fpu == 0 && profile.convertible <= 8;
+}
+
+bool BuilderContext::conversion_prefers_any_mode() const {
+  if (csrState == CSRState::FPU) {
+    return false;  // the plain form is free
+  }
+  switch (next_float_demand()) {
+    case FloatDemand::kVmx:
+      return true;
+    case FloatDemand::kFpu:
+      return false;  // the switch or check is needed anyway: taken here, this instruction stays plain
+    case FloatDemand::kNone:
+      break;
+  }
+  // Nothing that needs a mode before the next branch. VMX mode known to be current: the plain form would switch off
+  // here for certain (fp_moves_modeless's own rule). Otherwise the any-mode form is a bet on a switch that may come
+  // later (fp_mode_lookahead_past_branch; see config.h for what it cost in a mostly scalar game).
+  if (csrState == CSRState::VMX) {
+    return true;
+  }
+  return config().fpModeLookaheadPastBranch && (function_has_vmx_float() || function_is_mode_free());
+}
+
+bool BuilderContext::compare_any_mode() {
+  if (config().fpComparesModeless) {
+    if (config().fpModeLookahead) {
+      if (conversion_prefers_any_mode()) {
+        return true;
+      }
+    } else if (csrState == CSRState::VMX) {
+      return true;
+    }
+  }
+  emit_set_flush_mode(false);
+  return false;
+}
+
+bool BuilderContext::arithmetic_any_mode() {
+  if (config().fpModeLookahead && csrState != CSRState::FPU) {
+    const FloatDemand next = next_float_demand();
+    if (next == FloatDemand::kVmx || (next == FloatDemand::kNone && csrState == CSRState::VMX)) {
+      return true;
+    }
+  }
+  emit_set_flush_mode(false);
+  return false;
 }
 
 bool BuilderContext::has_mid_asm_hook() const {
@@ -541,24 +1071,33 @@ void BuilderContext::emit_vec_var_shift(const char* shift_dir, const char* eleme
 // Memory (Load/Store) Code Generation Helpers
 //=============================================================================
 
+std::string BuilderContext::d_form_args(std::string& macro, bool mmio) {
+  const uint32_t rA = insn.operands[2];
+  const int32_t disp = static_cast<int32_t>(insn.operands[1]);
+  const bool split = config().dformDispSplit && !mmio && rA != 0 &&
+                     (macro.rfind("REX_LOAD_U", 0) == 0 || macro.rfind("REX_STORE_U", 0) == 0);
+  if (split) {
+    macro.insert(macro.find('_', 4) + 1, "D_");  // REX_LOAD_U32 -> REX_LOAD_D_U32
+    return fmt::format("{}.u32, {}", r(rA), disp);
+  }
+  if (rA != 0)
+    return fmt::format("{}.u32 + {}", r(rA), disp);
+  return fmt::format("{}", disp);
+}
+
 void BuilderContext::emit_load_d_form(const char* load_macro, const char* dest_type,
                                       bool check_mmio) {
   // D-form: rD = LOAD(rA + D) where operands[0]=rD, operands[1]=D, operands[2]=rA
   // load_macro should be like "REX_LOAD_U8" - we replace REX_LOAD with REX_MM_LOAD for MMIO
-  const char* macro = load_macro;
-  static char mm_macro[64];
-  if (check_mmio && mmio_check_d_form()) {
+  std::string macro = load_macro;
+  const bool mmio = check_mmio && mmio_check_d_form();
+  if (mmio) {
     // Replace "REX_LOAD_" with "REX_MM_LOAD_"
-    if (strncmp(load_macro, "REX_LOAD_", 9) == 0) {
-      snprintf(mm_macro, sizeof(mm_macro), "REX_MM_LOAD_%s", load_macro + 9);
-      macro = mm_macro;
-    }
+    if (strncmp(load_macro, "REX_LOAD_", 9) == 0)
+      macro = std::string("REX_MM_LOAD_") + (load_macro + 9);
   }
-
-  print("\t{}.{} = {}(", r(insn.operands[0]), dest_type, macro);
-  if (insn.operands[2] != 0)
-    print("{}.u32 + ", r(insn.operands[2]));
-  println("{});", static_cast<int32_t>(insn.operands[1]));
+  const std::string args = d_form_args(macro, mmio);
+  println("\t{}.{} = {}({});", r(insn.operands[0]), dest_type, macro, args);
 }
 
 void BuilderContext::emit_load_x_form(const char* load_macro, const char* dest_type,
@@ -585,20 +1124,15 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
                                        bool check_mmio) {
   // D-form: STORE(rA + D, rS) where operands[0]=rS, operands[1]=D, operands[2]=rA
   // store_macro should be like "REX_STORE_U8" - we replace REX_STORE with REX_MM_STORE for MMIO
-  const char* macro = store_macro;
-  static char mm_macro[64];
-  if (check_mmio && mmio_check_d_form()) {
+  std::string macro = store_macro;
+  const bool mmio = check_mmio && mmio_check_d_form();
+  if (mmio) {
     // Replace "REX_STORE_" with "REX_MM_STORE_"
-    if (strncmp(store_macro, "REX_STORE_", 10) == 0) {
-      snprintf(mm_macro, sizeof(mm_macro), "REX_MM_STORE_%s", store_macro + 10);
-      macro = mm_macro;
-    }
+    if (strncmp(store_macro, "REX_STORE_", 10) == 0)
+      macro = std::string("REX_MM_STORE_") + (store_macro + 10);
   }
-
-  print("\t{}(", macro);
-  if (insn.operands[2] != 0)
-    print("{}.u32 + ", r(insn.operands[2]));
-  println("{}, {}.{});", static_cast<int32_t>(insn.operands[1]), r(insn.operands[0]), src_type);
+  const std::string args = d_form_args(macro, mmio);
+  println("\t{}({}, {}.{});", macro, args, r(insn.operands[0]), src_type);
 }
 
 void BuilderContext::emit_store_x_form(const char* store_macro, const char* src_type,

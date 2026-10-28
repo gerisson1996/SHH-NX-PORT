@@ -43,19 +43,19 @@ using Ctx = rex::thread::Fiber::Context;
 
 // The assembly below indexes by fixed offset. If someone reorders Context, this
 // fails at compile time instead of corrupting the stack at run time.
-static_assert(offsetof(Ctx, x19) == 0, "Context: x19 movido");
-static_assert(offsetof(Ctx, x21) == 16, "Context: x21 movido");
-static_assert(offsetof(Ctx, x23) == 32, "Context: x23 movido");
-static_assert(offsetof(Ctx, x25) == 48, "Context: x25 movido");
-static_assert(offsetof(Ctx, x27) == 64, "Context: x27 movido");
-static_assert(offsetof(Ctx, fp) == 80, "Context: fp movido");
-static_assert(offsetof(Ctx, lr) == 88, "Context: lr movido");
-static_assert(offsetof(Ctx, sp) == 96, "Context: sp movido");
-static_assert(offsetof(Ctx, d8) == 104, "Context: d8 movido");
-static_assert(offsetof(Ctx, d10) == 120, "Context: d10 movido");
-static_assert(offsetof(Ctx, d12) == 136, "Context: d12 movido");
-static_assert(offsetof(Ctx, d14) == 152, "Context: d14 movido");
-static_assert(sizeof(Ctx) == 168, "Context: tamano cambiado");
+static_assert(offsetof(Ctx, x19) == 0, "Context: x19 moved");
+static_assert(offsetof(Ctx, x21) == 16, "Context: x21 moved");
+static_assert(offsetof(Ctx, x23) == 32, "Context: x23 moved");
+static_assert(offsetof(Ctx, x25) == 48, "Context: x25 moved");
+static_assert(offsetof(Ctx, x27) == 64, "Context: x27 moved");
+static_assert(offsetof(Ctx, fp) == 80, "Context: fp moved");
+static_assert(offsetof(Ctx, lr) == 88, "Context: lr moved");
+static_assert(offsetof(Ctx, sp) == 96, "Context: sp moved");
+static_assert(offsetof(Ctx, d8) == 104, "Context: d8 moved");
+static_assert(offsetof(Ctx, d10) == 120, "Context: d10 moved");
+static_assert(offsetof(Ctx, d12) == 136, "Context: d12 moved");
+static_assert(offsetof(Ctx, d14) == 152, "Context: d14 moved");
+static_assert(sizeof(Ctx) == 168, "Context: size changed");
 
 }  // namespace
 
@@ -156,7 +156,7 @@ void Fiber::Destroy() {
   if (is_thread_fiber_) {
     tls_current_ = nullptr;
   } else {
-    assert(this != tls_current_ && "Destroy sobre la fibra que esta corriendo");
+    assert(this != tls_current_ && "Destroy on the fiber that is running");
   }
   delete this;
 }
@@ -170,7 +170,7 @@ extern "C" [[noreturn]] void rex_fiber_trampoline(void) {
   f->entry_(f->arg_);
   // entry_ must not return: there is no context to go back to, this fiber's
   // stack ends here.
-  assert(false && "la funcion de entrada de una fibra ha vuelto");
+  assert(false && "the entry function of a fiber has returned");
   std::abort();
 }
 

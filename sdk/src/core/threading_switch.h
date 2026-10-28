@@ -55,7 +55,7 @@ extern "C" {
 typedef uint32_t RexSwitchHandle;
 #define REX_SWITCH_INVALID_HANDLE ((RexSwitchHandle)0)
 
-/* --- conjuntos de CPU -------------------------------------------------- */
+/* --- CPU sets ---------------------------------------------------------- */
 
 /*
  * The Switch has 4 cores; core 3 is reserved by the system except in title
@@ -160,6 +160,14 @@ bool RexSwitchSetCurrentThreadPriorityOk(int priority);
 bool RexSwitchSetCurrentThreadCore(int core);
 
 /*
+ * sa2-nx (2026-10-20): the calling thread's core mask (the process's cores only) with 'preferred' as its preferred
+ * core (one of the mask's). False if the kernel refuses it or the mask leaves none of the process's cores.
+ */
+bool RexSwitchSetCurrentThreadMask(int preferred, unsigned long long mask);
+/* sa2-nx (2026-10-20): the same for another registered thread, by its pthread (Thread::native_handle()). */
+bool RexSwitchSetThreadMaskOf(void* native_handle, int preferred, unsigned long long mask);
+
+/*
  * The real pin: besides preferring that core, it forbids the others. More dangerous than
  * RexSwitchSetCurrentThreadCore (if that core saturates, the thread does not run). Returns whether
  * it was accepted.
@@ -168,6 +176,17 @@ bool RexSwitchPinCurrentThreadToCore(int core);
 
 /* Which core the calling thread is running on right now. It can only be asked about oneself. */
 int RexSwitchCurrentCore(void);
+
+/*
+ * --- why a thread could not be created -------------------------------------------------------------
+ *
+ * libnx reports every threadCreate failure as ENOMEM. This writes which resource is missing for a thread
+ * with this stack size, in the order libnx needs them: one heap block for the stack (memalign), room for
+ * its mirror in the stack region (virtmemFindStack before svcMapMemory), a kernel thread slot (the process
+ * resource limit, svcCreateThread). For the failure path only: it allocates and frees a block of that size
+ * and walks the heap (mallinfo).
+ */
+void RexSwitchDescribeThreadFailure(size_t stack_size, char* out, size_t out_len);
 
 #ifdef __cplusplus
 }

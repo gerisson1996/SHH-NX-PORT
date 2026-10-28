@@ -10,7 +10,9 @@
  * the definition of abort has to reach the link before the one in libc.a to
  * replace it.
  *
- *   stderr  -> <NRO folder>/logs/rex/rex_stderr.log, unbuffered, rewritten on every boot
+ *   stderr  -> <NRO folder>/logs/rex/rex_stderr.log, unbuffered, rewritten on every boot; only with the log on
+ *              (sa2-nx 2026-10-08: RexSwitchRedirectStderr, called once the configuration is read, so a build with
+ *              logging off writes no logs/ folder at all)
  *   abort() -> <NRO folder>/logs/rex/rex_crash.log with the stack, and error 2345-0101
  *   exit()  -> the same, error 2345-0103. The orderly shutdown does not go through exit()
  *              (see windowed_app_main_switch.cpp), so getting here means some library
@@ -39,29 +41,50 @@ const char* RexSwitchLogDir(void) {
     return g_rex_log_dir;
 }
 
+/* sa2-nx: the folders are created when something is written there (RexSwitchEnsureLogDir), not at startup. */
 static void RexSwitchInitLogDir(void) {
     if (__system_argc < 1 || !__system_argv || !__system_argv[0]) {
         return;
     }
     const char* nro = __system_argv[0];
-    const char* barra = strrchr(nro, '/');
-    if (!barra) {
+    const char* bar = strrchr(nro, '/');
+    if (!bar) {
         return;
     }
     /* without a device ("/switch/..."), the SD one: the path must also work for fsdevTranslatePath */
-    const char* dispositivo = strchr(nro, ':') ? "" : "sdmc:";
+    const char* vulkan_device = strchr(nro, ':') ? "" : "sdmc:";
     char dir[FS_MAX_PATH];
-    int n = snprintf(dir, sizeof(dir), "%s%.*slogs", dispositivo, (int)(barra - nro + 1), nro);
+    int n = snprintf(dir, sizeof(dir), "%s%.*slogs", vulkan_device, (int)(bar - nro + 1), nro);
     if (n <= 0 || (size_t)n + sizeof("/rex/") > sizeof(dir)) {
         return;
     }
-    mkdir(dir, 0777);
-    strcat(dir, "/rex");
-    mkdir(dir, 0777);
-    struct stat st;
-    if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-        strcat(dir, "/");
-        strcpy(g_rex_log_dir, dir);
+    strcat(dir, "/rex/");
+    strcpy(g_rex_log_dir, dir);
+}
+
+/* Creates <NRO folder>/logs/rex/ (both levels) if missing. */
+void RexSwitchEnsureLogDir(void) {
+    char dir[FS_MAX_PATH];
+    strcpy(dir, g_rex_log_dir);
+    size_t n = strlen(dir);
+    if (n && dir[n - 1] == '/') dir[--n] = '\0';
+    char* rex = strrchr(dir, '/');
+    if (rex) {
+        *rex = '\0';
+        mkdir(dir, 0777); /* logs */
+        *rex = '/';
+    }
+    mkdir(dir, 0777); /* logs/rex */
+}
+
+/* stderr into <NRO folder>/logs/rex/rex_stderr.log (rewritten), unbuffered: called by the SDK once the configuration
+   says the log goes to a file. */
+void RexSwitchRedirectStderr(void) {
+    RexSwitchEnsureLogDir();
+    char path[FS_MAX_PATH];
+    snprintf(path, sizeof(path), "%srex_stderr.log", g_rex_log_dir);
+    if (freopen(path, "w", stderr)) {
+        setvbuf(stderr, NULL, _IONBF, 0);
     }
 }
 
@@ -74,7 +97,7 @@ void abort(void) {
 }
 
 static void RexSwitchExitHook(void) {
-    RexSwitchCrashLog("exit() fuera del cierre ordenado", NULL, (u64)__builtin_frame_address(0),
+    RexSwitchCrashLog("exit() outside an orderly shutdown", NULL, (u64)__builtin_frame_address(0),
                       (u64)__builtin_return_address(0));
     diagAbortWithResult(MAKERESULT(Module_Libnx, 103));
 }
@@ -87,10 +110,5 @@ static void RexSwitchExitHook(void) {
 __attribute__((constructor(101)))
 static void RexSwitchCrashHooksInit(void) {
     RexSwitchInitLogDir();
-    char ruta[FS_MAX_PATH];
-    snprintf(ruta, sizeof(ruta), "%srex_stderr.log", g_rex_log_dir);
-    if (freopen(ruta, "w", stderr)) {
-        setvbuf(stderr, NULL, _IONBF, 0);
-    }
     atexit(RexSwitchExitHook);
 }

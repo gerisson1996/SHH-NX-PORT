@@ -141,6 +141,10 @@ extern PPCFuncMapping PPCFuncMappings[];
 #endif
 
 #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
+// dcbt / dcbtst with the generator's dcbt_prefetch option: the host's prefetch of the same address.
+#ifndef REX_PREFETCH
+#define REX_PREFETCH(x, write) __builtin_prefetch((const void*)REX_RAW_ADDR(x), (write))
+#endif
 
 #define REX_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
 #define REX_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
@@ -153,6 +157,32 @@ extern PPCFuncMapping PPCFuncMappings[];
 #define REX_STORE_U16(x, y) (*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap16(y))
 #define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
 #define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
+
+// Mass Effect diet (codegen option dform_disp_split): D-form accesses pass the register and the signed
+// displacement apart, so the address is base + zext(reg) + disp (one add shared by neighbouring accesses, the
+// displacement folded into the load/store) instead of (u32)(reg + disp). It differs only when reg + disp crosses
+// 2^32, i.e. for a guest access to 0xFFFFxxxx+ or a negative offset from a near-null pointer, which is a guest
+// fault anyway. Platforms with a physical-window offset keep the old form.
+#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+#define REX_LOAD_D_U8(r, d) REX_LOAD_U8((u32)(r) + (d))
+#define REX_LOAD_D_U16(r, d) REX_LOAD_U16((u32)(r) + (d))
+#define REX_LOAD_D_U32(r, d) REX_LOAD_U32((u32)(r) + (d))
+#define REX_LOAD_D_U64(r, d) REX_LOAD_U64((u32)(r) + (d))
+#define REX_STORE_D_U8(r, d, y) REX_STORE_U8((u32)(r) + (d), y)
+#define REX_STORE_D_U16(r, d, y) REX_STORE_U16((u32)(r) + (d), y)
+#define REX_STORE_D_U32(r, d, y) REX_STORE_U32((u32)(r) + (d), y)
+#define REX_STORE_D_U64(r, d, y) REX_STORE_U64((u32)(r) + (d), y)
+#else
+#define REX_ADDR_D(r, d) (base + (uint64_t)(u32)(r) + (int64_t)(d))
+#define REX_LOAD_D_U8(r, d) (*(volatile u8*)REX_ADDR_D(r, d))
+#define REX_LOAD_D_U16(r, d) __builtin_bswap16(*(volatile u16*)REX_ADDR_D(r, d))
+#define REX_LOAD_D_U32(r, d) __builtin_bswap32(*(volatile u32*)REX_ADDR_D(r, d))
+#define REX_LOAD_D_U64(r, d) __builtin_bswap64(*(volatile u64*)REX_ADDR_D(r, d))
+#define REX_STORE_D_U8(r, d, y) (*(volatile u8*)REX_ADDR_D(r, d) = (y))
+#define REX_STORE_D_U16(r, d, y) (*(volatile u16*)REX_ADDR_D(r, d) = __builtin_bswap16(y))
+#define REX_STORE_D_U32(r, d, y) (*(volatile u32*)REX_ADDR_D(r, d) = __builtin_bswap32(y))
+#define REX_STORE_D_U64(r, d, y) (*(volatile u64*)REX_ADDR_D(r, d) = __builtin_bswap64(y))
+#endif
 
 #define REX_MEMORY_SIZE 0x100000000ull
 

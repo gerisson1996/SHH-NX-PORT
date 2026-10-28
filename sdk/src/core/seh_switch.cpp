@@ -23,7 +23,7 @@
  *    asynchronous EH flags on Windows, so there is no guarantee that the catch
  *    would ever run: the likely outcome would be std::terminate.
  *
- * 3. NFSMW does not use it. generate_exception_handlers is false by default, and
+ * 3. This port does not use it. generate_exception_handlers is false by default, and
  *    it is commented out in app/overrides.toml. With that off, the SEH macros are
  *    not emitted.
  *
@@ -90,12 +90,12 @@ extern "C" bool RexSwitchSehHandleFault(ThreadExceptionDump* ctx) {
   // It is recorded in the thread's SEH state, as seh_posix.cpp would do
   // before throwing: code and faulting address.
   const uint32_t ec = ctx->esr >> 26;
-  const bool fallo_de_datos = (ec & 0b111110) == 0b100100;
-  auto& estado = rex::platform::seh_thread_state();
-  estado.code = fallo_de_datos ? rex::SehException::ACCESS_VIOLATION
+  const bool failure_of_data = (ec & 0b111110) == 0b100100;
+  auto& state = rex::platform::seh_thread_state();
+  state.code = failure_of_data ? rex::SehException::ACCESS_VIOLATION
                                : rex::SehException::ILLEGAL_INSTRUCTION;
-  estado.info[0] = 0;
-  estado.info[1] = static_cast<uintptr_t>(ctx->far.x);
+  state.info[0] = 0;
+  state.info[1] = static_cast<uintptr_t>(ctx->far.x);
 
   return false;
 }

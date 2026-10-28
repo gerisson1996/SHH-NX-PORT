@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <span>
 
 #include <rex/system/xtypes.h>
@@ -60,6 +61,10 @@ class File {
   // Flush anything pending to disk. Devices that cannot do it (or for which it makes no sense, such as
   // read-only ones) just report success; the one that matters is the host disk device.
   virtual X_STATUS Flush() { return X_STATUS_SUCCESS; }
+
+  // Rename the entry this file was opened on (NtSetInformationFile FileRenameInformation). Devices
+  // whose host cannot rename an open file override it.
+  virtual X_STATUS Rename(const std::filesystem::path& file_path);
 
   // rex::filesystem::FileAccess
   uint32_t file_access() const { return file_access_; }

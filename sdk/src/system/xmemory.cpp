@@ -27,11 +27,13 @@
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread.h>
 
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
+#include <rex/sys_counters.h>
 
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -131,6 +133,33 @@ Memory::~Memory() {
   physical_membase_ = nullptr;
 }
 
+
+#if REX_PLATFORM_SWITCH
+extern "C" bool (*g_rex_hot_read_hook)(uint64_t host_address);
+namespace {
+Memory* g_hot_read_memory = nullptr;
+
+// See NoteWatchedRead in exception_handler_switch.cpp: a physical page the CPU keeps reading is
+// treated as written, exactly that page, so its watch goes away and it is mapped again.
+bool UnwatchHotReadPage(uint64_t host_address) {
+  Memory* memory = g_hot_read_memory;
+  if (!memory) {
+    return false;
+  }
+  const uint64_t base = reinterpret_cast<uint64_t>(memory->virtual_membase());
+  if (host_address < base || host_address >= base + 0x100000000ull) {
+    return false;
+  }
+  const uint32_t guest = memory->HostToGuestVirtual(reinterpret_cast<const void*>(host_address));
+  return memory->TriggerPhysicalMemoryCallbacks(
+      rex::thread::global_critical_region::AcquireDirect(), guest & ~0xFFFu, 0x1000, true, true,
+      true);
+}
+}  // namespace
+#endif
+
+u8* g_store_cards = nullptr;  // sa2-nx (2026-10-20, banjo-nx): the store cards (xmemory.h)
+
 bool Memory::Initialize() {
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
 
@@ -168,6 +197,8 @@ bool Memory::Initialize() {
     assert_always();
     return false;
   }
+  g_hot_read_memory = this;
+  g_rex_hot_read_hook = UnwatchHotReadPage;
 #else
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
@@ -213,11 +244,13 @@ bool Memory::Initialize() {
                               0x1FD00000, 4096, &heaps_.physical);
 
   // Protect the first and last 64kb of memory.
-  heaps_.v00000000.AllocFixed(0x00000000, 0x10000, 0x10000,
+  // sa2-nx (2026-10-20, banjo-nx): the first MB holds the store cards (xmemory.h: g_store_cards), which every guest
+  // store outside the stack writes: readable and writable whatever protect_zero says (a guest access there would have
+  // faulted before, so the game makes none).
+  heaps_.v00000000.AllocFixed(0x00000000, 0x100000, 0x10000,
                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
-                              !REXCVAR_GET(protect_zero)
-                                  ? memory::kMemoryProtectRead | memory::kMemoryProtectWrite
-                                  : memory::kMemoryProtectNoAccess);
+                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+  g_store_cards = virtual_membase_;
   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000, memory::kMemoryAllocationReserve,
                              memory::kMemoryProtectNoAccess);
 
@@ -234,8 +267,8 @@ bool Memory::Initialize() {
   // five views the 360 has over physical memory (0x7F..., 0xA0..., 0xC0...,
   // 0xE0... and raw physical), so the process ends up accounting for more than
   // 2 GB and the kernel refuses the next allocation. Measured: the game stayed
-  // black after the EA logo with "no se pudo confirmar 0x6A0000 bytes; respaldo
-  // 578 MB, mapeado 2139 MB contando espejos" (2001-0103).
+  // black after the EA logo with "could not commit 0x6A0000 bytes; backing
+  // 578 MB, mapped 2139 MB counting mirrors" (2001-0103).
   //
   // Instead, physical memory is committed as it is touched: the first access to an
   // uncommitted page lands in the exception handler, which commits 1 MB and
@@ -419,6 +452,7 @@ void Memory::Reset() {
 }
 
 const BaseHeap* Memory::LookupHeap(uint32_t address) const {
+  REX_SYS_CENSUS(rex::syscount::kCensusLookupHeap, 1);
   if (address < 0x40000000) {
     return &heaps_.v00000000;
   } else if (address < 0x7F000000) {
@@ -555,6 +589,96 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
+#if REX_PLATFORM_SWITCH
+extern "C" void* RexGmShadowFor(uint64_t window_address);
+
+namespace {
+/*
+ * Guest-side report for an unhandled guest access violation.
+ *
+ * The host crash dump only has host registers and host frames. To find where a bad guest pointer
+ * came from, the guest registers of the faulting thread, its guest stack back chain (back chain
+ * word at 0(r1), saved LR at back_chain - 8) and the memory the registers point to are needed.
+ * Guest memory is read through the shadow alias (RexGmShadowFor), which is always mapped, so the
+ * report itself can never fault on a watched or not yet faulted-in page.
+ */
+bool ReadGuest32(uint8_t* virtual_membase, uint32_t address, uint32_t* out) {
+  const auto* p = static_cast<const uint8_t*>(
+      RexGmShadowFor(reinterpret_cast<uint64_t>(virtual_membase + address)));
+  if (!p) {
+    return false;
+  }
+  uint32_t v;
+  std::memcpy(&v, p, sizeof(v));
+  *out = rex::byte_swap(v);
+  return true;
+}
+
+void DumpGuestWords(uint8_t* virtual_membase, const char* label, uint32_t address, uint32_t words) {
+  std::string line;
+  for (uint32_t i = 0; i < words; ++i) {
+    uint32_t v = 0;
+    if (!ReadGuest32(virtual_membase, address + i * 4, &v)) {
+      if (i == 0) {
+        return;
+      }
+      break;
+    }
+    if (i % 8 == 0) {
+      if (!line.empty()) {
+        REXSYS_ERROR("{}", line);
+      }
+      line = fmt::format("  {} {:08X}:", label, address + i * 4);
+    }
+    line += fmt::format(" {:08X}", v);
+  }
+  if (!line.empty()) {
+    REXSYS_ERROR("{}", line);
+  }
+}
+
+void DumpGuestCrashContext(uint8_t* virtual_membase) {
+  auto* ts = rex::runtime::ThreadState::Get();
+  if (!ts || !ts->context()) {
+    return;
+  }
+  const ::PPCContext& c = *ts->context();
+  const uint32_t r[32] = {
+      c.r0.u32,  c.r1.u32,  c.r2.u32,  c.r3.u32,  c.r4.u32,  c.r5.u32,  c.r6.u32,  c.r7.u32,
+      c.r8.u32,  c.r9.u32,  c.r10.u32, c.r11.u32, c.r12.u32, c.r13.u32, c.r14.u32, c.r15.u32,
+      c.r16.u32, c.r17.u32, c.r18.u32, c.r19.u32, c.r20.u32, c.r21.u32, c.r22.u32, c.r23.u32,
+      c.r24.u32, c.r25.u32, c.r26.u32, c.r27.u32, c.r28.u32, c.r29.u32, c.r30.u32, c.r31.u32};
+  REXSYS_ERROR("Guest context (last values stored in PPCContext; may lag host registers):");
+  for (int i = 0; i < 32; i += 8) {
+    REXSYS_ERROR("  r{:<2}-r{:<2} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}", i,
+                 i + 7, r[i], r[i + 1], r[i + 2], r[i + 3], r[i + 4], r[i + 5], r[i + 6],
+                 r[i + 7]);
+  }
+  REXSYS_ERROR("  lr {:08X} ctr {:08X}", static_cast<uint32_t>(c.lr), c.ctr.u32);
+
+  REXSYS_ERROR("Guest stack back chain from r1 (frame, saved LR of the function that owns it):");
+  uint32_t sp = r[1];
+  for (int i = 0; i < 48 && sp; ++i) {
+    uint32_t back = 0, saved_lr = 0;
+    if (!ReadGuest32(virtual_membase, sp, &back) || !back || back <= sp) {
+      break;
+    }
+    ReadGuest32(virtual_membase, back - 8, &saved_lr);
+    REXSYS_ERROR("  #{:02} sp {:08X} -> caller sp {:08X}, return to {:08X}", i, sp, back,
+                 saved_lr);
+    sp = back;
+  }
+
+  DumpGuestWords(virtual_membase, "stack", r[1], 0x80);
+  for (int i = 3; i < 32; ++i) {
+    if (r[i] >= 0x10000 && i != 1) {
+      DumpGuestWords(virtual_membase, fmt::format("r{:<2}  ", i).c_str(), r[i] & ~3u, 16);
+    }
+  }
+}
+}  // namespace
+#endif
+
 bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                      void* host_address, bool is_write) {
   // Access via physical_membase_ is special, when need to bypass everything
@@ -571,6 +695,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id());
+#if REX_PLATFORM_SWITCH
+    DumpGuestCrashContext(virtual_membase_);
+#endif
     return false;
   }
 
@@ -910,7 +1037,7 @@ rex::memory::PageAccess ToPageAccess(uint32_t protect) {
 // given on the host as read-write. On Horizon there are no read-only pages in
 // the guest window: they are unmapped, and every read goes through the
 // exception handler (2 us per access). The XEX constants live in such pages,
-// and the game code reads them constantly. On the first boot of NFSMW one of
+// and the game code reads them constantly. On a first boot one of
 // those emulated reads was also what exposed the resume bug (see
 // resume_ctx.h). The game does not write to those pages (it would fault on the
 // 360 and on the PC), so dropping the protection does not change its behavior.
@@ -1933,6 +2060,13 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
   } else {
     host_address_offset = 0;
   }
+  // The header's constant is what the recompiled code and (off Windows) Memory::TranslateVirtual add instead of
+  // asking the heap: it must be this heap's offset.
+  if (host_address_offset != detail::PhysicalHostOffset(heap_base)) {
+    REXSYS_ERROR("Physical heap {:08X}: host address offset {:X}, but PhysicalHostOffset says {:X}", heap_base,
+                 host_address_offset, detail::PhysicalHostOffset(heap_base));
+    std::abort();
+  }
 
   BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size,
                        host_address_offset);
@@ -2248,6 +2382,9 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     return false;
   }
   length = std::min(length, heap_size_ - heap_relative_address);
+  // sa2-nx (2026-10-20, banjo-nx): a host write of physical memory (a file read into it, a decommit or release) marks
+  // its store cards as a guest store would.
+  MarkStoreCards(virtual_address, length);
   if (length == 0) {
     return false;
   }

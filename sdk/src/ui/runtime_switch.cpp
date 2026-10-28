@@ -36,7 +36,7 @@ namespace {
  * errors what() includes the path. It ends with error 2345-0104.
  */
 [[noreturn]] void RexSwitchTerminate() {
-  char reason[768] = "std::terminate sin excepcion activa";
+  char reason[768] = "std::terminate without an active exception";
   if (std::exception_ptr current = std::current_exception()) {
     const std::type_info* type = abi::__cxa_current_exception_type();
     int status = -1;
@@ -72,27 +72,61 @@ extern "C" {
 u32 __nx_applet_type = AppletType_Application;
 
 /*
- * The heap size libnx asks for when nothing hands the program a heap. Started
- * by hbloader (the Homebrew Menu or a forwarder), which is how this port runs,
- * libnx takes the heap hbloader already set up, all the memory but about 2 MB,
- * and ignores this value.
+ * With 0, libnx gives the newlib heap all available memory, and in this
+ * project that is a mistake: the guest memory model remaps chunks of this heap
+ * into the guest window and the 360 mirrors, and each of those mappings needs
+ * the kernel to reserve memory of its own for the page tables. If the heap takes
+ * everything, that memory does not exist.
  *
- * That is why the profiler reads 3,185 of 3,189 MB: InfoType_UsedMemorySize
- * counts that whole heap from the start. It was the same with 1,536 as with
- * 1,024 MB here, and already before anything was loaded, so it does not show
- * how much is free.
+ * Measured on the console: with an uncapped heap, the game died with "could not
+ * commit 0x1000 bytes" (kernel 2001-0103, out of memory) at ~1.8 GB mapped,
+ * and even a 4 KB request and thread creation failed.
  *
- * Measured on the console: the game died with "no se pudo confirmar 0x1000
- * bytes" (kernel 2001-0103) at ~1.8 GB mapped, and even a 4 KB request and
- * thread creation failed. Changing this value did not move that point; what
- * fixed it was mapping each guest chunk into a view only when that view touches
- * it (guest_memory_switch.cpp).
+ * It was lowered from 1,536 to 1,024 MB in case the NVIDIA driver was short of
+ * room. That was not it: the 3,185 of 3,189 MB in the profiler is
+ * InfoType_UsedMemorySize, which does not move on Horizon (it is the same with
+ * 1,536 as with 1,024, and already before anything is loaded), so it does not
+ * measure what it seemed to. It stays at 1,024 because that is enough, not
+ * because it fixed anything.
  *
- * Everything the port uses comes out of that heap: the guest backing (measured
- * at 506 MB), the host thread stacks (16 MB each) and Mesa, GPU memory included.
- * How much of it the GPU uses shows in Vulkan's memory budget.
+ * 1,024 MB leave plenty of room for what lives in the heap (the guest backing,
+ * measured at 506 MB, the host thread stacks at 16 MB each, and whatever Mesa
+ * asks for) and leave the rest free for the mappings. What the GPU uses
+ * (textures, buffers and compiled shaders) does not come from here.
  */
 size_t __nx_heap_size = 1024ull * 1024 * 1024;  /* see below */
+
+/*
+ * sa2-nx (2026-10-20, from banjo-nx 2026-10-17): libnx's heap setup (4.12, the same steps), but without a loader the heap is the larger of
+ * __nx_heap_size and all the memory available (what libnx takes when __nx_heap_size is 0). A console always starts the
+ * NRO through hbloader (title takeover or a forwarder), whose heap override is taken as before. An emulator (Ryujinx)
+ * starts it without a loader, and 1 GB ran out (guest backing, thread stacks and the GPU driver's memory share it)
+ * where hbloader would have given about 3 GB.
+ */
+void __libnx_initheap(void) {
+  void* addr = nullptr;
+  size_t size = 0;
+  if (envHasHeapOverride()) {
+    addr = envGetHeapOverrideAddr();
+    size = envGetHeapOverrideSize();
+  } else {
+    u64 available = 0, used = 0;
+    svcGetInfo(&available, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    if (available > used + 0x200000) size = (available - used - 0x200000) & ~size_t(0x1FFFFF);
+    if (size < __nx_heap_size) size = __nx_heap_size;
+    Result rc = svcSetHeapSize(&addr, size);
+    if (R_FAILED(rc) && size != __nx_heap_size) {
+      size = __nx_heap_size;
+      rc = svcSetHeapSize(&addr, size);
+    }
+    if (R_FAILED(rc)) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
+  }
+  extern char* fake_heap_start;
+  extern char* fake_heap_end;
+  fake_heap_start = static_cast<char*>(addr);
+  fake_heap_end = static_cast<char*>(addr) + size;
+}
 
 /*
  * The exception handler stack is no longer declared here.

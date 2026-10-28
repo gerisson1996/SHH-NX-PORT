@@ -500,6 +500,9 @@ void SpirvShaderTranslator::StartTranslation() {
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
                                  "xe_var_vfetch_address", const_int_0_);
     var_main_tfetch_lod_ =
+    var_main_vfetch_bound_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
+                                 "xe_var_vfetch_bound", const_int_0_);
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                  "xe_var_tfetch_lod", const_float_0_);
     var_main_tfetch_gradients_h_ =

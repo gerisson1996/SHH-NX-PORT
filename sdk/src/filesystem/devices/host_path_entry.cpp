@@ -11,6 +11,7 @@
 
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
+#include "startup_trace.h"
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
@@ -60,7 +61,7 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
    * A folder is not opened as a file.
    *
    * On the Xbox 360, opening a directory is legal: games do it to enumerate it or just to check that
-   * the drive is mounted. NFSMW opens the root of its save container ("rmcsave:\") right after
+   * the drive is mounted. The game opens the root of its save container ("rmcsave:\") right after
    * mounting it, and this code used to try to open a FILE* on that folder. That always fails,
    * NO_SUCH_FILE was returned, and the game read it as "this save cannot be used": hence the
    * "damaged profile" on load. Creating a profile did not hit it, because then the game writes a
@@ -75,8 +76,16 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     return X_STATUS_SUCCESS;
   }
 
-  auto file_handle = rex::filesystem::FileHandle::OpenExisting(
-      host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
+  // A read handle the startup preload thread opened ahead of the guest (read-only access only).
+  std::unique_ptr<rex::filesystem::FileHandle> file_handle;
+  if (is_read_only() && !(desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
+                                            FileAccess::kFileAppendData | FileAccess::kGenericAll))) {
+    file_handle = startup_trace::TakePreopened(static_cast<HostPathDevice*>(device_), path());
+  }
+  if (!file_handle) {
+    file_handle = rex::filesystem::FileHandle::OpenExisting(
+        host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
+  }
   if (!file_handle) {
     // TODO(benvanik): pick correct response.
     return X_STATUS_NO_SUCH_FILE;
@@ -147,8 +156,9 @@ X_STATUS HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>&
   std::error_code ec;
   std::filesystem::rename(host_path_, new_host_path, ec);
   if (ec) {
-    REXFS_ERROR("RenameEntryInternal: failed to rename '{}' to '{}': {}",
-                rex::path_to_utf8(host_path_), rex::path_to_utf8(new_host_path), ec.message());
+    REXFS_ERROR("RenameEntryInternal: failed to rename '{}' to '{}': {} ({})",
+                rex::path_to_utf8(host_path_), rex::path_to_utf8(new_host_path), ec.message(),
+                ec.value());
     return X_STATUS_ACCESS_DENIED;
   }
 

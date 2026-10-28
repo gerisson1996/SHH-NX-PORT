@@ -149,6 +149,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called after logging is initialized. Add log sinks here.
   virtual void OnPostInitLogging() {}
 
+  /// sa2-nx: TOML applied before the config file (<name>.toml), as defaults it overrides key by key. Empty = none.
+  virtual std::string_view BuiltInConfig() const { return {}; }
+
+  /// sa2-nx: written as the config file (<name>.toml) when there is none, so the player has one to edit. Empty = none.
+  virtual std::string_view DefaultConfigFile() const { return {}; }
+
   /// Called after Runtime::LoadXexImage() succeeds. The XEX is loaded and
   /// mapped into guest memory but the module has not launched.
   /// Use this for data patches and recomp-specific achievement registration.

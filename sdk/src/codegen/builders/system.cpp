@@ -31,20 +31,24 @@ bool build_attn(BuilderContext& ctx) {
 }
 
 bool build_sync(BuilderContext& ctx) {
-  // Memory barrier, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  // PPC sync is a heavyweight ordering point. Emitting a portable C++ fence
+  // is required on weakly ordered hosts such as ARM64 (and is harmless on
+  // hosts where the hardware memory model is already stronger).
+  ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
   return true;
 }
 
 bool build_lwsync(BuilderContext& ctx) {
-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  // lwsync orders the producer/consumer traffic used by many Xenon lock-free
+  // queues. acquire-release is the closest portable C++ fence strength.
+  ctx.println("\tstd::atomic_thread_fence(std::memory_order_acq_rel);");
   return true;
 }
 
 bool build_eieio(BuilderContext& ctx) {
-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  // Preserve ordering even when an eieio is not consumed as part of a
+  // recognized MMIO access sequence.
+  ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
   return true;
 }
 
@@ -135,15 +139,31 @@ bool build_dcbf(BuilderContext& ctx) {
   return true;
 }
 
+namespace {
+// dcbt_prefetch (sa2-nx): the hint as the host's own prefetch of the same address. No effect on any value.
+void emit_prefetch(BuilderContext& ctx, int write) {
+  if (!ctx.config().dcbtPrefetch) {
+    return;
+  }
+  // dcbt / dcbtst decode as {CT, RA, RB} (thirdparty/disasm/ppc-dis.c), unlike dcbz's {RA, RB}: the address is
+  // (RA|0) + RB. banjo-nx found (2026-10-16) that this read operands 0 and 1, so every prefetch went to RA alone (or
+  // r0) instead of RA + RB. A prefetch changes no value either way.
+  ctx.print("\tREX_PREFETCH(");
+  if (ctx.insn.operands[1] != 0)
+    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
+  ctx.println("{}.u32, {});", ctx.r(ctx.insn.operands[2]), write);
+}
+}  // namespace
+
 bool build_dcbt(BuilderContext& ctx) {
   // Hint instruction, prefetch has no semantic effect
-  (void)ctx;
+  emit_prefetch(ctx, 0);
   return true;
 }
 
 bool build_dcbtst(BuilderContext& ctx) {
   // Hint instruction, prefetch-for-store has no semantic effect
-  (void)ctx;
+  emit_prefetch(ctx, 1);
   return true;
 }
 

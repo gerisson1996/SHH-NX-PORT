@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -35,6 +36,12 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xthread.h>
+#include <rex/sys_counters.h>
+
+REXCVAR_DEFINE_INT32(kernel_timestamp_interval_ms, 1, "Kernel",
+                     "Period of the timer that refreshes the guest's KeTimeStampBundle tick count (1 = the "
+                     "original 1 ms, about 1000 host wake-ups per second; 4 = 250/s: the guest-visible "
+                     "millisecond tick then advances in 4 ms steps)");
 
 REXCVAR_DEFINE_BOOL(log_high_frequency_kernel_calls, false, "Kernel",
                     "Log kernel calls with the kHighFrequency tag");
@@ -193,7 +200,9 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
                                    chrono::Clock::QueryGuestUptimeMillis());
   memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 20, 0);
   timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
-      std::chrono::milliseconds(1), [lpKeTimeStampBundle]() {
+      std::chrono::milliseconds(std::clamp(REXCVAR_GET(kernel_timestamp_interval_ms), 1, 50)),
+      [lpKeTimeStampBundle]() {
+        REX_SYS_COUNT(rex::syscount::kTimestampTick, 1);
         memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
                                          chrono::Clock::QueryGuestUptimeMillis());
       });

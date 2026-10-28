@@ -13,9 +13,9 @@ Phase 1: translating `default.xex` to C++ on the PC. The game does not run yet.
 
 | Phase | What | State |
 |---|---|---|
-| 1 | Project, code generator, first C++ translation of `default.xex` | done (not compiled yet) |
-| 2 | Game runs on PC with ReXGlue's own graphics | - |
-| 3 | Switch build (NRO), memory, threads, audio | - |
+| 1 | Project, code generator, first C++ translation of `default.xex` | done |
+| 2 | Game runs on PC with ReXGlue's own graphics | title screen reached; gameplay not tested |
+| 3 | Switch build (NRO), memory, threads, audio | NRO builds; not tested on the console yet |
 | 4 | Shader library and native Vulkan renderer | - |
 | 5 | Browser installer | - |
 
@@ -24,11 +24,49 @@ Phase 1: translating `default.xex` to C++ on the PC. The game does not run yet.
 - Game: Title ID `4B4E07E5`, "Build v18.51" (Code Changelist #437812), XEX file time 2008-08-14.
 - The first codegen failed on two branch targets with no function; they are declared in `app/overrides.toml`.
   The second run wrote 152 C++ files (about 163 MB) in about 2 minutes.
-- The codegen still warns `Unresolved conditional branch to 0x8265CC48 from 0x8265CC54`. Check it in phase 2.
-- `tools/huecos.py` has not been run yet. Run it and add `huecos.toml` to the manifest when the game starts hitting
-  "Call to invalid or unregistered function" at run time.
-- `sdk/` comes from nfsmw-nx and has some NFSMW tuning, for example XMA audio and file reads. Check it in phase 2
-  before trusting it for this game.
+- `sdk/` comes from nfsmw-nx and has some NFSMW tuning, for example XMA audio and file reads. Check it before
+  trusting it for this game.
+
+### Notes from phase 2
+
+- The first PC run stopped at once on `Call to invalid or unregistered function at guest address 0x8268C720`: a
+  code gap the analysis left without a function. `tools/huecos.py --min 8` found 908 gaps. Declaring them all split
+  some real functions (356 branch warnings in the codegen log) and some were data or import thunks.
+  `tools/huecos_conflictos.py` removes those from `app/huecos.toml` and lists them in `tools/huecos_excluir.txt`.
+  After two passes, 757 gaps remain and the codegen gives no warnings.
+- Graphics need the `xenos` GPU plugin: `app/CMakeLists.txt` puts it next to the .exe and `app/src/shh_app.h`
+  sets `gpu_plugin=xenos` by default. Without it the game runs with a black window.
+- With that, the game plays the intro movies (Bink) and reaches "Press START" at about 30 FPS on the PC.
+- Open: one draw with tessellation fails in the backend (`PM4_DRAW_INDX ... tess_mode=1`), and the game cannot
+  write `d:\streaming.log` because the game folder is mounted read-only.
+
+## Building for the Switch
+
+Needs devkitPro and the static NVK driver: a `portlibs/switch` folder with `lib/libvulkan.a`, built from
+[mesa-switch](https://github.com/danfromtico/mesa-switch) at commit `1a8c1a66d6f` with nfsmw-nx's
+`mesa/mesa-switch-nfsmw.patch` (`tools/build_mesa.sh` does it on Windows with MSYS2 at `C:\msys64`).
+
+```bat
+tools\build_switch.bat C:\path\to\nvk_sdk
+```
+
+The result is `out\switch\shh.nro`. On the SD card:
+
+```
+sdmc:/switch/shh-nx/
+    shh.nro
+    game_root/      (the game files: default.xex, the .PAK files, audio/, movies/, ...)
+```
+
+Start it from the Homebrew Menu in title takeover mode (hold R while starting a game). The album does not give
+enough memory. Graphics still go through ReXGlue's GPU emulation, which was too slow for nfsmw-nx on the Switch.
+
+## Running on the PC
+
+```bat
+tools\build_pc.bat
+out\pc\shh.exe --game_data_root=assets\game_root
+```
 
 ## Layout
 

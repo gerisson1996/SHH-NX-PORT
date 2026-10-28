@@ -21,8 +21,12 @@
 #include <switch.h>
 
 #include <errno.h>
+#include <malloc.h>
 #include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
 
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -38,43 +42,48 @@ namespace {
  * Not a hot path: it is touched when threads are created and destroyed, never
  * per frame. A plain mutex is more than enough.
  */
-struct Registro {
+struct Register {
   std::mutex m;
-  std::unordered_map<uintptr_t, RexSwitchHandle> mapa;
+  std::unordered_map<uintptr_t, RexSwitchHandle> map;
 };
 
-Registro& registro() {
-  static Registro r;
+Register& register_value() {
+  static Register r;
   return r;
 }
 
 }  // namespace
 
 extern "C" {
+/* libnx: the heap size asked for when there is no loader heap override (runtime_switch.cpp sets it). */
+extern size_t __nx_heap_size;
+}
+
+extern "C" {
 
 void RexSwitchRegisterCurrentThread(void) {
-  auto& r = registro();
+  auto& r = register_value();
   std::lock_guard<std::mutex> lock(r.m);
-  r.mapa[reinterpret_cast<uintptr_t>(pthread_self())] = threadGetCurHandle();
+  r.map[reinterpret_cast<uintptr_t>(pthread_self())] = threadGetCurHandle();
 }
 
 void RexSwitchUnregisterCurrentThread(void) {
-  auto& r = registro();
+  auto& r = register_value();
   std::lock_guard<std::mutex> lock(r.m);
-  r.mapa.erase(reinterpret_cast<uintptr_t>(pthread_self()));
+  r.map.erase(reinterpret_cast<uintptr_t>(pthread_self()));
 }
 
 RexSwitchHandle RexSwitchHandleFor(pthread_t thread) {
   if (pthread_equal(thread, pthread_self()))
     return threadGetCurHandle();
 
-  auto& r = registro();
+  auto& r = register_value();
   std::lock_guard<std::mutex> lock(r.m);
-  auto it = r.mapa.find(reinterpret_cast<uintptr_t>(thread));
-  return it == r.mapa.end() ? REX_SWITCH_INVALID_HANDLE : it->second;
+  auto it = r.map.find(reinterpret_cast<uintptr_t>(thread));
+  return it == r.map.end() ? REX_SWITCH_INVALID_HANDLE : it->second;
 }
 
-/* --- afinidad ---------------------------------------------------------- */
+/* --- affinity ---------------------------------------------------------- */
 
 int pthread_getaffinity_np(pthread_t thread, size_t size, cpu_set_t* set) {
   if (set == nullptr || size < sizeof(cpu_set_t))
@@ -84,12 +93,12 @@ int pthread_getaffinity_np(pthread_t thread, size_t size, cpu_set_t* set) {
   if (h == REX_SWITCH_INVALID_HANDLE)
     return ESRCH;
 
-  s32 preferido = 0;
-  u64 mascara = 0;
-  if (R_FAILED(svcGetThreadCoreMask(&preferido, &mascara, h)))
+  s32 preferred = 0;
+  u64 mask = 0;
+  if (R_FAILED(svcGetThreadCoreMask(&preferred, &mask, h)))
     return EINVAL;
 
-  set->bits = mascara;
+  set->bits = mask;
   return 0;
 }
 
@@ -106,20 +115,20 @@ int pthread_setaffinity_np(pthread_t thread, size_t size, const cpu_set_t* set) 
    * taken; -1 would mean "whatever it already had", which is not what the
    * POSIX API being imitated asks for.
    */
-  s32 preferido = -1;
+  s32 preferred = -1;
   for (int i = 0; i < 4; i++) {
-    if (set->bits & (1ull << i)) { preferido = i; break; }
+    if (set->bits & (1ull << i)) { preferred = i; break; }
   }
-  if (preferido < 0)
-    return EINVAL;  /* mascara vacia: POSIX tampoco lo permite */
+  if (preferred < 0)
+    return EINVAL;  /* empty mask: POSIX does not allow it either */
 
   /*
    * Only 4 cores exist. Asking for more is not a caller error (the SDK
    * passes 64-bit masks), so it is trimmed silently.
    */
-  const u32 mascara = static_cast<u32>(set->bits & 0xF);
+  const u32 mask = static_cast<u32>(set->bits & 0xF);
 
-  if (R_FAILED(svcSetThreadCoreMask(h, preferido, mascara)))
+  if (R_FAILED(svcSetThreadCoreMask(h, preferred, mask)))
     return EPERM;
   return 0;
 }
@@ -170,7 +179,7 @@ int pthread_attr_setschedpolicy(pthread_attr_t* attr, int policy) {
   return 0;
 }
 
-/* --- mutex robustos: no existen ---------------------------------------- */
+/* --- robust mutexes: they do not exist --------------------------------- */
 
 int pthread_mutexattr_setrobust(pthread_mutexattr_t* attr, int robustness) {
   (void)attr;
@@ -277,19 +286,48 @@ void RexSwitchSetCurrentThreadPriority(int priority) {
 bool RexSwitchSetCurrentThreadCore(int core) {
   Thread* yo = threadGetSelf();
   Handle h = (yo != nullptr) ? yo->handle : CUR_THREAD_HANDLE;
-  s32 preferido = 0;
-  u64 mascara = 0;
-  if (R_FAILED(svcGetThreadCoreMask(&preferido, &mascara, h))) {
+  s32 preferred = 0;
+  u64 mask = 0;
+  if (R_FAILED(svcGetThreadCoreMask(&preferred, &mask, h))) {
     if (h == CUR_THREAD_HANDLE ||
-        R_FAILED(svcGetThreadCoreMask(&preferido, &mascara, CUR_THREAD_HANDLE))) {
+        R_FAILED(svcGetThreadCoreMask(&preferred, &mask, CUR_THREAD_HANDLE))) {
       return false;
     }
     h = CUR_THREAD_HANDLE;
   }
-  if (core >= 0 && (mascara & (u64(1) << core)) == 0) {
+  if (core >= 0 && (mask & (u64(1) << core)) == 0) {
     return false;  // that core is not this process's: do not force it
   }
-  return R_SUCCEEDED(svcSetThreadCoreMask(h, core, mascara));
+  return R_SUCCEEDED(svcSetThreadCoreMask(h, core, mask));
+}
+
+bool RexSwitchSetThreadMaskOf(void* native_handle, int preferred, unsigned long long mask) {
+  pthread_t thread;
+  static_assert(sizeof(thread) == sizeof(native_handle));
+  std::memcpy(&thread, &native_handle, sizeof(thread));
+  const RexSwitchHandle h = RexSwitchHandleFor(thread);
+  const u64 m = u64(mask) & 0x7;
+  if (h == REX_SWITCH_INVALID_HANDLE || m == 0 || preferred < 0 || !(m & (u64(1) << preferred))) return false;
+  return R_SUCCEEDED(svcSetThreadCoreMask(h, preferred, m));
+}
+
+bool RexSwitchSetCurrentThreadMask(int preferred, unsigned long long mask) {
+  Thread* yo = threadGetSelf();
+  Handle h = (yo != nullptr) ? yo->handle : CUR_THREAD_HANDLE;
+  s32 current_preferred = 0;
+  u64 current = 0;
+  if (R_FAILED(svcGetThreadCoreMask(&current_preferred, &current, h))) {
+    if (h == CUR_THREAD_HANDLE ||
+        R_FAILED(svcGetThreadCoreMask(&current_preferred, &current, CUR_THREAD_HANDLE))) {
+      return false;
+    }
+    h = CUR_THREAD_HANDLE;
+  }
+  const u64 m = u64(mask) & 0x7;  // the process's three cores
+  if (m == 0 || preferred < 0 || !(m & (u64(1) << preferred))) {
+    return false;
+  }
+  return R_SUCCEEDED(svcSetThreadCoreMask(h, preferred, m));
 }
 
 /*
@@ -308,20 +346,20 @@ bool RexSwitchPinCurrentThreadToCore(int core) {
   }
   Thread* yo = threadGetSelf();
   Handle h = (yo != nullptr) ? yo->handle : CUR_THREAD_HANDLE;
-  s32 preferido = 0;
-  u64 mascara = 0;
-  if (R_FAILED(svcGetThreadCoreMask(&preferido, &mascara, h))) {
+  s32 preferred = 0;
+  u64 mask = 0;
+  if (R_FAILED(svcGetThreadCoreMask(&preferred, &mask, h))) {
     if (h == CUR_THREAD_HANDLE ||
-        R_FAILED(svcGetThreadCoreMask(&preferido, &mascara, CUR_THREAD_HANDLE))) {
+        R_FAILED(svcGetThreadCoreMask(&preferred, &mask, CUR_THREAD_HANDLE))) {
       return false;
     }
     h = CUR_THREAD_HANDLE;
   }
-  const u64 solo_ese = u64(1) << core;
-  if ((mascara & solo_ese) == 0) {
+  const u64 that_only = u64(1) << core;
+  if ((mask & that_only) == 0) {
     return false;  // that core is not this process's
   }
-  return R_SUCCEEDED(svcSetThreadCoreMask(h, core, solo_ese));
+  return R_SUCCEEDED(svcSetThreadCoreMask(h, core, that_only));
 }
 
 /*
@@ -330,6 +368,39 @@ bool RexSwitchPinCurrentThreadToCore(int core) {
  * it about another thread, so each thread has to look at itself.
  */
 int RexSwitchCurrentCore(void) { return int(svcGetCurrentProcessorNumber()); }
+
+void RexSwitchDescribeThreadFailure(size_t stack_size, char* out, size_t out_len) {
+  if (out == nullptr || out_len == 0) {
+    return;
+  }
+  // 1. libnx allocates stack + TLS + reent as one block with memalign(0x1000, ...); 64 KB covers TLS and reent.
+  const size_t block = ((stack_size + 0xFFF) & ~size_t(0xFFF)) + 0x10000;
+  void* probe = memalign(0x1000, block);
+  const bool heap_ok = probe != nullptr;
+  free(probe);
+  const struct mallinfo mi = mallinfo();
+  // With a loader (hbloader) the heap is the loader's, whatever __nx_heap_size says.
+  const size_t heap_total = envHasHeapOverride() ? size_t(envGetHeapOverrideSize()) : __nx_heap_size;
+  // 2. Room for the stack's mirror in the stack region (then svcMapMemory).
+  virtmemLock();
+  void* const mirror = virtmemFindStack(block, 0x4000);
+  virtmemUnlock();
+  // 3. A kernel thread slot (svcCreateThread).
+  s64 threads_now = -1;
+  s64 threads_cap = -1;
+  u64 limit = 0;
+  if (R_SUCCEEDED(svcGetInfo(&limit, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0)) && limit != 0) {
+    svcGetResourceLimitCurrentValue(&threads_now, Handle(limit), LimitableResource_Threads);
+    svcGetResourceLimitLimitValue(&threads_cap, Handle(limit), LimitableResource_Threads);
+    svcCloseHandle(Handle(limit));
+  }
+  snprintf(out, out_len,
+           "heap %s a %zu KB block (heap %zu MB, arena %zu MB, in use %zu MB, free %zu MB in %zu chunks); "
+           "stack region %s; kernel threads %lld of %lld",
+           heap_ok ? "has" : "has NO", block >> 10, heap_total >> 20, size_t(mi.arena) >> 20,
+           size_t(mi.uordblks) >> 20, size_t(mi.fordblks) >> 20, size_t(mi.ordblks),
+           mirror != nullptr ? "has room" : "is FULL", (long long)threads_now, (long long)threads_cap);
+}
 
 }  // extern "C"
 

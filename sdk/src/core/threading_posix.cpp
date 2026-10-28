@@ -14,13 +14,18 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <signal.h>
 
 #include <atomic>
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
 #include <ctime>
 #include <deque>
+#include <condition_variable>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include <pthread.h>
 #include <semaphore.h>
@@ -34,6 +39,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 // Horizon has no sys/syscall.h. The shim provides affinity, priority, cpu_set_t
 // and the thread id. See core/threading_switch.h.
 #include "threading_switch.h"
+// The pool of thread stacks (switch_reaper below) allocates the blocks the way
+// libnx would (memalign) and sizes them the way libnx carves them (struct _reent).
+#include <malloc.h>
+#include <sys/reent.h>
 #else
 #include <sys/syscall.h>
 #endif
@@ -43,7 +52,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/sys_counters.h>
 #include <rex/thread/timer_queue.h>
 
 #include <sched.h>
@@ -67,6 +78,33 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #else
 #define REX_HAS_SIGEV_THREAD_ID 0
 #endif
+
+// sa2-nx (2026-10-20): see switch_reaper's pool below.
+REXCVAR_DEFINE_INT32(switch_thread_stack_pool, 64, "Threading",
+                     "Switch: guest thread stacks (16 MB each) kept for the next threads instead of going back to the "
+                     "heap. 4 before 2026-10-20: SA2 runs up to 55 guest threads at once at a stage load, so each load "
+                     "took new 16 MB blocks from the heap and gave them back, and the heap fragmented (Ryujinx, 9 "
+                     "minutes of the attract demos: 1.4 GB more taken with 4, 0.76 GB with 24, flat with 64 after the "
+                     "first load, the memory in use the same)")
+    .range(4, 64)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(thread_wait_blocking, true, "Threading",
+                    "Event-driven waits: WaitMultiple parks on a wake point instead of polling every 1 ms, "
+                    "and alertable waits are woken by the queued APC hint instead of a 1 ms poll slice. "
+                    "false = the original 1 ms polling (A/B; also the fallback if a hang is suspected)");
+REXCVAR_DEFINE_BOOL(thread_signal_skip_idle, true, "Threading",
+                    "Setting an event or releasing a semaphore that no thread is blocked on does not call the "
+                    "condition variable's notify (on Horizon always a syscall, svcSignalProcessWideKey, even with "
+                    "nobody waiting): the waiters of each condition are counted under its own mutex. false = notify "
+                    "on every signal, as before");
+
+REXCVAR_DEFINE_INT32(thread_alertable_slice_ms, 8, "Threading",
+                     "With thread_wait_blocking: longest an alertable wait sleeps before it re-checks the "
+                     "APC queue (safety net; the wake-up normally arrives through the queued callback). "
+                     "Ignored (1 ms) with thread_wait_blocking = false");
+REXCVAR_DEFINE_INT32(thread_multiwait_safety_ms, 20, "Threading",
+                     "With thread_wait_blocking: a parked WaitMultiple re-polls its handles at least this "
+                     "often even if nobody poked it (safety net against a state change that did not notify)");
 
 namespace rex::thread {
 
@@ -224,26 +262,9 @@ void Sleep(std::chrono::microseconds duration) {
   } while (ret == -1 && errno == EINTR);
 }
 
-// TODO(bwrsandman) Implement by allowing alert interrupts from IO operations
+// AlertableSleep: defined below, after the condition classes (it parks on a wake point).
 thread_local bool alertable_state_ = false;
 bool DispatchCurrentThreadUserCallback();
-SleepResult AlertableSleep(std::chrono::microseconds duration) {
-  alertable_state_ = true;
-  auto deadline = std::chrono::steady_clock::now() + duration;
-  while (true) {
-    if (DispatchCurrentThreadUserCallback()) {
-      alertable_state_ = false;
-      return SleepResult::kAlerted;
-    }
-    auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      alertable_state_ = false;
-      return SleepResult::kSuccess;
-    }
-    auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
-    Sleep(std::min(remaining, std::chrono::microseconds(1000)));
-  }
-}
 
 TlsHandle AllocateTlsHandle() {
   auto key = static_cast<pthread_key_t>(-1);
@@ -285,6 +306,22 @@ static sem_t* RexCreateAnonymousSemaphore() {
 }
 #endif  // __APPLE__
 
+// A thread parked in a blocking WaitMultiple (or an alertable wait) sleeps on one of these. Handles that
+// change state poke the wake points registered on them; QueueUserCallback pokes the one of the target thread.
+// Lifetime: owned by the waiter's stack; it is unregistered from every handle (which takes that handle's
+// registration mutex, so it also waits for a poker that is inside Poke) before it is destroyed.
+struct WakePoint {
+  std::mutex m;
+  std::condition_variable cv;
+  std::atomic<uint64_t> seq{0};
+
+  void Poke() {
+    std::lock_guard<std::mutex> lock(m);
+    seq.fetch_add(1, std::memory_order_relaxed);
+    cv.notify_all();
+  }
+};
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
@@ -305,9 +342,48 @@ class PosixConditionBase {
   virtual ~PosixConditionBase() = default;
   virtual bool Signal() = 0;
 
-  WaitResult Wait(std::chrono::milliseconds timeout) {
+  // Wake points of the WaitMultiple calls currently parked on this handle.
+  void RegisterMulti(WakePoint* wp) {
+    std::lock_guard<std::mutex> lock(multi_mutex_);
+    multi_waiters_.push_back(wp);
+    multi_count_.fetch_add(1, std::memory_order_seq_cst);
+  }
+  void UnregisterMulti(WakePoint* wp) {
+    std::lock_guard<std::mutex> lock(multi_mutex_);
+    for (auto it = multi_waiters_.begin(); it != multi_waiters_.end(); ++it) {
+      if (*it == wp) {
+        multi_waiters_.erase(it);
+        break;
+      }
+    }
+    multi_count_.fetch_sub(1, std::memory_order_seq_cst);
+  }
+  // Called by every state change that can satisfy a wait, AFTER the state was written (and its lock
+  // released). One relaxed-cost load when nobody is parked.
+  void NotifyMulti() {
+    if (multi_count_.load(std::memory_order_seq_cst) == 0) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(multi_mutex_);
+    for (WakePoint* wp : multi_waiters_) {
+      wp->Poke();
+    }
+  }
+  // Wakes a thread blocked in Wait() on this condition without signalling it (alertable wait interrupted by
+  // a queued callback). The waiter's predicate sees its interrupt flag.
+  void InterruptWaiters() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cond_.notify_all();
+  }
+
+  // `interrupt` (optional): an alertable wait passes the flag "a user callback is queued for me"; the wait
+  // then returns kTimeout early (the caller dispatches the callback and decides what to do next).
+  WaitResult Wait(std::chrono::milliseconds timeout,
+                  const std::atomic<bool>* interrupt = nullptr) {
     bool executed;
-    auto predicate = [this] { return this->signaled(); };
+    auto predicate = [this, interrupt] {
+      return this->signaled() || (interrupt && interrupt->load(std::memory_order_acquire));
+    };
 #if defined(__SWITCH__)
     // The timeout includes acquiring the internal lock. lock() ignored it, and a
     // zero-timeout query could block behind another thread indefinitely.
@@ -323,7 +399,7 @@ class PosixConditionBase {
         if (now >= deadline) {
           return WaitResult::kTimeout;
         }
-        // Dormir permite avanzar al propietario aunque tenga menor prioridad.
+        // Sleeping lets the owner make progress even with a lower priority.
         const auto remaining = std::chrono::ceil<std::chrono::microseconds>(deadline - now);
         std::this_thread::sleep_for(std::min(remaining, std::chrono::microseconds(100)));
       }
@@ -343,6 +419,10 @@ class PosixConditionBase {
     if (predicate()) {
       executed = true;
     } else {
+      // thread_signal_skip_idle: counted while blocked (under mutex_, which the wait releases only once this thread
+      // is queued on the condition), so a signaller that changes the state under the same mutex sees every thread
+      // its notify could wake. A thread that arrives later finds the state already changed and does not block.
+      ++cond_waiters_;
       if (timeout == std::chrono::milliseconds::max()) {
         cond_.wait(lock, predicate);
         executed = true;  // Did not time out;
@@ -354,8 +434,12 @@ class PosixConditionBase {
         executed = cond_.wait_for(lock, timeout, predicate);
 #endif
       }
+      --cond_waiters_;
     }
     if (executed) {
+      if (interrupt && !signaled()) {
+        return WaitResult::kTimeout;  // interrupted by a queued user callback
+      }
       post_execution();
       return WaitResult::kSuccess;
     } else {
@@ -363,13 +447,18 @@ class PosixConditionBase {
     }
   }
 
+  // `wake` (optional): wake point registered by the caller (and, for alertable calls, with its thread). With
+  // it the call parks instead of sleeping 1 ms between polls: it re-polls when a registered handle is
+  // signalled (poke), when `interrupt` is raised, at the end of the timeout, or after the safety interval.
   static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
                                                     bool wait_all,
-                                                    std::chrono::milliseconds timeout) {
+                                                    std::chrono::milliseconds timeout,
+                                                    WakePoint* wake = nullptr,
+                                                    const std::atomic<bool>* interrupt = nullptr) {
     assert_true(!handles.empty());
 
     if (handles.size() == 1) {
-      auto result = handles[0]->Wait(timeout);
+      auto result = handles[0]->Wait(timeout, interrupt);
       return std::make_pair(result, 0);
     }
 
@@ -378,10 +467,30 @@ class PosixConditionBase {
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
+    // Registered for the whole call; the guard unregisters on every exit path.
+    struct MultiRegistration {
+      std::vector<PosixConditionBase*>& handles;
+      WakePoint* wake;
+      MultiRegistration(std::vector<PosixConditionBase*>& h, WakePoint* w) : handles(h), wake(w) {
+        if (wake) {
+          for (auto* handle : handles) handle->RegisterMulti(wake);
+        }
+      }
+      ~MultiRegistration() {
+        if (wake) {
+          for (auto* handle : handles) handle->UnregisterMulti(wake);
+        }
+      }
+    } registration(handles, wake);
+    const auto safety = std::chrono::milliseconds(std::max(1, REXCVAR_GET(thread_multiwait_safety_ms)));
+
     // Reuse the allocation between polls; clear() releases the locks, not the memory.
     std::vector<std::unique_lock<std::mutex>> locks;
     locks.reserve(handles.size());
     while (true) {
+      // Sampled BEFORE the poll: a handle signalled after this point bumps the sequence, so the park
+      // below returns at once instead of missing it.
+      const uint64_t seen = wake ? wake->seq.load(std::memory_order_acquire) : 0;
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -472,6 +581,34 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
+      if (wake) {
+        // An interrupt raised before we got here is handled by the caller (it dispatches the callback).
+        if (interrupt && interrupt->load(std::memory_order_acquire)) {
+          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
+        }
+        auto wake_deadline = now + safety;
+        if (end_time < wake_deadline) {
+          wake_deadline = end_time;
+        }
+        REX_SYS_COUNT(rex::syscount::kMultiBlock, 1);
+        std::unique_lock<std::mutex> park(wake->m);
+        const bool woke = wake->cv.wait_until(park, wake_deadline, [&] {
+          return wake->seq.load(std::memory_order_relaxed) != seen ||
+                 (interrupt && interrupt->load(std::memory_order_acquire));
+        });
+        park.unlock();
+        if (woke) {
+          if (interrupt && interrupt->load(std::memory_order_acquire)) {
+            return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
+          }
+          REX_SYS_COUNT(rex::syscount::kMultiWake, 1);
+        } else if (std::chrono::steady_clock::now() < end_time) {
+          REX_SYS_COUNT(rex::syscount::kMultiSafety, 1);
+        }
+        continue;
+      }
+
+      REX_SYS_COUNT(rex::syscount::kMultiPoll, 1);
       if (timeout == std::chrono::milliseconds::max()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       } else {
@@ -493,8 +630,24 @@ class PosixConditionBase {
  protected:
   inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+  // thread_signal_skip_idle: the notify of a state change, given the waiter count read under mutex_ together with
+  // that change. Without a waiter there is nothing to wake and the syscall is skipped (counted for the profiler).
+  void WakeWaiters(uint32_t waiters) {
+    static const bool skip_idle = REXCVAR_GET(thread_signal_skip_idle);
+    if (waiters != 0 || !skip_idle) {
+      cond_.notify_all();
+    } else {
+      REX_SYS_COUNT(rex::syscount::kSignalIdle, 1);
+    }
+  }
   std::condition_variable cond_;
   std::mutex mutex_;
+  uint32_t cond_waiters_ = 0;  // threads blocked in Wait() on cond_; guarded by mutex_
+
+ private:
+  std::mutex multi_mutex_;
+  std::vector<WakePoint*> multi_waiters_;
+  std::atomic<uint32_t> multi_count_{0};
 };
 
 // There really is no native POSIX handle for a single wait/signal construct
@@ -512,9 +665,16 @@ class PosixCondition<Event> : public PosixConditionBase {
   virtual ~PosixCondition() = default;
 
   bool Signal() override {
-    auto lock = std::unique_lock<std::mutex>(mutex_);
-    signal_ = true;
-    cond_.notify_all();
+    uint32_t waiters;
+    {
+      auto lock = std::unique_lock<std::mutex>(mutex_);
+      signal_ = true;
+      waiters = cond_waiters_;
+    }
+    // Notified after the lock is released: a woken waiter (on Horizon the XMA decoder runs above the guest
+    // threads) would otherwise run straight into the mutex its signaller still holds and go back to sleep.
+    WakeWaiters(waiters);
+    NotifyMulti();
     return true;
   }
 
@@ -551,7 +711,10 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
-    cond_.notify_all();
+    const uint32_t waiters = cond_waiters_;
+    lock.unlock();
+    WakeWaiters(waiters);
+    NotifyMulti();
     return true;
   }
 
@@ -559,7 +722,8 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   inline bool signaled() const override { return count_ > 0; }
   inline void post_execution() override {
     count_--;
-    cond_.notify_all();
+    // Called by the waiter under mutex_ (it has left the count already): other waiters re-check the count.
+    WakeWaiters(cond_waiters_);
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -579,11 +743,16 @@ class PosixCondition<Mutant> : public PosixConditionBase {
 
   bool Release() {
     if (owner_ == std::this_thread::get_id() && count_ > 0) {
-      auto lock = std::unique_lock<std::mutex>(mutex_);
-      --count_;
-      // Free to be acquired by another thread
-      if (count_ == 0) {
+      bool released = false;
+      {
+        auto lock = std::unique_lock<std::mutex>(mutex_);
+        --count_;
+        // Free to be acquired by another thread
+        released = count_ == 0;
+      }
+      if (released) {
         cond_.notify_all();
+        NotifyMulti();
       }
       return true;
     }
@@ -613,9 +782,12 @@ class PosixCondition<Timer> : public PosixConditionBase {
   virtual ~PosixCondition() { Cancel(); }
 
   bool Signal() override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    signal_ = true;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      signal_ = true;
+    }
     cond_.notify_all();
+    NotifyMulti();
     return true;
   }
 
@@ -686,6 +858,259 @@ struct ThreadStartData {
   Thread* thread_obj;
 };
 
+#if defined(__SWITCH__)
+/*
+ * sa2-nx: the reaper of finished threads.
+ *
+ * libnx has no thread detach (newlib's pthread_detach calls __syscall_thread_detach, which libnx does not
+ * implement), and a Horizon thread keeps its kernel thread slot and its stack (16 MB for a guest thread) until
+ * pthread_join closes it. The SDK joined a thread only when guest code waited on it (post_execution). Sonic
+ * Adventure 2 starts a one-shot "AsynDo" thread per asynchronous job and never waits on them: 58 of them piled up,
+ * the process reached its thread limit (95 threads), and the level loader's CreateThread failed with
+ * C0000017 - the loading screen then waited forever for a thread that did not exist.
+ *
+ * Each thread hands itself to this reaper as it finishes (ClaimJoin), and one reaper thread joins it a second
+ * later, when the thread has surely exited and nothing still holds its handle for a call in flight. A wait that
+ * comes after the claim no longer joins (the claim is a flag both sides take), so nothing is joined twice.
+ *
+ * One exception: when a creation fails, usually for want of what those finished threads still hold (a stack block,
+ * a kernel slot), they are joined at once (JoinFinishedNow) instead of after their second. That is safe on Horizon:
+ * pthread_join itself waits for the thread to exit, and no call made on another thread's pthread_t reads it there
+ * (the shim looks handles up by value, pthread_cancel is a stub, and names are only touched before the thread is
+ * marked finished, which comes before its claim).
+ */
+namespace switch_reaper {
+struct Item {
+  pthread_t thread;
+  std::chrono::steady_clock::time_point due;
+  void* stack;  // its stack block, from the pool below (null: libnx allocated that stack and frees it itself)
+  size_t stack_bytes;
+};
+std::mutex g_mutex;
+std::condition_variable g_cv;
+std::deque<Item> g_queue;  // oldest first, hence in due order (JoinFinishedNow only brings due times in to now)
+bool g_started = false;
+std::atomic<uint64_t> g_reaped{0};
+std::condition_variable g_drained;  // notified after each join, and when a stack block is kept in the pool
+bool g_joining = false;             // Loop has taken an item and not joined it yet (under g_mutex)
+
+/*
+ * sa2-nx: the stacks of joined threads, kept for the next thread of the same size.
+ *
+ * Console, 2026-10-07 (the Tails boss stage and later): 77 creations of a guest thread failed with "heap has NO a
+ * 16448 KB block" while the heap had 1.0-1.5 GB free, in ~10.8 k pieces. The only block that big was the stack of
+ * the previous one-shot "AsynDo" thread, which went back to the heap when the reaper joined that thread, a second
+ * after it ended, so each creation waited for that join: 0.3-1.0 s, a frame of ~1000 ms every time, 74 s in all. A
+ * 16 MB block given back to the heap is also soon split by small allocations.
+ *
+ * So a big stack is a block of our own, from here or, when none is kept, from the heap. It goes to libnx through
+ * pthread_attr_setstack: threadCreate maps it into the stack region without owning it (it carves the TLS and the
+ * reent out of its top, as it does with its own allocation) and the join (threadClose) unmaps it. Then the block
+ * comes back here instead of to the heap. At most PoolBlocks() blocks and PoolMaxBytes() are kept; any other block
+ * goes back to the heap.
+ */
+// Only the guest threads' 16 MB stacks. The SDK's own threads (4 MB by default, long-lived) stay with libnx as
+// before, and their blocks never take the pool's places.
+constexpr size_t kPoolMinStack = size_t(8) << 20;
+// sa2-nx (2026-10-20): switch_thread_stack_pool blocks (4 before), each a guest stack of 16 MB with its TLS.
+constexpr size_t kPoolMaxBlocks = 64;
+size_t PoolBlocks() {
+  static const size_t blocks = size_t(std::clamp<int32_t>(REXCVAR_GET(switch_thread_stack_pool), 4, 64));
+  return blocks;
+}
+size_t PoolMaxBytes() { return PoolBlocks() * (size_t(20) << 20); }
+struct Stack {
+  void* base;
+  size_t bytes;
+};
+std::array<Stack, kPoolMaxBlocks> g_pool{};  // the first g_pool_count are kept blocks (under g_mutex)
+size_t g_pool_count = 0;
+size_t g_pool_bytes = 0;
+std::atomic<uint64_t> g_stacks_new{0};     // stack blocks taken from the heap
+std::atomic<uint64_t> g_stacks_reused{0};  // ... and from the pool
+std::atomic<uint64_t> g_early_joins{0};    // creations that went through once JoinFinishedNow had joined threads
+std::atomic<uint64_t> g_stacks_live{0};    // sa2-nx (2026-10-20): pooled-size stacks taken and not given back yet
+std::atomic<uint64_t> g_stacks_peak{0};    // ... their most at once
+
+// libnx's linker script (switch.ld): the thread-local segment that threadCreate sets up in every new thread.
+extern "C" char __tls_start[];
+extern "C" char __tls_end[];
+extern "C" size_t __tls_align;
+
+// What threadCreate takes from the top of a stack it is handed (libnx, kernel/thread.c): the TLS segment and the
+// newlib reent, rounded up to the TLS alignment, then 48 bytes of start arguments. Measured as libnx measures it.
+size_t LibnxStackOverhead() {
+  const size_t tls = (static_cast<size_t>(__tls_end - __tls_start) + 0xF) & ~size_t(0xF);
+  const size_t reent = (sizeof(struct _reent) + 0xF) & ~size_t(0xF);
+  const size_t align = std::max<size_t>(__tls_align, 2 * sizeof(void*));
+  return ((tls + reent + align - 1) & ~(align - 1)) + 0x30;
+}
+
+// The block for a thread that asks for `stack_size`, or 0 when libnx allocates the stack as before. Whole pages
+// (libnx requires it), and big enough that the thread keeps at least `stack_size` of stack (libnx's own allocation
+// leaves it `stack_size` minus those 48 bytes). A TLS segment as big as a pooled stack is not expected: left to libnx.
+size_t PooledStackBytes(size_t stack_size) {
+  static const size_t overhead = LibnxStackOverhead();
+  if (stack_size < kPoolMinStack || overhead > kPoolMinStack) {
+    return 0;
+  }
+  return (stack_size + overhead + 0xFFF) & ~size_t(0xFFF);
+}
+
+// Takes a kept block of exactly `bytes` out of the pool, or returns null. Under g_mutex.
+void* PopPooledLocked(size_t bytes) {
+  for (size_t i = g_pool_count; i-- > 0;) {
+    if (g_pool[i].bytes == bytes) {
+      void* const base = g_pool[i].base;
+      g_pool[i] = g_pool[--g_pool_count];
+      g_pool_bytes -= bytes;
+      return base;
+    }
+  }
+  return nullptr;
+}
+
+// A block for a new thread's stack: a kept one, else a new one from the heap. Null when the heap has none either.
+void NoteStackTaken() {
+  const uint64_t live = g_stacks_live.fetch_add(1, std::memory_order_relaxed) + 1;
+  uint64_t peak = g_stacks_peak.load(std::memory_order_relaxed);
+  while (live > peak && !g_stacks_peak.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
+  }
+}
+
+void* TakeStack(size_t bytes) {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (void* const base = PopPooledLocked(bytes)) {
+      g_stacks_reused.fetch_add(1, std::memory_order_relaxed);
+      NoteStackTaken();
+      return base;
+    }
+  }
+  void* const base = memalign(0x1000, bytes);
+  if (base != nullptr) {
+    g_stacks_new.fetch_add(1, std::memory_order_relaxed);
+    NoteStackTaken();
+  }
+  return base;
+}
+
+// A block no thread runs on any more (its thread was joined, or never started): kept for the next thread while the
+// pool has room, else given back to the heap.
+void GiveStack(void* base, size_t bytes) {
+  if (base == nullptr) {
+    return;
+  }
+  g_stacks_live.fetch_sub(1, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_pool_count < PoolBlocks() && g_pool_bytes + bytes <= PoolMaxBytes()) {
+      g_pool[g_pool_count++] = {base, bytes};
+      g_pool_bytes += bytes;
+      g_drained.notify_all();  // a creation may be waiting for one (JoinFinishedNow)
+      return;
+    }
+  }
+  free(base);
+}
+
+void* Loop(void*) {
+  std::unique_lock<std::mutex> lock(g_mutex);
+  for (;;) {
+    if (g_queue.empty()) {
+      g_cv.wait(lock);
+      continue;
+    }
+    // The oldest finished thread is joined when it is due, or sooner once JoinFinishedNow brought its due time in.
+    const auto due = g_queue.front().due;
+    if (std::chrono::steady_clock::now() < due) {
+      g_cv.wait_until(lock, due);
+      continue;
+    }
+    const Item item = g_queue.front();
+    g_queue.pop_front();
+    g_joining = true;
+    lock.unlock();
+    pthread_join(item.thread, nullptr);
+    GiveStack(item.stack, item.stack_bytes);  // the join unmapped it
+    const uint64_t reaped = g_reaped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (reaped <= 4 || reaped % 16 == 0) {
+      size_t kept = 0;
+      size_t kept_bytes = 0;
+      {
+        std::lock_guard<std::mutex> pool_lock(g_mutex);
+        kept = g_pool_count;
+        kept_bytes = g_pool_bytes;
+      }
+      REXSYS_INFO("[threads] {} finished host threads released (kernel slot and stack); stacks: {} from the heap, "
+                  "{} reused, {} kept ({} MB, at most {}), {} at most in use at once; {} creations helped by "
+                  "joining finished threads early",
+                  reaped, g_stacks_new.load(std::memory_order_relaxed),
+                  g_stacks_reused.load(std::memory_order_relaxed), kept, kept_bytes >> 20, PoolBlocks(),
+                  g_stacks_peak.load(std::memory_order_relaxed), g_early_joins.load(std::memory_order_relaxed));
+    }
+    lock.lock();
+    g_joining = false;
+    g_drained.notify_all();
+  }
+  return nullptr;
+}
+
+// Finished threads that still hold their kernel slot and their stack.
+size_t Pending() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return g_queue.size() + (g_joining ? 1 : 0);
+}
+
+// Waits, at most `timeout`, until every finished thread has been joined.
+bool WaitDrained(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(g_mutex);
+  return g_drained.wait_for(lock, timeout, [] { return g_queue.empty() && !g_joining; });
+}
+
+/*
+ * For a creation that failed: has every finished thread joined now rather than a second after it ended, then waits
+ * (at most `timeout`) until a block of `bytes` is kept in the pool, which it takes and returns, or until nothing is
+ * left to join. `bytes` 0 (a stack libnx allocates): it only waits for the joins. `pending`: how many finished
+ * threads were waiting to be joined.
+ */
+void* JoinFinishedNow(size_t bytes, std::chrono::milliseconds timeout, size_t* pending) {
+  std::unique_lock<std::mutex> lock(g_mutex);
+  *pending = g_queue.size() + (g_joining ? 1 : 0);
+  const auto now = std::chrono::steady_clock::now();
+  for (Item& item : g_queue) {
+    item.due = std::min(item.due, now);
+  }
+  g_cv.notify_one();
+  void* stack = nullptr;
+  g_drained.wait_for(lock, timeout, [&] {
+    stack = bytes != 0 ? PopPooledLocked(bytes) : nullptr;
+    return stack != nullptr || (g_queue.empty() && !g_joining);
+  });
+  if (stack != nullptr) {
+    g_stacks_reused.fetch_add(1, std::memory_order_relaxed);
+    NoteStackTaken();
+  }
+  return stack;
+}
+
+void Queue(pthread_t thread, void* stack, size_t stack_bytes) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_started) {
+    pthread_attr_t attr;
+    pthread_t reaper;
+    if (pthread_attr_init(&attr) == 0) {
+      pthread_attr_setstacksize(&attr, 64 * 1024);
+      g_started = pthread_create(&reaper, &attr, Loop, nullptr) == 0;
+      pthread_attr_destroy(&attr);
+    }
+  }
+  g_queue.push_back({thread, std::chrono::steady_clock::now() + std::chrono::seconds(1), stack, stack_bytes});
+  g_cv.notify_one();
+}
+}  // namespace switch_reaper
+#endif
+
 template <>
 class PosixCondition<Thread> : public PosixConditionBase {
   enum class State {
@@ -732,7 +1157,90 @@ class PosixCondition<Thread> : public PosixConditionBase {
         return false;
       }
     }
-    if (pthread_create(&thread_, &attr, ThreadStartRoutine, start_data) != 0) {
+#if defined(__SWITCH__)
+    /*
+     * sa2-nx: a big stack (16 MB for a guest thread) runs on a block from switch_reaper's pool, which keeps the
+     * stacks of joined threads for the next threads instead of giving them back to a fragmented heap (see there).
+     */
+    const size_t pooled_bytes = switch_reaper::PooledStackBytes(params.stack_size);
+    // One try. `stack`: a block already taken from the pool, or null to take one here.
+    auto create = [&](void* stack) -> int {
+      if (pooled_bytes == 0) {
+        return pthread_create(&thread_, &attr, ThreadStartRoutine, start_data);
+      }
+      if (stack == nullptr) {
+        stack = switch_reaper::TakeStack(pooled_bytes);
+        if (stack == nullptr) {
+          return ENOMEM;  // what libnx returns when it cannot allocate the stack itself
+        }
+      }
+      // Recorded before the thread exists: it hands the block to the reaper as it ends (ClaimJoin), which can
+      // happen before pthread_create returns here.
+      stack_ = stack;
+      stack_bytes_ = pooled_bytes;
+      int result = pthread_attr_setstack(&attr, stack, pooled_bytes);
+      if (result == 0) {
+        result = pthread_create(&thread_, &attr, ThreadStartRoutine, start_data);
+      }
+      if (result != 0) {
+        stack_ = nullptr;
+        stack_bytes_ = 0;
+        switch_reaper::GiveStack(stack, pooled_bytes);  // the thread never ran on it
+      }
+      return result;
+    };
+    int created = create(nullptr);
+    if (created != 0) {
+      /*
+       * sa2-nx: what is missing is usually held by finished threads the reaper has not joined yet. Each keeps its
+       * stack and its kernel slot for a second after it ends, and the game starts its next one-shot thread long
+       * before that (every ~35 ms on the Tails boss stage). They are joined now and the creation is tried again as
+       * soon as one of their stacks is back, instead of waiting for the reaper; the retries below stay as the
+       * fallback.
+       */
+      const auto asked = std::chrono::steady_clock::now();
+      size_t pending = 0;
+      void* const stack = switch_reaper::JoinFinishedNow(pooled_bytes, std::chrono::milliseconds(250), &pending);
+      if (stack != nullptr || pending != 0) {
+        const int first = created;
+        created = create(stack);
+        if (created == 0) {
+          const uint64_t helped = switch_reaper::g_early_joins.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (helped <= 4) {
+            REXSYS_INFO("[threads] creating a thread with a {} KB stack failed ({}): {} finished threads were joined "
+                        "at once instead of a second after they ended, and the thread was created {:.2f} ms later "
+                        "(early join {}; the reaper's report line counts the next ones)",
+                        params.stack_size >> 10, first, pending,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - asked).count(),
+                        helped);
+          }
+        }
+      }
+    }
+    /*
+     * sa2-nx: a failed creation ends a level load for good. The game's loader thread never runs and the loading
+     * screen waits for it forever (console, 2026-10-06 22:41:12, the load after the Big Foot boss: "CreateThread
+     * failed", C0000017). libnx turns every failure into ENOMEM, so the log says which resource is missing, and
+     * the finished threads the reaper still holds (each keeps its stack and its kernel slot for a second) are
+     * released before trying again.
+     */
+    for (int attempt = 1; created != 0 && attempt <= 3; ++attempt) {
+      char why[320];
+      RexSwitchDescribeThreadFailure(params.stack_size, why, sizeof(why));
+      REXSYS_WARN("[threads] creating a thread with a {} KB stack failed ({}), attempt {} of 4: {}; {} finished "
+                  "threads not released yet",
+                  params.stack_size >> 10, created, attempt, static_cast<const char*>(why),
+                  switch_reaper::Pending());
+      switch_reaper::WaitDrained(std::chrono::milliseconds(1500));
+      created = create(nullptr);
+      if (created == 0) {
+        REXSYS_WARN("[threads] the thread was created at attempt {}", attempt + 1);
+      }
+    }
+#else
+    int created = pthread_create(&thread_, &attr, ThreadStartRoutine, start_data);
+#endif
+    if (created != 0) {
       pthread_attr_destroy(&attr);
       return false;
     }
@@ -832,8 +1340,20 @@ class PosixCondition<Thread> : public PosixConditionBase {
   uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
 #endif
 
+#if defined(__SWITCH__)
+  // The finished thread's handle goes to the reaper (with its pooled stack): no call may use it once the join is
+  // claimed.
+  void ClaimJoin() {
+    if (thread_ && !join_claimed_.exchange(true)) switch_reaper::Queue(thread_, stack_, stack_bytes_);
+  }
+  bool HandleGone() const { return join_claimed_.load(std::memory_order_acquire); }
+#else
+  bool HandleGone() const { return false; }
+#endif
+
   uint64_t affinity_mask() {
     WaitStarted();
+    if (HandleGone()) return 0;
 #if defined(__APPLE__)
     // macOS doesn't expose Linux-style pthread affinity masks; report every
     // logical processor as available.
@@ -865,6 +1385,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_affinity_mask(uint64_t mask) {
     WaitStarted();
+    if (HandleGone()) return;
 #if defined(__APPLE__)
     // macOS doesn't expose Linux-style pthread affinity masks; keep this a
     // no-op so higher layers can build and run.
@@ -891,6 +1412,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   int priority() {
     WaitStarted();
+    if (HandleGone()) return -1;
     int policy;
     sched_param param{};
     int ret = pthread_getschedparam(thread_, &policy, &param);
@@ -903,6 +1425,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_priority(int new_priority) {
     WaitStarted();
+    if (HandleGone()) return;
     sched_param param{};
     param.sched_priority = new_priority;
     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
@@ -938,6 +1461,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
 
+    // An alertable wait of the target is parked until its timeout / a signal: wake it so it dispatches the
+    // callback now (the flag above is what its wait predicate looks at).
+    WakeAlertableWaiter();
+
 #if defined(__SWITCH__)
     // Horizon does not deliver signals, so there is no way to interrupt another
     // thread to make it run the call. The callback is queued and runs when the
@@ -965,6 +1492,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (result != 0) {
       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
     }
+  }
+
+  // What the owning thread is parked on inside an alertable wait (exactly one of the two is set), or none.
+  // Set/cleared by ScopedAlertWake; QueueUserCallback pokes it. Holding wake_mutex_ while poking keeps the
+  // target alive (the waiter clears it, under the same mutex, before its wait object goes out of scope).
+  void SetWakeTarget(PosixConditionBase* cond, WakePoint* point) {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    wake_cond_ = cond;
+    wake_point_ = point;
+  }
+  void WakeAlertableWaiter() {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    if (wake_cond_) {
+      wake_cond_->InterruptWaiters();
+    }
+    if (wake_point_) {
+      wake_point_->Poke();
+    }
+  }
+  const std::atomic<bool>* pending_user_callbacks_flag() const {
+    return &has_pending_user_callbacks_;
   }
 
   bool DispatchQueuedUserCallbacks() {
@@ -1009,7 +1557,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       // wakes a thread that suspended itself from WaitSuspended(); this call
       // resumes a thread that was paused from outside. Both are needed,
       // because they are two different suspension paths.
-      if (!pthread_equal(thread_, pthread_self())) {
+      if (!pthread_equal(thread_, pthread_self()) && !HandleGone()) {
         RexSwitchResumeThread(thread_);
       }
 #endif
@@ -1050,7 +1598,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     // as random corruption.
     //
     // svcSetThreadActivity is the system's real mechanism.
-    return RexSwitchPauseThread(thread_) == 0;
+    return !HandleGone() && RexSwitchPauseThread(thread_) == 0;
 #else
     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadSuspend));
     return result == 0;
@@ -1074,6 +1622,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
       }
       state_ = State::kFinished;
     }
+#if defined(__SWITCH__)
+    if (is_current_thread) ClaimJoin();  // ExitThread: this thread will not return to ThreadStartRoutine
+#endif
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1082,6 +1633,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       signaled_ = true;
       cond_.notify_all();
     }
+    NotifyMulti();
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
     } else {
@@ -1116,8 +1668,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
   static void* ThreadStartRoutine(void* parameter);
   inline bool signaled() const override { return signaled_; }
   inline void post_execution() override {
-    if (thread_) {
+    // The first one to claim the join does it (a wait here, or the Switch reaper); a second wait does nothing.
+    if (thread_ && !join_claimed_.exchange(true)) {
       pthread_join(thread_, nullptr);
+#if defined(__SWITCH__)
+      switch_reaper::GiveStack(stack_, stack_bytes_);  // the join unmapped it: it can carry another thread
+#endif
     }
 #if defined(__APPLE__)
     if (suspend_sem_ != SEM_FAILED) {
@@ -1129,6 +1685,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #endif
   }
   pthread_t thread_;
+  std::atomic<bool> join_claimed_{false};  // somebody joins (or will join) thread_: see switch_reaper
+#if defined(__SWITCH__)
+  void* stack_ = nullptr;  // thread_'s stack block from switch_reaper's pool (null: libnx allocated the stack)
+  size_t stack_bytes_ = 0;
+#endif
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_
@@ -1145,6 +1706,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
   mutable std::condition_variable state_signal_;
   std::deque<std::function<void()>> user_callbacks_;
   std::atomic<bool> has_pending_user_callbacks_{false};
+  std::mutex wake_mutex_;
+  PosixConditionBase* wake_cond_ = nullptr;
+  WakePoint* wake_point_ = nullptr;
 #if REX_PLATFORM_ANDROID
   // Name accessible via name() on Android before API 26 which added
   // pthread_getname_np.
@@ -1172,7 +1736,44 @@ bool DispatchCurrentThreadUserCallback() {
 
 namespace {
 
-constexpr auto kAlertablePollSlice = std::chrono::milliseconds(1);
+// Slice an alertable wait sleeps before re-checking the user-callback queue. With event-driven waits the queued
+// callback wakes the waiter itself, so the slice is only a safety net; legacy mode polls every 1 ms.
+std::chrono::milliseconds AlertablePollSlice() {
+  if (!REXCVAR_GET(thread_wait_blocking)) {
+    return std::chrono::milliseconds(1);
+  }
+  return std::chrono::milliseconds(std::clamp(REXCVAR_GET(thread_alertable_slice_ms), 1, 1000));
+}
+
+// Registers what the current thread parks on for the duration of an alertable wait, so QueueUserCallback
+// (from another thread) can wake it. Inert when event-driven waits are off.
+class ScopedAlertWake {
+ public:
+  ScopedAlertWake(PosixConditionBase* cond, WakePoint* point) {
+    if (!REXCVAR_GET(thread_wait_blocking)) {
+      return;
+    }
+    if (!current_thread_condition_) {
+      Thread::GetCurrentThread();
+    }
+    thread_ = current_thread_condition_;
+    if (thread_) {
+      thread_->SetWakeTarget(cond, point);
+    }
+  }
+  ~ScopedAlertWake() {
+    if (thread_) {
+      thread_->SetWakeTarget(nullptr, nullptr);
+    }
+  }
+  // The "callback queued" flag the parked wait watches, or null when not event-driven.
+  const std::atomic<bool>* flag() const {
+    return thread_ ? thread_->pending_user_callbacks_flag() : nullptr;
+  }
+
+ private:
+  PosixCondition<Thread>* thread_ = nullptr;
+};
 
 class ScopedAlertableState {
  public:
@@ -1206,7 +1807,7 @@ bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline) 
 std::chrono::milliseconds ComputeAlertableWaitTimeout(
     std::chrono::steady_clock::time_point deadline) {
   if (deadline == std::chrono::steady_clock::time_point::max()) {
-    return kAlertablePollSlice;
+    return AlertablePollSlice();
   }
   // A positive remainder under 1 ms must keep waiting. Truncating it to zero
   // turns the end of every alertable wait into a busy poll on Horizon.
@@ -1215,7 +1816,7 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
   if (remaining <= std::chrono::milliseconds::zero()) {
     return std::chrono::milliseconds::zero();
   }
-  return std::min(remaining, kAlertablePollSlice);
+  return std::min(remaining, AlertablePollSlice());
 }
 
 }  // namespace
@@ -1269,12 +1870,16 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
 
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
+  // Event-driven: a queued callback interrupts the parked Wait() (flag + InterruptWaiters).
+  ScopedAlertWake wake(&posix_wait_handle->condition(), nullptr);
+  const std::atomic<bool>* interrupt = wake.flag();
 
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
     }
-    auto result = posix_wait_handle->condition().Wait(ComputeAlertableWaitTimeout(deadline));
+    auto result =
+        posix_wait_handle->condition().Wait(ComputeAlertableWaitTimeout(deadline), interrupt);
     if (result != WaitResult::kTimeout) {
       return result;
     }
@@ -1282,6 +1887,9 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
     if (HasAlertableTimeoutElapsed(deadline)) {
       return WaitResult::kTimeout;
     }
+    REX_SYS_COUNT(interrupt && interrupt->load(std::memory_order_relaxed) ? rex::syscount::kAlertWake
+                                                                          : rex::syscount::kAlertSlice,
+                  1);
   }
 }
 
@@ -1303,11 +1911,14 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
 
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
+  ScopedAlertWake wake(&posix_wait_handle_to_wait_on->condition(), nullptr);
+  const std::atomic<bool>* interrupt = wake.flag();
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
     }
-    result = posix_wait_handle_to_wait_on->condition().Wait(ComputeAlertableWaitTimeout(deadline));
+    result = posix_wait_handle_to_wait_on->condition().Wait(ComputeAlertableWaitTimeout(deadline),
+                                                            interrupt);
     if (result != WaitResult::kTimeout) {
       return result;
     }
@@ -1329,24 +1940,71 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
     }
     conditions.push_back(&handle->condition());
   }
+  // Parked (event-driven) waits need a wake point; legacy mode keeps the 1 ms polling.
+  const bool blocking = REXCVAR_GET(thread_wait_blocking);
+  WakePoint wake_point;
+  WakePoint* wake = blocking && conditions.size() > 1 ? &wake_point : nullptr;
   if (!is_alertable) {
-    return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all, timeout);
+    return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all, timeout, wake, nullptr);
   }
 
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
+  // A single handle parks in Wait() itself; several park on the wake point.
+  ScopedAlertWake alert_wake(blocking && conditions.size() == 1 ? conditions[0] : nullptr, wake);
+  const std::atomic<bool>* interrupt = alert_wake.flag();
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return std::make_pair(WaitResult::kUserCallback, 0);
     }
     auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
-                                                   wait_all, ComputeAlertableWaitTimeout(deadline));
+                                                   wait_all, ComputeAlertableWaitTimeout(deadline),
+                                                   wake, interrupt);
     if (result.first != WaitResult::kTimeout) {
       return result;
     }
     if (HasAlertableTimeoutElapsed(deadline)) {
       return std::make_pair(WaitResult::kTimeout, 0);
     }
+    REX_SYS_COUNT(interrupt && interrupt->load(std::memory_order_relaxed) ? rex::syscount::kAlertWake
+                                                                          : rex::syscount::kAlertSlice,
+                  1);
+  }
+}
+
+// Sleeps (alertably) for `duration`; returns kAlerted when a queued user callback ran. Event-driven: parks on
+// a wake point that QueueUserCallback pokes, instead of 1 ms nanosleep slices.
+SleepResult AlertableSleep(std::chrono::microseconds duration) {
+  alertable_state_ = true;
+  auto deadline = std::chrono::steady_clock::now() + duration;
+  const bool blocking = REXCVAR_GET(thread_wait_blocking);
+  WakePoint wake_point;
+  ScopedAlertWake alert_wake(nullptr, blocking ? &wake_point : nullptr);
+  const std::atomic<bool>* interrupt = alert_wake.flag();
+  const auto slice = std::chrono::duration_cast<std::chrono::microseconds>(AlertablePollSlice());
+  while (true) {
+    if (DispatchCurrentThreadUserCallback()) {
+      alertable_state_ = false;
+      return SleepResult::kAlerted;
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      alertable_state_ = false;
+      return SleepResult::kSuccess;
+    }
+    auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+    const auto nap = std::min(remaining, slice);
+    if (blocking && interrupt) {
+      std::unique_lock<std::mutex> park(wake_point.m);
+      wake_point.cv.wait_until(park, now + nap, [&] {
+        return interrupt->load(std::memory_order_acquire);
+      });
+    } else {
+      Sleep(nap);
+    }
+    REX_SYS_COUNT(interrupt && interrupt->load(std::memory_order_relaxed) ? rex::syscount::kAlertWake
+                                                                          : rex::syscount::kAlertSlice,
+                  1);
   }
 }
 
@@ -1548,6 +2206,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = State::kFinished;
   }
+#if defined(__SWITCH__)
+  thread->handle_.ClaimJoin();  // before signaling: a waiter woken below must not join it too
+#endif
 
   {
     std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
@@ -1555,6 +2216,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
   }
+  thread->handle_.NotifyMulti();
 
   current_thread_ = nullptr;
   current_thread_condition_ = nullptr;

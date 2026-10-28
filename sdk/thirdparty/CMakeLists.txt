@@ -68,11 +68,13 @@ if(REXGLUE_BUILD_TESTS)
 endif()
 
 foreach(submodule ${REQUIRED_SUBMODULES})
-    # fetch_thirdparty.py copies the sources without their .git, so check the folder itself.
-    if(NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}")
+    # Fork change: the third-party sources are fetched by tools/fetch_thirdparty.py instead of
+    # being git submodules, so check for a populated directory rather than a .git entry.
+    file(GLOB _submodule_files "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/*")
+    if(NOT _submodule_files)
         message(FATAL_ERROR
-            "Git submodule '${submodule}' is not initialized.\n"
-            "Please run: git submodule update --init --recursive\n"
+            "Third-party source '${submodule}' is missing.\n"
+            "Please run: python tools/fetch_thirdparty.py\n"
             "from the repository root directory."
         )
     endif()
@@ -425,7 +427,7 @@ endif()
 # =============================================================================
 # FFmpeg - Audio/video codec library (for XMA decoding)
 # Only builds libavutil and libavcodec needed for WMA Pro decoding
-# NFSMW: also the WMV3 decoder for the cutscenes (config_nfsmw_wmv3.h)
+# Fork addition: also the WMV3 decoder (for games with WMV cutscenes) (config_masseffect_wmv3.h)
 # =============================================================================
 
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
@@ -659,7 +661,7 @@ add_library(libavcodec STATIC
     ${FFMPEG_DIR}/libavcodec/fft_float.c
     ${FFMPEG_DIR}/libavcodec/fft_fixed_32.c
     ${FFMPEG_DIR}/libavcodec/fft_init_table.c
-    # NFSMW: WMV3 (VC-1 main profile) and what it selects
+    # Fork addition: WMV3 (VC-1 main profile) and what it selects
     ${FFMPEG_DIR}/libavcodec/vc1dec.c
     ${FFMPEG_DIR}/libavcodec/vc1_block.c
     ${FFMPEG_DIR}/libavcodec/vc1_loopfilter.c
@@ -720,7 +722,7 @@ if(IS_X86_64)
         ${FFMPEG_DIR}/libavcodec/x86/fdct.c
         ${FFMPEG_DIR}/libavcodec/x86/mpegaudiodsp.c
         ${FFMPEG_DIR}/libavcodec/x86/dct_init.c
-        # NFSMW: WMV3 initializations (C only: no assembly on the PC)
+        # Fork addition: WMV3 initializations (C only: no assembly on the PC)
         ${FFMPEG_DIR}/libavcodec/x86/blockdsp_init.c
         ${FFMPEG_DIR}/libavcodec/x86/h263dsp_init.c
         ${FFMPEG_DIR}/libavcodec/x86/h264chroma_init.c
@@ -747,7 +749,7 @@ if(IS_ARM64)
         ${FFMPEG_DIR}/libavcodec/aarch64/neon.S
         ${FFMPEG_DIR}/libavcodec/aarch64/mpegaudiodsp_init.c
         ${FFMPEG_DIR}/libavcodec/aarch64/mpegaudiodsp_neon.S
-        # NFSMW: NEON for WMV3
+        # Fork addition: NEON for WMV3
         ${FFMPEG_DIR}/libavcodec/aarch64/h264chroma_init_aarch64.c
         ${FFMPEG_DIR}/libavcodec/aarch64/h264cmc_neon.S
         ${FFMPEG_DIR}/libavcodec/aarch64/h264qpel_init_aarch64.c

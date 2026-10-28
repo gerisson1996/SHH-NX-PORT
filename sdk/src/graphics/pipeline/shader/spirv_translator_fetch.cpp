@@ -44,11 +44,25 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   EnsureBuildPointAvailable();
 
   uint32_t fetch_constant_word_0_index = instr.operands[1].storage_index << 1;
+  uint32_t fetch_constant_word_1_index = fetch_constant_word_0_index + 1;
+
+  // The second fetch constant word contains both endianness and the buffer
+  // size in dwords, so load it before splitting full and mini fetch handling.
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(const_int_0_);
+  id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index >> 2)));
+  id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index & 3)));
+  spv::Id fetch_constant_word_1 =
+      builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                       uniform_fetch_constants_, id_vector_temp_),
+                           spv::NoPrecision);
 
   spv::Id address;
+  spv::Id fetch_end;
   if (instr.is_mini_fetch) {
-    // `base + index * stride` loaded by vfetch_full.
+    // `base + index * stride` and the exclusive end loaded by vfetch_full.
     address = builder_->createLoad(var_main_vfetch_address_, spv::NoPrecision);
+    fetch_end = builder_->createLoad(var_main_vfetch_bound_, spv::NoPrecision);
   } else {
     // Get the base address in dwords from the bits 2:31 of the first fetch
     // constant word.
@@ -69,8 +83,21 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     // may be conditional, so fetch constants may also be used conditionally.
     address = builder_->createUnaryOp(
         spv::OpBitcast, type_int_,
-        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_0,
-                              builder_->makeUintConstant(2)));
+        builder_->createBinOp(
+            spv::OpBitwiseAnd, type_uint_,
+            builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_0,
+                                  builder_->makeUintConstant(2)),
+            builder_->makeUintConstant(0x07FFFFFF)));
+    fetch_end = builder_->createBinOp(
+        spv::OpIAdd, type_int_, address,
+        builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_,
+                builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_1,
+                                      builder_->makeUintConstant(2)),
+                builder_->makeUintConstant((uint32_t(1) << 24) - 1))));
+    builder_->createStore(fetch_end, var_main_vfetch_bound_);
     if (instr.attributes.stride) {
       // Convert the index to an integer by flooring or by rounding to the
       // nearest (as floor(index + 0.5) because rounding to the nearest even
@@ -119,11 +146,11 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
                                            builder_->makeIntConstant(int(word_offset)));
     }
     word_composite_indices[word_index] = word_count;
-    // FIXME(Triang3l): Bound checking is not done here, but haven't encountered
-    // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
-    // P705), however, words (not full elements) out of glBufferData bounds
-    // contain 0.
-    word_composite_constituents[word_count++] = LoadUint32FromSharedMemory(word_address);
+    spv::Id loaded_word = LoadUint32FromSharedMemory(word_address);
+    spv::Id word_in_bounds = builder_->createBinOp(spv::OpULessThan, type_bool_, word_address,
+                                                   fetch_end);
+    word_composite_constituents[word_count++] = builder_->createTriOp(
+        spv::OpSelect, type_uint_, word_in_bounds, loaded_word, const_uint_0_);
   }
   spv::Id words;
   if (word_count > 1) {
@@ -139,19 +166,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   }
 
   // Endian swap the words, getting the endianness from bits 0:1 of the second
-  // fetch constant word.
-  uint32_t fetch_constant_word_1_index = fetch_constant_word_0_index + 1;
-  id_vector_temp_.clear();
-  // The only element of the fetch constant buffer.
-  id_vector_temp_.push_back(const_int_0_);
-  // Vector index.
-  id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index >> 2)));
-  // Component index.
-  id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index & 3)));
-  spv::Id fetch_constant_word_1 =
-      builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
-                                                       uniform_fetch_constants_, id_vector_temp_),
-                           spv::NoPrecision);
+  // fetch constant word loaded above.
   words = EndianSwap32Uint(
       words, builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_1,
                                    builder_->makeUintConstant(0b11)));
@@ -1408,9 +1423,23 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id is_any_unsigned =
             builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
 
+        // Load the fetch constant word 3, needed for result exponent biasing.
+        // exp_adjust is in word 3, bits 13:18 (6-bit signed).
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                             uniform_fetch_constants_,
+                                                             id_vector_temp_),
+                                 spv::NoPrecision));
+
         // Load the fetch constant word 4, needed unconditionally for LOD
-        // biasing, for result exponent biasing, and conditionally for stacked
-        // texture filtering.
+        // biasing, and conditionally for stacked texture filtering.
         id_vector_temp_.clear();
         id_vector_temp_.push_back(const_int_0_);
         id_vector_temp_.push_back(
@@ -2030,10 +2059,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         }
 
         // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // word 3 (word 4 bits 12:21 are the LOD bias).
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;

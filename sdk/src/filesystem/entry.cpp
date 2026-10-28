@@ -14,6 +14,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/entry.h>
+#include <rex/filesystem/file.h>
 #include <rex/string.h>
 
 namespace rex::filesystem {
@@ -133,6 +134,10 @@ bool Entry::Delete(Entry* entry) {
 bool Entry::Delete() {
   assert_not_null(parent_);
   return parent_->Delete(this);
+}
+
+X_STATUS File::Rename(const std::filesystem::path& file_path) {
+  return entry()->Rename(file_path);
 }
 
 X_STATUS Entry::Rename(const std::filesystem::path& file_path) {

@@ -12,11 +12,20 @@
 #include <algorithm>
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
 #include <rex/system/util/object_table.h>
 #include <rex/system/xobject.h>
 #include <rex/system/xthread.h>
+#include <rex/sys_counters.h>
+
+#include "../global_lock_spin.h"
+
+REXCVAR_DEFINE_INT32(global_lock_spin, 48, "Kernel",
+                     "Handle-table lookups and guest-object resolution try the global critical region this many "
+                     "times (CPU yield between tries, ~1 us in total) before blocking in the kernel. 0 = block at "
+                     "once (the original behaviour)");
 
 namespace rex::system::util {
 
@@ -274,9 +283,11 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
   }
 
   XObject* object = nullptr;
+  std::unique_lock<std::recursive_mutex> region;
   if (!already_locked) {
-    global_critical_region_.mutex().lock();
+    region = AcquireGlobalSpin(global_critical_region_.mutex(), rex::syscount::kObjBlocked);
   }
+  REX_SYS_COUNT(rex::syscount::kObjLookup, 1);
 
   // Lower 2 bits are ignored.
   uint32_t slot = GetHandleSlot(handle);
@@ -292,10 +303,6 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
   // Retain the object pointer.
   if (object) {
     object->Retain();
-  }
-
-  if (!already_locked) {
-    global_critical_region_.mutex().unlock();
   }
 
   return object;

@@ -18,6 +18,8 @@
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
 #include <rex/filesystem.h>
+#include <rex/filesystem/devices/pack_device.h>
+#include <rex/filesystem/vfs.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
 #include <rex/ui/overlay/achievement_toast.h>
@@ -52,6 +54,8 @@ extern "C" {
 // libnx runtime internals used by the Switch exit in OnClosing.
 extern u32 __nx_applet_exit_mode;
 NX_NORETURN void __libnx_exit(int rc);
+void RexSwitchNeonProbe(void);
+void RexSwitchRedirectStderr(void);  // switch_crash_hooks.c
 }
 #endif
 
@@ -60,6 +64,7 @@ NX_NORETURN void __libnx_exit(int rc);
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <string_view>
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
@@ -169,9 +174,22 @@ bool ReXApp::SetupEnvironment() {
   config_path_ = path_config.config_path;
   resolved_defaults_ = std::move(path_config);
 
-  // Load config FIRST so log cvars have final values
+  // Load config FIRST so log cvars have final values. The application's built-in defaults go first; the config
+  // file overrides them key by key. sa2-nx: without a config file, the application's default one is written first,
+  // so the player has a file to edit.
+  if (const std::string_view default_file = DefaultConfigFile();
+      !default_file.empty() && !config_path_.empty() && !std::filesystem::exists(config_path_)) {
+    std::ofstream out(config_path_, std::ios::binary);
+    out.write(default_file.data(), std::streamsize(default_file.size()));
+  }
+  if (const std::string_view built_in = BuiltInConfig(); !built_in.empty())
+    rex::cvar::LoadConfigString(built_in, "built-in defaults");
   if (std::filesystem::exists(config_path_))
     rex::cvar::LoadConfig(config_path_);
+#if defined(__SWITCH__)
+  // sa2-nx: stderr (Mesa's and the SDK's warnings) to logs/rex/rex_stderr.log only with the file log on.
+  if (REXCVAR_GET(log_to_file)) RexSwitchRedirectStderr();
+#endif
 
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
@@ -182,7 +200,8 @@ bool ReXApp::SetupEnvironment() {
   auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path_);
   auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
                                         log_level_str, category_levels);
-  if (log_file_cvar.empty()) {
+  // sa2-nx: log_to_file = false writes no log file at all (no logs/ folder).
+  if (log_file_cvar.empty() && REXCVAR_GET(log_to_file)) {
     log_config.app_name = std::string(GetName());
     log_config.log_dir = (exe_dir / "logs").string();
   }
@@ -223,7 +242,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
-  if (!std::filesystem::is_directory(paths.game_data_root)) {
+  // The game data is the folder, or only its asset cache (<folder>.nxpack + .nxidx, see pack_device.h): on the Switch
+  // the folder is usually not on the card at all once the pack is there.
+  if (!std::filesystem::is_directory(paths.game_data_root) &&
+      !rex::filesystem::PackDevice::Exists(std::filesystem::absolute(paths.game_data_root))) {
     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
@@ -273,7 +295,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 #if REX_PLATFORM_SWITCH
         // The menu and the game share the controller: while a menu window
         // has navigation focus, the buttons belong to the menu.
-        return rex::ui::nx::JuegoRecibeMando(imgui_drawer_->GetIO());
+        return rex::ui::nx::GameReceivesGamepad(imgui_drawer_->GetIO());
 #else
         return !imgui_drawer_->GetIO().WantCaptureMouse;
 #endif
@@ -297,7 +319,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     std::string host_tail{tail};
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
-    if (!std::filesystem::is_regular_file(xex_host)) {
+    // Through the mounted file system, not the host folder: with the asset cache the XEX is inside the pack.
+    if (!std::filesystem::is_regular_file(xex_host) &&
+        !(runtime_->file_system() && runtime_->file_system()->ResolvePath(xex_image))) {
       auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
@@ -323,6 +347,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   }
 
   OnPostSetup();
+
+#if REX_PLATFORM_SWITCH
+  // Diagnostic only; does nothing unless neon_probe.flag is in the log folder.
+  RexSwitchNeonProbe();
+#endif
 
   return true;
 }
@@ -428,7 +457,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
 #if REX_PLATFORM_SWITCH
       // The position set with L+R and the right stick, stored next to the configuration file.
-      debug_overlay_->SetPositionFile(config_path_.parent_path() / "overlay_depuracion.txt");
+      debug_overlay_->SetPositionFile(config_path_.parent_path() / "overlay_debug.txt");
 #endif
     }
   });
@@ -478,14 +507,14 @@ void ReXApp::LaunchModule() {
     if (achievement_notification_listener_ == 0 && runtime_ && runtime_->kernel_state()) {
       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
           [this](const rex::system::AchievementEvent& event) {
-            rex::system::AchievementEvent copia = event;
-            app_context().CallInUIThreadDeferred([this, copia]() {
+            rex::system::AchievementEvent copy = event;
+            app_context().CallInUIThreadDeferred([this, copy]() {
               if (!achievement_notification_) {
                 achievement_notification_ = std::shared_ptr<ui::AchievementNotificationDialog>(
                     CreateAchievementNotificationDialog());
               }
               if (achievement_notification_) {
-                achievement_notification_->Push(copia);
+                achievement_notification_->Push(copy);
               }
             });
           });

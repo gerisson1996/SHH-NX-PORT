@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <utility>
 
 #include <rex/assert.h>
@@ -20,6 +21,30 @@
 #include <rex/platform.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
+
+#if REX_PLATFORM_WINDOWS
+#include <windows.h>
+#endif
+
+namespace {
+// " (module.exe+0xRVA)" for a host code address, so a crash under ASLR can be symbolized afterwards
+// (llvm-symbolizer --obj=module.exe 0x<preferred base + RVA>). Empty where the platform has no lookup.
+std::string DescribeHostCode(uint64_t pc) {
+#if REX_PLATFORM_WINDOWS
+  HMODULE module = nullptr;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCSTR>(pc), &module) && module) {
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(module, path, MAX_PATH);
+    const char* name = std::strrchr(path, '\\');
+    return fmt::format(" ({}+0x{:X})", name ? name + 1 : path, pc - reinterpret_cast<uint64_t>(module));
+  }
+#else
+  (void)pc;
+#endif
+  return {};
+}
+}  // namespace
 
 using namespace rex::arch;
 
@@ -417,8 +442,13 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
     if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+      const bool handled = access_violation_callback_(
+          std::move(lock), access_violation_callback_context_, fault_host_address, is_write);
+      if (!handled) {
+        REXLOG_ERROR("Unhandled guest access violation at host PC {:p}{}",
+                     reinterpret_cast<const void*>(ex->pc()), DescribeHostCode(ex->pc()));
+      }
+      return handled;
     }
     return false;
   }

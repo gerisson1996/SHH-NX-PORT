@@ -12,11 +12,13 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #include <rex/cvar.h>
@@ -59,6 +61,7 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
 }  // namespace
 
 namespace rex::graphics {
+
 
 // Nvidia Optimus/AMD PowerXpress support.
 // These exports force the process to trigger the discrete GPU in multi-GPU
@@ -158,7 +161,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        uint64_t last_swap = kernel::xboxkrnl::VdSwapCount();
         while (vsync_worker_running_) {
+          if (kernel::xboxkrnl::VblankPerSwap()) {
+            if (kernel::xboxkrnl::WaitSwapForVblank(last_swap, vsync_worker_running_)) MarkVblank();
+            last_frame_time = chrono::Clock::QueryGuestTickCount();
+            continue;
+          }
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;

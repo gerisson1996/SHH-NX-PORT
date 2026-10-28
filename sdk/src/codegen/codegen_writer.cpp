@@ -15,14 +15,19 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <map>
+#include <cstdlib>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 
 #include <fmt/format.h>
+#include <fstream>
 #include <inja/inja.hpp>
 
 #include <rex/codegen/function_graph.h>
+#include "args_in_registers.h"
 #include <rex/codegen/output_partition.h>
 #include <rex/codegen/template_registry.h>
 #include <rex/logging.h>
@@ -104,6 +109,9 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"config_flags", configFlags},
       {"functions", functionsJson},
       {"recomp_files", nlohmann::json::array()},
+      {"register_files", nlohmann::json::array()},
+      {"register_shards", nlohmann::json::array()},
+      {"has_register_shards", false},
   };
 }
 
@@ -230,9 +238,39 @@ bool CodegenWriter::write(bool force) {
   out = renderWithJson(registry, "codegen/init_cpp", tmplData);
   SaveCurrentOutData(fmt::format("{}_init.cpp", projectName));
 
-  // Generate {project}_register.cpp (registration function for hash-based dispatch)
+  // Generate the registration coordinator and optional address-stable shards.
   REXCODEGEN_TRACE("Recompile: generating {}_register.cpp", projectName);
   tmplData["is_dll"] = ctx_.isDllModule();
+  auto& registerFiles = tmplData["register_files"];
+  registerFiles.push_back(fmt::format("{}_register.cpp", projectName));
+
+  const uint32_t registerShardSpan = REXCVAR_GET(register_shard_span_bytes);
+  if (registerShardSpan != 0) {
+    std::map<uint32_t, nlohmann::json> shardFunctions;
+    const auto& functionsJson = tmplData["functions"];
+    for (size_t i = 0; i < functions.size(); ++i) {
+      const auto& fn = functionsJson.at(i);
+      if (!fn["below_code_base"].get<bool>() || fn["is_import"].get<bool>()) {
+        uint32_t shardStart = static_cast<uint32_t>(functions[i]->base()) / registerShardSpan *
+                              registerShardSpan;
+        shardFunctions[shardStart].push_back(fn);
+      }
+    }
+
+    tmplData["has_register_shards"] = !shardFunctions.empty();
+    for (auto& [shardStart, shardEntries] : shardFunctions) {
+      const auto symbol = fmt::format("{}_RegisterFunctions_{:08X}", projectName, shardStart);
+      const auto filename = fmt::format("{}_register.{:08X}.cpp", projectName, shardStart);
+      auto shardData = tmplData;
+      shardData["functions"] = std::move(shardEntries);
+      shardData["register_symbol"] = symbol;
+      out = renderWithJson(registry, "codegen/register_shard_cpp", shardData);
+      SaveCurrentOutData(filename);
+      tmplData["register_shards"].push_back({{"symbol", symbol}});
+      registerFiles.push_back(filename);
+    }
+  }
+
   out = renderWithJson(registry, "codegen/register_cpp", tmplData);
   SaveCurrentOutData(fmt::format("{}_register.cpp", projectName));
 
@@ -253,6 +291,7 @@ bool CodegenWriter::write(bool force) {
   REXCODEGEN_TRACE("Recompiling {} functions...", functions.size());
 
   std::vector<std::string> bodies;
+  std::vector<std::string> bodyNames;
   std::vector<FunctionSize> sizes;
   std::vector<std::unordered_set<std::string>> references;
   bodies.reserve(functions.size());
@@ -272,8 +311,49 @@ bool CodegenWriter::write(bool force) {
     sizes.push_back({static_cast<uint32_t>(fn->base()), code.size()});
     bodies.push_back(std::move(code));
     references.push_back(referenced);
+    bodyNames.push_back(fn->base() == analysisState().entryPoint
+                            ? std::string("xstart")
+                            : (!fn->name().empty() ? fn->name() : fmt::format("sub_{:08X}", fn->base())));
   }
   emitCtx.referenced = nullptr;
+
+  // Arguments in registers: rewrite the bodies (file assignment keeps using the original sizes, so the
+  // partition does not depend on the option).
+  std::vector<std::vector<std::string>> argsDeclarations(bodies.size());
+  bool argsInRegisters = config().argsInRegisters;
+  if (const char* env = std::getenv("REX_ARGS_IN_REGISTERS"))  // like REX_MAX_JUMP_TABLE_ENTRIES: per-run override
+    argsInRegisters = std::atoi(env) != 0;
+  if (argsInRegisters) {
+    ArgsInRegistersOptions argsOpt;
+    argsOpt.instrument = config().argsInRegistersInstrument;
+    argsOpt.poison = config().argsInRegistersPoison;
+    if (!config().argsInRegistersExcludeFile.empty()) {
+      std::ifstream in(config().argsInRegistersExcludeFile);
+      if (!in) {
+        REXCODEGEN_ERROR("args_in_registers_exclude_file: cannot read {}", config().argsInRegistersExcludeFile);
+        return false;
+      }
+      std::string line;
+      while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+          line.pop_back();
+        if (!line.empty())
+          argsOpt.excluded.insert(line);
+      }
+    }
+    ArgsInRegistersStats argsStats;
+    try {
+      ApplyArgsInRegisters(bodyNames, bodies, argsDeclarations, argsOpt, &argsStats);
+    } catch (const std::exception& e) {
+      REXCODEGEN_ERROR("{}", e.what());
+      return false;
+    }
+    REXCODEGEN_INFO(
+        "args_in_registers: {} functions, {} eligible ({} excluded), {} single-body, {} direct call sites passing {} "
+        "arguments by value, {} calls keep the old ABI",
+        argsStats.functions, argsStats.eligible, argsOpt.excluded.size(), argsStats.combined, argsStats.fastSites,
+        argsStats.argsByValue, argsStats.unknownSites);
+  }
 
   auto partition = OutputPartition::Load(outputPath / kPartitionFileName);
   auto buckets = partition.Assign(sizes, maxFileBytes);
@@ -291,6 +371,17 @@ bool CodegenWriter::write(bool force) {
     println("#include \"{}_pch.h\"\n", projectName);
     for (const auto& name : ordered) {
       println("DECLARE_REX_FUNC({});", name);
+    }
+    if (argsInRegisters) {
+      if (config().argsInRegistersInstrument || config().argsInRegistersPoison) {
+        println("#ifndef ME_ARGS_COUNT\n#define ME_ARGS_COUNT(name, kind) ((void)0)\n#endif");
+        println("#ifndef ME_ARGS_POISON\n#define ME_ARGS_POISON(mask) ((void)0)\n#endif");
+      }
+      std::set<std::string> argsLines;
+      for (size_t entry : buckets[index])
+        argsLines.insert(argsDeclarations[entry].begin(), argsDeclarations[entry].end());
+      for (const auto& line : argsLines)
+        println("{}", line);
     }
     SaveCurrentOutData(fmt::format("{}_funcs.{}.h", projectName, index));
 

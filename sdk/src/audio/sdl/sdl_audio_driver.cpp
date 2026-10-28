@@ -30,88 +30,88 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
-REXCVAR_DEFINE_INT32(audio_sdl_rafaga_tramas, 0, "Audio",
-                     "Diagnostico: el driver SDL saca las tramas del juego de N en N, con N "
-                     "liberaciones seguidas, como el driver de la Switch con buferes de 4 tramas; "
-                     "0 o 1 = una a una, como siempre");
-REXCVAR_DEFINE_BOOL(audio_sdl_bomba, false, "Audio",
-                    "Diagnostico: un hilo pide una trama del juego cada 5,333 ms (como la bomba del "
-                    "driver de la Switch) y SDL deja de liberar el semaforo al consumir");
-REXCVAR_DEFINE_INT32(audio_volcado_salida_s, 0, "Audio",
-                     "Diagnostico: segundos de lo que el driver SDL entrega al dispositivo (con los "
-                     "silencios por falta de tramas) que se guardan en audio_salida.wav; 0 = nada");
-REXCVAR_DEFINE_INT32(audio_volcado_salida_desde_s, 0, "Audio",
-                     "Diagnostico: segundos de salida SDL que se saltan antes del volcado");
+REXCVAR_DEFINE_INT32(audio_sdl_burst_frames, 0, "Audio",
+                     "Diagnostic: the SDL driver pulls the game's frames N at a time, with N "
+                     "releases in a row, like the Switch driver with 4-frame buffers; "
+                     "0 or 1 = one by one, as usual");
+REXCVAR_DEFINE_BOOL(audio_sdl_pump, false, "Audio",
+                    "Diagnostic: a thread requests a game frame every 5.333 ms (like the pump of the "
+                    "Switch driver) and SDL stops releasing the semaphore on consumption");
+REXCVAR_DEFINE_INT32(audio_dump_output_s, 0, "Audio",
+                     "Diagnostic: seconds of what the SDL driver delivers to the device (including the "
+                     "silences from missing frames) that are saved to audio_output.wav; 0 = none");
+REXCVAR_DEFINE_INT32(audio_dump_output_from_s, 0, "Audio",
+                     "Diagnostic: seconds of SDL output skipped before the dump");
 
 namespace rex::audio::sdl {
 
 namespace {
 
-// Diagnostic audio_volcado_salida_s and the silence report: only SDL's audio thread uses them.
-struct VolcadoSalida {
-  std::vector<float> muestras;
-  uint64_t saltadas = 0;  // samples per channel skipped before starting
-  bool escrito = false;
+// Diagnostic audio_dump_output_s and the silence report: only SDL's audio thread uses them.
+struct DumpOutput {
+  std::vector<float> samples;
+  uint64_t skipped = 0;  // samples per channel skipped before starting
+  bool written = false;
 };
-VolcadoSalida volcado_salida;
-uint64_t tramas_con_datos = 0;
-uint64_t tramas_de_silencio = 0;
-std::chrono::steady_clock::time_point ultimo_informe_salida{};
+DumpOutput dump_output;
+uint64_t frames_with_data = 0;
+uint64_t frames_of_silence = 0;
+std::chrono::steady_clock::time_point last_report_output{};
 
-void GrabarSalida(const float* datos, int bytes, uint32_t canales) {
-  const int32_t segundos = REXCVAR_GET(audio_volcado_salida_s);
-  if (segundos <= 0 || volcado_salida.escrito || !canales || bytes <= 0) {
+void RecordOutput(const float* data, int bytes, uint32_t channels) {
+  const int32_t seconds = REXCVAR_GET(audio_dump_output_s);
+  if (seconds <= 0 || dump_output.written || !channels || bytes <= 0) {
     return;
   }
-  const size_t muestras = size_t(bytes) / sizeof(float);
-  const uint64_t saltar = uint64_t(std::max(REXCVAR_GET(audio_volcado_salida_desde_s), 0)) * 48000;
-  if (volcado_salida.saltadas < saltar) {
-    volcado_salida.saltadas += muestras / canales;
+  const size_t samples = size_t(bytes) / sizeof(float);
+  const uint64_t skip = uint64_t(std::max(REXCVAR_GET(audio_dump_output_from_s), 0)) * 48000;
+  if (dump_output.skipped < skip) {
+    dump_output.skipped += samples / channels;
     return;
   }
-  volcado_salida.muestras.insert(volcado_salida.muestras.end(), datos, datos + muestras);
-  if (volcado_salida.muestras.size() < size_t(segundos) * 48000 * canales) {
+  dump_output.samples.insert(dump_output.samples.end(), data, data + samples);
+  if (dump_output.samples.size() < size_t(seconds) * 48000 * channels) {
     return;
   }
-  volcado_salida.escrito = true;
-  const auto ruta = rex::filesystem::GetExecutableFolder() / "audio_salida.wav";
-  std::ofstream fichero(ruta, std::ios::binary | std::ios::trunc);
-  if (fichero) {
-    const uint32_t bytes_datos = uint32_t(volcado_salida.muestras.size() * sizeof(float));
-    const auto u32 = [&](uint32_t v) { fichero.write(reinterpret_cast<const char*>(&v), 4); };
-    const auto u16 = [&](uint16_t v) { fichero.write(reinterpret_cast<const char*>(&v), 2); };
-    fichero.write("RIFF", 4);
-    u32(36 + bytes_datos);
-    fichero.write("WAVEfmt ", 8);
+  dump_output.written = true;
+  const auto path = rex::filesystem::GetExecutableFolder() / "audio_output.wav";
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (file) {
+    const uint32_t bytes_data = uint32_t(dump_output.samples.size() * sizeof(float));
+    const auto u32 = [&](uint32_t v) { file.write(reinterpret_cast<const char*>(&v), 4); };
+    const auto u16 = [&](uint16_t v) { file.write(reinterpret_cast<const char*>(&v), 2); };
+    file.write("RIFF", 4);
+    u32(36 + bytes_data);
+    file.write("WAVEfmt ", 8);
     u32(16);
-    u16(3);  // flotante IEEE
-    u16(uint16_t(canales));
+    u16(3);  // IEEE float
+    u16(uint16_t(channels));
     u32(48000);
-    u32(48000 * canales * 4);
-    u16(uint16_t(canales * 4));
+    u32(48000 * channels * 4);
+    u16(uint16_t(channels * 4));
     u16(32);
-    fichero.write("data", 4);
-    u32(bytes_datos);
-    fichero.write(reinterpret_cast<const char*>(volcado_salida.muestras.data()), bytes_datos);
-    REXAPU_INFO("[audio] volcado de la salida SDL: {} muestras por canal, {} canales, en {}",
-                volcado_salida.muestras.size() / canales, canales, ruta.string());
+    file.write("data", 4);
+    u32(bytes_data);
+    file.write(reinterpret_cast<const char*>(dump_output.samples.data()), bytes_data);
+    REXAPU_INFO("[audio] SDL output dump: {} samples per channel, {} channels, in {}",
+                dump_output.samples.size() / channels, channels, path.string());
   }
-  volcado_salida.muestras = std::vector<float>();
+  dump_output.samples = std::vector<float>();
 }
 
-void ContarTrama(bool silencio) {
-  ++(silencio ? tramas_de_silencio : tramas_con_datos);
-  const auto ahora = std::chrono::steady_clock::now();
-  if (ahora - ultimo_informe_salida < std::chrono::seconds(10)) {
+void CountFrame(bool silence) {
+  ++(silence ? frames_of_silence : frames_with_data);
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_report_output < std::chrono::seconds(10)) {
     return;
   }
-  if (ultimo_informe_salida.time_since_epoch().count() != 0) {
-    REXAPU_INFO("[audio] SDL en 10 s: {} tramas con datos y {} de silencio por falta de tramas",
-                tramas_con_datos, tramas_de_silencio);
+  if (last_report_output.time_since_epoch().count() != 0) {
+    REXAPU_INFO("[audio] SDL in 10 s: {} frames with data and {} of silence from missing frames",
+                frames_with_data, frames_of_silence);
   }
-  tramas_con_datos = 0;
-  tramas_de_silencio = 0;
-  ultimo_informe_salida = ahora;
+  frames_with_data = 0;
+  frames_of_silence = 0;
+  last_report_output = now;
 }
 
 }  // namespace
@@ -120,9 +120,9 @@ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* s
     : AudioDriver(memory), semaphore_(semaphore) {}
 
 SDLAudioDriver::~SDLAudioDriver() {
-  if (bomba_.joinable()) {
-    bomba_activa_ = false;
-    bomba_.join();
+  if (pump_.joinable()) {
+    active_pump_ = false;
+    pump_.join();
   }
   assert_true(frames_queued_.empty());
   assert_true(frames_unused_.empty());
@@ -198,40 +198,40 @@ bool SDLAudioDriver::Initialize() {
     return false;
   }
 
-  if (REXCVAR_GET(audio_sdl_bomba)) {
-    bomba_activa_ = true;
-    bomba_ = std::thread([this]() { Bomba(); });
-    REXAPU_INFO("audio: bomba de diagnostico a 187,5 Hz activa");
+  if (REXCVAR_GET(audio_sdl_pump)) {
+    active_pump_ = true;
+    pump_ = std::thread([this]() { Pump(); });
+    REXAPU_INFO("audio: diagnostic pump at 187.5 Hz active");
   }
 
   return true;
 }
 
-void SDLAudioDriver::Bomba() {
-  using Reloj = std::chrono::steady_clock;
-  const auto intervalo =
+void SDLAudioDriver::Pump() {
+  using Clock = std::chrono::steady_clock;
+  const auto interval =
       std::chrono::nanoseconds(1'000'000'000ll * channel_samples_ / frame_frequency_);
-  auto plazo = Reloj::now() + intervalo;
-  while (bomba_activa_.load(std::memory_order_relaxed)) {
-    const auto ahora = Reloj::now();
-    if (ahora < plazo) {
+  auto deadline = Clock::now() + interval;
+  while (active_pump_.load(std::memory_order_relaxed)) {
+    const auto now = Clock::now();
+    if (now < deadline) {
       std::this_thread::yield();  // no sleep: on Windows it can overshoot by several ms
       continue;
     }
-    size_t en_cola;
+    size_t in_queue;
     {
       std::unique_lock<std::mutex> guard(frames_mutex_);
-      en_cola = frames_queued_.size();
+      in_queue = frames_queued_.size();
     }
-    if (en_cola <= 6) {
+    if (in_queue <= 6) {
       semaphore_->Release(1, nullptr);
     }
-    if (en_cola < 2) {
+    if (in_queue < 2) {
       semaphore_->Release(1, nullptr);
     }
-    plazo += intervalo;
-    if (ahora >= plazo) {
-      plazo = ahora + intervalo;
+    deadline += interval;
+    if (now >= deadline) {
+      deadline = now + interval;
     }
   }
 }
@@ -266,9 +266,9 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 }
 
 void SDLAudioDriver::Shutdown() {
-  if (bomba_.joinable()) {
-    bomba_activa_ = false;
-    bomba_.join();
+  if (pump_.joinable()) {
+    active_pump_ = false;
+    pump_.join();
   }
   if (sdl_stream_) {
     SDL_DestroyAudioStream(sdl_stream_);
@@ -309,53 +309,53 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
   const float gain = GetOutputGain();
-  const int32_t rafaga = REXCVAR_GET(audio_sdl_rafaga_tramas);
-  if (rafaga > 1) {
+  const int32_t burst = REXCVAR_GET(audio_sdl_burst_frames);
+  if (burst > 1) {
     // Diagnostic: up to N frames at once, each with its release, into a private buffer SDL feeds from.
     // The game then gets the calls in bursts, as on the Switch.
     while (additional_amount > 0) {
-      if (driver->rafaga_leido_ >= driver->rafaga_.size()) {
-        driver->rafaga_.clear();
-        driver->rafaga_leido_ = 0;
+      if (driver->read_burst_ >= driver->burst_.size()) {
+        driver->burst_.clear();
+        driver->read_burst_ = 0;
         std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-        for (int32_t k = 0; k < rafaga && !driver->frames_queued_.empty(); ++k) {
+        for (int32_t k = 0; k < burst && !driver->frames_queued_.empty(); ++k) {
           float* buffer = driver->frames_queued_.front();
           driver->frames_queued_.pop();
-          const size_t inicio = driver->rafaga_.size();
-          driver->rafaga_.resize(inicio + size_t(sample_count));
+          const size_t start = driver->burst_.size();
+          driver->burst_.resize(start + size_t(sample_count));
           if (REXCVAR_GET(audio_mute)) {
-            std::fill(driver->rafaga_.begin() + inicio, driver->rafaga_.end(), 0.0f);
+            std::fill(driver->burst_.begin() + start, driver->burst_.end(), 0.0f);
           } else if (driver->sdl_device_channels_ == 2) {
-            conversion::sequential_6_BE_to_interleaved_2_LE(driver->rafaga_.data() + inicio, buffer,
+            conversion::sequential_6_BE_to_interleaved_2_LE(driver->burst_.data() + start, buffer,
                                                             channel_samples_, fold, gain);
           } else {
-            conversion::sequential_6_BE_to_interleaved_6_LE(driver->rafaga_.data() + inicio, buffer,
+            conversion::sequential_6_BE_to_interleaved_6_LE(driver->burst_.data() + start, buffer,
                                                             channel_samples_, mix, gain);
           }
           driver->frames_unused_.push(buffer);
-          if (!driver->bomba_activa_.load(std::memory_order_relaxed)) {
+          if (!driver->active_pump_.load(std::memory_order_relaxed)) {
             auto ret = driver->semaphore_->Release(1, nullptr);
             assert_true(ret);
           }
         }
       }
-      if (driver->rafaga_leido_ >= driver->rafaga_.size()) {
+      if (driver->read_burst_ >= driver->burst_.size()) {
         // Nothing queued: silence without a release, as in the normal path.
         std::memset(data, 0, len);
         if (!SDL_PutAudioStreamData(stream, data, len)) {
           break;
         }
-        GrabarSalida(data, len, driver->sdl_device_channels_);
-        ContarTrama(true);
+        RecordOutput(data, len, driver->sdl_device_channels_);
+        CountFrame(true);
         additional_amount -= len;
         continue;
       }
-      if (!SDL_PutAudioStreamData(stream, driver->rafaga_.data() + driver->rafaga_leido_, len)) {
+      if (!SDL_PutAudioStreamData(stream, driver->burst_.data() + driver->read_burst_, len)) {
         break;
       }
-      GrabarSalida(driver->rafaga_.data() + driver->rafaga_leido_, len, driver->sdl_device_channels_);
-      ContarTrama(false);
-      driver->rafaga_leido_ += size_t(sample_count);
+      RecordOutput(driver->burst_.data() + driver->read_burst_, len, driver->sdl_device_channels_);
+      CountFrame(false);
+      driver->read_burst_ += size_t(sample_count);
       additional_amount -= len;
     }
     SDL_stack_free(data);
@@ -374,8 +374,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
         break;
       }
-      GrabarSalida(data, len, driver->sdl_device_channels_);
-      ContarTrama(true);
+      RecordOutput(data, len, driver->sdl_device_channels_);
+      CountFrame(true);
       additional_amount -= len;
     } else {
       auto buffer = driver->frames_queued_.front();
@@ -402,11 +402,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         driver->frames_unused_.push(buffer);
         break;
       }
-      GrabarSalida(data, len, driver->sdl_device_channels_);
-      ContarTrama(false);
+      RecordOutput(data, len, driver->sdl_device_channels_);
+      CountFrame(false);
       driver->frames_unused_.push(buffer);
 
-      if (!driver->bomba_activa_.load(std::memory_order_relaxed)) {
+      if (!driver->active_pump_.load(std::memory_order_relaxed)) {
         auto ret = driver->semaphore_->Release(1, nullptr);
         assert_true(ret);
       }

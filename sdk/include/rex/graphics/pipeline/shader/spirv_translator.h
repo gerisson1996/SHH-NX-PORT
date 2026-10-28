@@ -969,6 +969,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_vfetch_address_;
   // float.
   spv::Id var_main_tfetch_lod_;
+  // Exclusive end (base + size) in dwords of the last vfetch_full's buffer, for
+  // clamping out-of-bounds words to 0 in both it and its vfetch_mini - int.
+  spv::Id var_main_vfetch_bound_;
   // float3.
   spv::Id var_main_tfetch_gradients_h_;
   spv::Id var_main_tfetch_gradients_v_;

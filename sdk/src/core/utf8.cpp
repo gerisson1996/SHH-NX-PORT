@@ -15,6 +15,7 @@
 #include <numeric>
 #include <tuple>
 
+#include <rex/logging.h>
 #include <rex/string/utf8.h>
 
 #define UTF_CPP_CPLUSPLUS 201703L
@@ -27,12 +28,49 @@ using utf8_citer = utfcpp::iterator<std::string_view::const_iterator>;
 
 namespace rex::string {
 
+// Guest strings are not guaranteed to be well-formed (unpaired surrogates,
+// unterminated buffers), and the Xbox/Windows APIs they come from tolerate that.
+// Replace invalid sequences with U+FFFD instead of letting utfcpp throw an
+// exception that no caller handles.
 std::string to_utf8(const std::u16string_view source) {
-  return utfcpp::utf16to8(source);
+  try {
+    return utfcpp::utf16to8(source);
+  } catch (const utfcpp::exception&) {
+  }
+  std::string result;
+  result.reserve(source.size());
+  for (size_t i = 0; i < source.size(); ++i) {
+    char32_t c = source[i];
+    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < source.size() && source[i + 1] >= 0xDC00 &&
+        source[i + 1] <= 0xDFFF) {
+      c = 0x10000 + ((c - 0xD800) << 10) + (source[i + 1] - 0xDC00);
+      ++i;
+    } else if (c >= 0xD800 && c <= 0xDFFF) {
+      c = 0xFFFD;
+    }
+    utfcpp::append(c, result);
+  }
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    REXLOG_WARN("to_utf8: replaced invalid UTF-16 in guest string (first unit {:04X}, length {})",
+                source.empty() ? 0u : uint32_t(source[0]), source.size());
+  }
+  return result;
 }
 
 std::u16string to_utf16(const std::string_view source) {
-  return utfcpp::utf8to16(source);
+  try {
+    return utfcpp::utf8to16(source);
+  } catch (const utfcpp::exception&) {
+  }
+  std::string valid = utfcpp::replace_invalid(source);
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    REXLOG_WARN("to_utf16: replaced invalid UTF-8 in string (length {})", source.size());
+  }
+  return utfcpp::utf8to16(valid);
 }
 
 std::string to_string(char32_t c) {

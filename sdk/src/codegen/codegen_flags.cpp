@@ -28,6 +28,11 @@ REXCVAR_DEFINE_UINT32(progress_log_frequency, 100, "Codegen",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
     .range(1, 100000);
 
+REXCVAR_DEFINE_UINT32(register_shard_span_bytes, 0, "Codegen",
+                      "Guest address span per generated registration shard; 0 disables sharding")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly)
+    .range(0, 0x10000000);
+
 //=============================================================================
 // Codegen/Analysis
 //=============================================================================

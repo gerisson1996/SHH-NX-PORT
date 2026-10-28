@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -593,6 +594,24 @@ VkBool32 VulkanInstance::DebugUtilsMessengerCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
     VkDebugUtilsMessageTypeFlagsEXT message_types,
     const VkDebugUtilsMessengerCallbackDataEXT* callback_data, [[maybe_unused]] void* user_data) {
+  // Some implementation warnings (such as MoltenVK's per-pipeline primitive
+  // restart notice) repeat for every object and flood the log, rotating away
+  // the context of real failures. Log each distinct message a few times only.
+  if (callback_data->pMessage &&
+      !(message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)) {
+    static std::mutex repeat_mutex;
+    static std::unordered_map<std::string, uint32_t> repeat_counts;
+    constexpr uint32_t kMaxRepeats = 3;
+    std::lock_guard<std::mutex> lock(repeat_mutex);
+    uint32_t& count = repeat_counts[callback_data->pMessage];
+    if (++count > kMaxRepeats) {
+      return VK_FALSE;
+    }
+    if (count == kMaxRepeats) {
+      REXLOG_INFO("Further repeats of the next Vulkan message are suppressed");
+    }
+  }
+
   std::ostringstream log_str;
 
   log_str << "Vulkan " << vk::to_string(vk::DebugUtilsMessageSeverityFlagBitsEXT(message_severity))

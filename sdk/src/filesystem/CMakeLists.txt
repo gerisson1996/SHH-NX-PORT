@@ -8,9 +8,14 @@ add_library(rexfilesystem OBJECT
     devices/host_path_device.cpp
     devices/host_path_entry.cpp
     devices/host_path_file.cpp
+    devices/host_path_index.cpp
+    devices/host_path_listed_switch.cpp
     devices/null_device.cpp
     devices/null_entry.cpp
     devices/null_file.cpp
+    devices/pack_device.cpp
+    devices/pack_storage_switch.cpp
+    devices/startup_trace.cpp
     devices/stfs_container_device.cpp
     devices/stfs_container_entry.cpp
     devices/stfs_container_file.cpp

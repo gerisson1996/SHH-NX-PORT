@@ -46,6 +46,7 @@ namespace rex::graphics {
 
 class CommandProcessor;
 
+
 class GraphicsSystem : public system::IGraphicsSystem {
  public:
   virtual ~GraphicsSystem();

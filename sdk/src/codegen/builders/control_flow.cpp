@@ -58,16 +58,27 @@ bool build_b(BuilderContext& ctx) {
   return true;
 }
 
+// `ctx.lr = <return address>;` before a call. elide_lr_stores drops it (see RecompilerConfig::elideLrStores)
+// unless the return address is in lr_keep_returns or the LR value is needed (keepAlways).
+static void emitLrStore(BuilderContext& ctx, bool keepAlways = false) {
+  const auto& cfg = ctx.config();
+  if (cfg.skipLr)
+    return;
+  const uint32_t ret = ctx.base + 4;
+  if (cfg.elideLrStores && !keepAlways && !cfg.lrKeepReturns.count(ret))
+    return;
+  ctx.println("\tctx.lr = 0x{:X};", ret);
+}
+
 bool build_bl(BuilderContext& ctx) {
   uint32_t target = ctx.insn.operands[0];
-
-  // Always set LR (unless skipLr)
-  if (!ctx.config().skipLr)
-    ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
 
   // Use graph to classify the target
   // true = call instruction, so own-base means recursive call (not loop back)
   auto kind = ctx.graph().classifyTarget(target, ctx.base, true);
+
+  // Always set LR (unless skipLr); a PIC `bl` to a local label reads the LR as data
+  emitLrStore(ctx, kind == TargetKind::InternalLabel);
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -99,8 +110,7 @@ bool build_blr(BuilderContext& ctx) {
 bool build_blrl(BuilderContext& ctx) {
   // BLRL: save return address, then branch-and-link to current LR
   ctx.println("\t{{ auto old_lr = ctx.lr;");
-  if (!ctx.config().skipLr)
-    ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
+  emitLrStore(ctx);
   ctx.println("\tREX_CALL_INDIRECT_FUNC(uint32_t(old_lr)); }}");
   ctx.csrState = CSRState::Unknown;
   return true;
@@ -150,6 +160,9 @@ bool build_bctr(BuilderContext& ctx) {
             if (targetFn->sharesRegisters())
               ctx.emit_call_sharing_registers(fmt::format("{}(ctx, base);", targetFn->name()),
                                               false, "\t\t");
+            else if (ctx.keepsNonArgumentsInCtx(*targetFn))
+              ctx.emit_call_handing_non_arguments(fmt::format("{}(ctx, base);", targetFn->name()),
+                                                  false, "\t\t");
             else
               ctx.println("\t\t{}(ctx, base);", targetFn->name());
           } else {
@@ -191,8 +204,7 @@ bool build_bctr(BuilderContext& ctx) {
 }
 
 bool build_bctrl(BuilderContext& ctx) {
-  if (!ctx.config().skipLr)
-    ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
+  emitLrStore(ctx);
   ctx.println("\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
   ctx.csrState = CSRState::Unknown;  // the call could change it
   return true;

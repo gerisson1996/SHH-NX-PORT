@@ -101,6 +101,32 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
   // Bool scalars
   auto hasBool = [&](const char* key) -> bool { return toml[key].is_boolean(); };
   MergeBool(cfg.skipLr, toml["skip_lr"].value_or(false), hasBool("skip_lr"), "skip_lr");
+  MergeBool(cfg.elideLrStores, toml["elide_lr_stores"].value_or(false), hasBool("elide_lr_stores"),
+            "elide_lr_stores");
+  MergeBool(cfg.dformDispSplit, toml["dform_disp_split"].value_or(false), hasBool("dform_disp_split"),
+            "dform_disp_split");
+  MergeBool(cfg.fctiwzInline, toml["fctiwz_inline"].value_or(false), hasBool("fctiwz_inline"),
+            "fctiwz_inline");
+  MergeBool(cfg.fpMovesModeless, toml["fp_moves_modeless"].value_or(false), hasBool("fp_moves_modeless"),
+            "fp_moves_modeless");
+  MergeBool(cfg.fpComparesModeless, toml["fp_compares_modeless"].value_or(false),
+            hasBool("fp_compares_modeless"), "fp_compares_modeless");
+  MergeBool(cfg.fpModeLookahead, toml["fp_mode_lookahead"].value_or(false), hasBool("fp_mode_lookahead"),
+            "fp_mode_lookahead");
+  MergeBool(cfg.fpModeLookaheadPastBranch, toml["fp_mode_lookahead_past_branch"].value_or(true),
+            hasBool("fp_mode_lookahead_past_branch"), "fp_mode_lookahead_past_branch");
+  MergeBool(cfg.rotateWordNarrow, toml["rotate_word_narrow"].value_or(false), hasBool("rotate_word_narrow"),
+            "rotate_word_narrow");
+  MergeBool(cfg.rotateWordShifts, toml["rotate_word_shifts"].value_or(false), hasBool("rotate_word_shifts"),
+            "rotate_word_shifts");
+  MergeBool(cfg.fctiInline, toml["fcti_inline"].value_or(false), hasBool("fcti_inline"), "fcti_inline");
+  MergeBool(cfg.fpCopyPairs, toml["fp_copy_pairs"].value_or(false), hasBool("fp_copy_pairs"), "fp_copy_pairs");
+  MergeBool(cfg.fpCopyForwarding, toml["fp_copy_forwarding"].value_or(false), hasBool("fp_copy_forwarding"),
+            "fp_copy_forwarding");
+  MergeBool(cfg.fpCopyOnlyFunctions, toml["fp_copy_only_functions"].value_or(false),
+            hasBool("fp_copy_only_functions"), "fp_copy_only_functions");
+  MergeBool(cfg.dcbtPrefetch, toml["dcbt_prefetch"].value_or(false), hasBool("dcbt_prefetch"), "dcbt_prefetch");
+  MergeBool(cfg.divInline, toml["div_inline"].value_or(false), hasBool("div_inline"), "div_inline");
   MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");
   MergeBool(cfg.ctrAsLocalVariable, toml["ctr_as_local"].value_or(false), hasBool("ctr_as_local"),
             "ctr_as_local");
@@ -116,6 +142,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_volatile_as_local"), "non_volatile_as_local");
   MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
+  MergeBool(cfg.argsInRegisters, toml["args_in_registers"].value_or(false), hasBool("args_in_registers"),
+            "args_in_registers");
+  MergeBool(cfg.argsInRegistersInstrument, toml["args_in_registers_instrument"].value_or(false),
+            hasBool("args_in_registers_instrument"), "args_in_registers_instrument");
+  MergeBool(cfg.argsInRegistersPoison, toml["args_in_registers_poison"].value_or(false),
+            hasBool("args_in_registers_poison"), "args_in_registers_poison");
+  if (auto v = toml["args_in_registers_exclude_file"].value<std::string>()) {
+    // relative to the TOML that names it
+    std::filesystem::path p(*v);
+    if (p.is_relative())
+      p = std::filesystem::path(filePath).parent_path() / p;
+    MergeScalar(cfg.argsInRegistersExcludeFile, p.string(), "args_in_registers_exclude_file");
+  }
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }
@@ -278,6 +317,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
         REXCODEGEN_ERROR("Missing 'labels' in [[switch_tables]] entry");
         continue;
       }
+      // Keys other than these are not read. The usual cause is a [functions] line appended to a file whose last
+      // table is a [[switch_tables]] entry: TOML puts the key in that entry and the function is never declared.
+      for (const auto& [key, value] : *table) {
+        if (key.str() != "address" && key.str() != "register" && key.str() != "labels") {
+          REXCODEGEN_WARN(
+              "Ignored key '{}' in the [[switch_tables]] entry for 0x{:08X} ({}): a [functions] line placed after "
+              "a [[switch_tables]] header belongs to that switch table",
+              key.str(), *address_opt, filePath);
+        }
+      }
 
       JumpTable jt;
       jt.bctrAddress = *address_opt;
@@ -371,6 +420,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
   }
 
   // --- Sets: additive ---
+
+  // lr_keep_returns -> lrKeepReturns (set): return addresses whose `ctx.lr = ...;` store is kept
+  if (auto keepArray = toml["lr_keep_returns"].as_array()) {
+    for (auto& entry : *keepArray) {
+      if (auto addr = entry.value<int64_t>())
+        cfg.lrKeepReturns.insert(static_cast<uint32_t>(*addr));
+    }
+  }
+
+  // non_argument_as_local_keep -> nonArgumentKeep (set): functions that keep r0/r2/r11/r12/f0/v32-v63 in ctx
+  if (auto keepArray = toml["non_argument_as_local_keep"].as_array()) {
+    for (auto& entry : *keepArray) {
+      if (auto addr = entry.value<int64_t>())
+        cfg.nonArgumentKeep.insert(static_cast<uint32_t>(*addr));
+      else
+        REXCODEGEN_ERROR("non_argument_as_local_keep: expected function addresses ({})", filePath);
+    }
+  }
 
   // indirect_calls -> knownIndirectCallHints (set)
   if (auto indirectCallArray = toml["indirect_calls"].as_array()) {
@@ -530,6 +597,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
       result.valid = false;
     }
   }
+
+  for (uint32_t addr : nonArgumentKeep)
+    checkAlignment(addr, "non_argument_as_local_keep");
 
   // Check function address alignment
   for (const auto& [addr, size] : functions) {

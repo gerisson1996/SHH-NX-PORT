@@ -23,7 +23,7 @@
 #include <rex/ui/vulkan/device.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_native_shader_features, false, "UI/Vulkan",
-                    "Habilitar capacidades disponibles para los shaders nativos experimentales")
+                    "Enable available capabilities for the experimental native shaders")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
@@ -196,7 +196,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_memory_budget)
   }
   if (get_physical_device_properties2_supported && REXCVAR_GET(vulkan_native_shader_features)) {
-    // #456. NFSMW native renderer: dynamic blending and color write masks. Its three features are
+    // #456. Native renderer: dynamic blending and color write masks. Its three features are
     // enabled further down, only if the device provides them.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_extended_dynamic_state3)
   }
@@ -344,7 +344,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
-  // Native renderer of NFSMW.
+  // Native renderer.
   VulkanFeatures<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT>
       features_EXT_extended_dynamic_state3;
@@ -638,6 +638,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_ENUM_LIMIT(sampledImageDepthSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_ENUM_LIMIT(sampledImageStencilSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_LIMIT(standardSampleLocations)
+  XE_UI_VULKAN_LIMIT(lineWidthRange[0])
+  XE_UI_VULKAN_LIMIT(lineWidthRange[1])
   XE_UI_VULKAN_LIMIT(optimalBufferCopyOffsetAlignment)
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
@@ -685,6 +687,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         XE_UI_VULKAN_FEATURE(samplerAnisotropy)
         XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
       }
+      // sa2-nx: guest lines keep their width relative to the image at a higher render resolution.
+      XE_UI_VULKAN_FEATURE(wideLines)
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
@@ -767,7 +771,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   if (device->extensions_.ext_EXT_extended_dynamic_state3) {
-    // Only these three, the ones the NFSMW native renderer uses. With all three, the pipeline's
+    // Only these three, the ones the native renderer uses. With all three, the pipeline's
     // pAttachments is not used: blending, its equation and the mask of each render target are set with
     // vkCmdSet*.
     XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorBlendEnable)

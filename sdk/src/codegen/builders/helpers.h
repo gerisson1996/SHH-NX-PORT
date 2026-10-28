@@ -328,10 +328,9 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
  */
 inline void emitSignExtendLoadDForm(BuilderContext& ctx, const char* cast_type,
                                     const char* load_macro) {
-  ctx.print("\t{}.s64 = {}({}(", ctx.r(ctx.insn.operands[0]), cast_type, load_macro);
-  if (ctx.insn.operands[2] != 0)
-    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
-  ctx.println("{}));", static_cast<int32_t>(ctx.insn.operands[1]));
+  std::string macro = load_macro;
+  const std::string args = ctx.d_form_args(macro, false);
+  ctx.println("\t{}.s64 = {}({}({}));", ctx.r(ctx.insn.operands[0]), cast_type, macro, args);
 }
 
 /**

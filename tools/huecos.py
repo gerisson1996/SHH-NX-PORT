@@ -109,6 +109,8 @@ def main():
                    help="direcciones concretas a localizar, p.ej. 0x8215FEA8")
     p.add_argument("--salida", default="docs/huecos.txt")
     p.add_argument("--toml", default="tools/huecos_functions.toml")
+    p.add_argument("--excluir", default="tools/huecos_excluir.txt",
+                   help="direcciones que no se declaran (tools/huecos_conflictos.py las escribe)")
     args = p.parse_args()
 
     part = os.path.join(args.gen, "codegen.partition.json")
@@ -139,7 +141,15 @@ def main():
         if fin < siguiente:
             huecos.append((fin, siguiente - fin, a, siguiente))
 
-    grandes = [h for h in huecos if h[1] >= args.min]
+    excluir = set()
+    if os.path.exists(args.excluir):
+        for linea in open(args.excluir, encoding="utf-8"):
+            linea = linea.split("#")[0].strip()
+            if linea:
+                excluir.add(int(linea, 16))
+    grandes = [h for h in huecos if h[1] >= args.min and h[0] not in excluir]
+    if excluir:
+        print("  %d huecos excluidos por %s" % (len(excluir), args.excluir))
 
     # Distribution by size
     dist = {}

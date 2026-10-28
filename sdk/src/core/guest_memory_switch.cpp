@@ -8,6 +8,7 @@
 #include <string.h>
 #include <switch.h>
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <atomic>
@@ -42,7 +43,7 @@ struct View {
 };
 
 /* A span already mapped in this operation, so it can be undone if another fails. */
-struct Tramo {
+struct Span {
     size_t   win_off;
     uint8_t* src;
     size_t   len;
@@ -59,7 +60,7 @@ struct Tramo {
  * base and size are set once in RexGmInit and only change again in RexGmShutdown, so an atomic copy
  * is enough and cannot get out of sync.
  */
-std::atomic<size_t> g_size_rapido{0};
+std::atomic<size_t> g_size_fast{0};
 
 /*
  * The base goes in its own atomic and is published after the size. That way, if a thread sees the
@@ -67,7 +68,7 @@ std::atomic<size_t> g_size_rapido{0};
  * half-initialized, with a valid base and size 0, and then InGuestWindow said no and a legitimate
  * guest fault ended in a fatal stop.
  */
-std::atomic<uint8_t*> g_base_rapido{nullptr};
+std::atomic<uint8_t*> g_base_fast{nullptr};
 
 struct State {
     /*
@@ -119,7 +120,24 @@ State& S() {
     return s;
 }
 
-Handle Proc() { return envGetOwnProcessHandle(); }
+// sa2-nx (2026-10-20): banjo-nx's emulator changes in this file (Proc, EagerViews and their uses), as banjo-nx has them.
+// banjo-nx (2026-10-17): hbloader passes the process handle; an emulator (Ryujinx) runs NROs without a loader, so
+// there is none, and the current-process pseudo-handle stands in for it.
+Handle Proc() {
+  const Handle h = envGetOwnProcessHandle();
+  return h != INVALID_HANDLE ? h : CUR_PROCESS_HANDLE;
+}
+
+/*
+ * banjo-nx (2026-10-17): without a loader (the same test) the views are mapped when a chunk is committed, not on the
+ * first access: an emulator (Ryujinx) does not deliver data aborts to the homebrew's exception handler, so the fault
+ * that RexGmFaultIn answers on a console ends the process there. A console always has the loader's handle and keeps
+ * the lazy views (the process limit on mappable memory, see RexGmCommit).
+ */
+bool EagerViews() {
+  static const bool eager = envGetOwnProcessHandle() == INVALID_HANDLE;
+  return eager;
+}
 
 bool Intersect(size_t a, size_t al, size_t b, size_t bl, size_t* lo, size_t* hi) {
     const size_t l = a > b ? a : b;
@@ -193,26 +211,26 @@ bool IsCommittedWindowAddress(State& s, uint64_t addr) {
  * are unmapped as before. Nothing is left half done: if the call fails, it has
  * not changed anything.
  */
-enum class SoloLectura { kSinProbar, kSi, kNo };
-SoloLectura g_solo_lectura = SoloLectura::kSinProbar;
+enum class ReadOnly { kNoTry, kSi, kNo };
+ReadOnly g_read_only = ReadOnly::kNoTry;
 
 /* Returns true if the page was protected through permissions. */
-bool ProtegerConPermisos(uint8_t* pagina, bool solo_lectura) {
-    if (g_solo_lectura == SoloLectura::kNo) return false;
+bool ProtectWithPermissions(uint8_t* page, bool read_only) {
+    if (g_read_only == ReadOnly::kNo) return false;
 
     const Result rc = svcSetProcessMemoryPermission(
-        Proc(), reinterpret_cast<u64>(pagina), kPageSize, solo_lectura ? Perm_R : Perm_Rw);
+        Proc(), reinterpret_cast<u64>(page), kPageSize, read_only ? Perm_R : Perm_Rw);
     if (R_FAILED(rc)) {
-        if (g_solo_lectura == SoloLectura::kSinProbar) {
-            g_solo_lectura = SoloLectura::kNo;  // no se vuelve a intentar
+        if (g_read_only == ReadOnly::kNoTry) {
+            g_read_only = ReadOnly::kNo;  // do not try again
         }
         return false;
     }
-    g_solo_lectura = SoloLectura::kSi;
+    g_read_only = ReadOnly::kSi;
     return true;
 }
 void UnmapWindowRange(State& s, size_t win_off, uint8_t* src, size_t len) {
-    if (g_solo_lectura == SoloLectura::kSi) {
+    if (g_read_only == ReadOnly::kSi) {
         /* No holes here: everything was mapped, watched or not. */
         if (R_SUCCEEDED(svcUnmapProcessMemory(s.base + win_off, Proc(),
                                               reinterpret_cast<u64>(src), len))) {
@@ -244,7 +262,7 @@ void UnmapWindowRange(State& s, size_t win_off, uint8_t* src, size_t len) {
  * at once and the watched pages then get their permission lowered. Simpler and
  * faster than skipping them.
  */
-bool MapWindowRangeSoloLectura(State& s, size_t win_off, uint8_t* src, size_t len) {
+bool MapWindowRangeReadOnly(State& s, size_t win_off, uint8_t* src, size_t len) {
     const Result rc =
         svcMapProcessMemory(s.base + win_off, Proc(), reinterpret_cast<u64>(src), len);
     if (R_FAILED(rc)) {
@@ -254,7 +272,7 @@ bool MapWindowRangeSoloLectura(State& s, size_t win_off, uint8_t* src, size_t le
     s.mapped += len;
     for (auto it = s.protection.lower_bound(win_off);
          it != s.protection.end() && it->first < win_off + len; ++it) {
-        ProtegerConPermisos(s.base + it->first, true);
+        ProtectWithPermissions(s.base + it->first, true);
     }
     return true;
 }
@@ -265,8 +283,8 @@ bool MapWindowRangeSoloLectura(State& s, size_t win_off, uint8_t* src, size_t le
  * half mapped.
  */
 bool MapWindowRange(State& s, size_t win_off, uint8_t* src, size_t len) {
-    if (g_solo_lectura == SoloLectura::kSi) {
-        return MapWindowRangeSoloLectura(s, win_off, src, len);
+    if (g_read_only == ReadOnly::kSi) {
+        return MapWindowRangeReadOnly(s, win_off, src, len);
     }
     const size_t end = win_off + len;
     size_t cur = win_off;
@@ -365,8 +383,8 @@ uint8_t* RexGmInit(size_t size) {
         return nullptr;
     }
     s.size = size;
-    g_size_rapido.store(size, std::memory_order_release);
-    g_base_rapido.store(s.base, std::memory_order_release);
+    g_size_fast.store(size, std::memory_order_release);
+    g_base_fast.store(s.base, std::memory_order_release);
     return s.base;
 }
 
@@ -396,13 +414,13 @@ void RexGmShutdown(void) {
      * Reverse order from startup: the base is cleared first, so nobody gets in with
      * a size that is no longer valid.
      */
-    g_base_rapido.store(nullptr, std::memory_order_release);
-    g_size_rapido.store(0, std::memory_order_release);
+    g_base_fast.store(nullptr, std::memory_order_release);
+    g_size_fast.store(0, std::memory_order_release);
 }
 
-uint8_t* RexGmBase(void) { return g_base_rapido.load(std::memory_order_acquire); }
+uint8_t* RexGmBase(void) { return g_base_fast.load(std::memory_order_acquire); }
 
-size_t RexGmSize(void) { return g_size_rapido.load(std::memory_order_acquire); }
+size_t RexGmSize(void) { return g_size_fast.load(std::memory_order_acquire); }
 
 bool RexGmWindowToOffset(uint64_t window_address, size_t* offset_out) {
     State& s = S();
@@ -423,16 +441,22 @@ size_t RexGmCommittedBytes(void) {
     return s.committed;
 }
 
+size_t RexGmChunkCount(void) {
+    State& s = S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.chunks.size();
+}
+
 size_t RexGmMappedBytes(void) {
     State& s = S();
     std::lock_guard<std::mutex> lock(s.mutex);
     return s.mapped;
 }
 
-int RexGmModoProteccion(void) {
-    switch (g_solo_lectura) {
-        case SoloLectura::kSi: return 1;
-        case SoloLectura::kNo: return 2;
+int RexGmProtectionMode(void) {
+    switch (g_read_only) {
+        case ReadOnly::kSi: return 1;
+        case ReadOnly::kNo: return 2;
         default: return 0;
     }
 }
@@ -457,6 +481,15 @@ bool RexGmAddView(uint8_t* base, size_t offset, size_t length) {
      * time it is touched.
      */
     s.views.push_back(v);
+    if (EagerViews()) {
+        /* banjo-nx: no faults to map it later (EagerViews): every committed chunk this view covers, now. */
+        const size_t vi = s.views.size() - 1;
+        for (const auto& [off, c] : s.chunks) {
+            size_t lo, hi;
+            if (Intersect(c.offset, c.length, v.offset, v.length, &lo, &hi))
+                MapChunkIntoView(s, vi, c);
+        }
+    }
     return true;
 }
 
@@ -478,37 +511,45 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.base) return false;
 
-    const size_t begin = AlignDown(offset, kPageSize);
-    const size_t end   = AlignUp(offset + length, kPageSize);
+    /*
+     * Committed in whole kBlockSize granules, not just the requested pages. Guest
+     * heaps with 64 KB pages grow one page at a time, and a chunk per request (each
+     * a code alias plus one mapping per view that touches it) exhausts the kernel's
+     * memory blocks long before the mapping limit: measured, 0xCE01 (2001-0103) on a
+     * 64 KB commit with only 329 MB of backing. The extra pages are backing only;
+     * guest-level commit state is still kept by the heaps in xmemory.cpp.
+     */
+    const size_t begin = AlignDown(offset, kBlockSize);
+    const size_t end   = std::min(AlignUp(offset + length, kBlockSize), s.size);
 
     size_t cur = begin;
     while (cur < end) {
-        if (Chunk* existente = ChunkAt(s, cur)) {
-            cur = existente->offset + existente->length;
+        if (Chunk* existing = ChunkAt(s, cur)) {
+            cur = existing->offset + existing->length;
             continue;
         }
 
         /* Where the gap ends: the next chunk, or the end. */
-        size_t hueco_fin = end;
+        size_t gap_end = end;
         auto sig = s.chunks.upper_bound(cur);
-        if (sig != s.chunks.end() && sig->second.offset < hueco_fin)
-            hueco_fin = sig->second.offset;
+        if (sig != s.chunks.end() && sig->second.offset < gap_end)
+            gap_end = sig->second.offset;
 
-        const size_t tam = hueco_fin - cur;
-        const size_t align = (tam >= kBlockSize && (cur & (kBlockSize - 1)) == 0)
+        const size_t sz = gap_end - cur;
+        const size_t align = (sz >= kBlockSize && (cur & (kBlockSize - 1)) == 0)
                                  ? kBlockSize : kPageSize;
 
-        void* backing = memalign(align, tam);
+        void* backing = memalign(align, sz);
         if (!backing) {
             s.last_result = REX_GM_ERR_NOMEM;
             return false;
         }
-        memset(backing, 0, tam);
+        memset(backing, 0, sz);
 
         virtmemLock();
-        void* shadow = virtmemFindCodeMemory(tam, align);
+        void* shadow = virtmemFindCodeMemory(sz, align);
         Result rc = shadow ? svcMapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow),
-                                                     reinterpret_cast<u64>(backing), tam)
+                                                     reinterpret_cast<u64>(backing), sz)
                            : 0;
         virtmemUnlock();
 
@@ -524,10 +565,10 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
         }
 
         /* The code alias starts without write access; it has to be opened. */
-        rc = svcSetProcessMemoryPermission(Proc(), reinterpret_cast<u64>(shadow), tam, Perm_Rw);
+        rc = svcSetProcessMemoryPermission(Proc(), reinterpret_cast<u64>(shadow), sz, Perm_Rw);
         if (R_FAILED(rc)) {
             svcUnmapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow),
-                                      reinterpret_cast<u64>(backing), tam);
+                                      reinterpret_cast<u64>(backing), sz);
             free(backing);
             s.last_result = rc;
             return false;
@@ -538,11 +579,19 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
          * (RexGmFaultIn). Mapping it into all five 360 views multiplies by five the
          * use of the process limit on mappable memory.
          */
-        const Chunk c{cur, tam, backing, shadow};
+        const Chunk c{cur, sz, backing, shadow};
         s.chunks[cur] = c;
-        s.committed += tam;
+        s.committed += sz;
+        if (EagerViews()) {
+            /* banjo-nx: no faults to map it later (EagerViews): into every view that covers it, now. */
+            for (size_t vi = 0; vi < s.views.size(); vi++) {
+                size_t lo, hi;
+                if (Intersect(c.offset, c.length, s.views[vi].offset, s.views[vi].length, &lo, &hi))
+                    MapChunkIntoView(s, vi, c);
+            }
+        }
 
-        cur = hueco_fin;
+        cur = gap_end;
     }
     return true;
 }
@@ -569,8 +618,8 @@ bool RexGmFaultIn(uint64_t window_address) {
                        static_cast<size_t>(window_address -
                                            reinterpret_cast<uint64_t>(s.views[vi].base));
     Chunk* c = ChunkAt(s, off);
-    if (!c) return false;                                       /* sin confirmar */
-    if (s.view_mapped.count({vi, c->offset}) != 0) return false; /* ya estaba */
+    if (!c) return false;                                       /* not committed */
+    if (s.view_mapped.count({vi, c->offset}) != 0) return false; /* already there */
     return MapChunkIntoView(s, vi, *c);
 }
 
@@ -615,7 +664,15 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
 
     if (out_old) *out_old = AccessOf(s, begin);
 
-    const bool debe_estar = (access == REX_GM_WRITE);
+    /*
+     * banjo-nx (2026-10-17): without a loader (EagerViews: an emulator) the pages keep full access. Ryujinx delivers no
+     * data abort, so a protected page ends the process at its next access instead of being watched; and its
+     * svcSetProcessMemoryPermission throws on the views rather than refusing (the deko3d renderer's first emulator
+     * runs). A console takes the path below.
+     */
+    if (EagerViews()) return true;
+
+    const bool must_be = (access == REX_GM_WRITE);
 
     /*
      * Fast path, and the common one: asking for full access on a range that has no
@@ -623,48 +680,48 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
      * heap, and without this it would walk the range page by page (131,072
      * iterations for the 512 MB of physical memory) to do nothing.
      */
-    if (debe_estar) {
+    if (must_be) {
         auto it = s.protection.lower_bound(begin);
         if (it == s.protection.end() || it->first >= end) return true;
     }
 
     for (size_t p = begin; p < end; p += kPageSize) {
-        const bool estaba = (AccessOf(s, p) == REX_GM_WRITE);
+        const bool was = (AccessOf(s, p) == REX_GM_WRITE);
 
-        if (estaba != debe_estar) {
+        if (was != must_be) {
             /*
              * The view is looked up per page: a range can cross the boundary
              * between two views with different offsets.
              */
             if (const View* v = ViewFor(s, wbase + p)) {
-                const size_t off_mapeo =
+                const size_t off_mapping =
                     v->offset + (p - static_cast<size_t>(v->base - s.base));
                 size_t vi = 0;
-                Chunk* c = ChunkAt(s, off_mapeo);
+                Chunk* c = ChunkAt(s, off_mapping);
                 /*
                  * If the chunk has not entered this view yet, there is nothing to map
                  * or unmap: the permission is recorded and the first access will bring
                  * the chunk in with the right permission already.
                  */
-                const bool en_vista = c != nullptr && ViewIndexFor(s, wbase + p, &vi) &&
+                const bool in_view = c != nullptr && ViewIndexFor(s, wbase + p, &vi) &&
                                       s.view_mapped.count({vi, c->offset}) != 0;
-                if (en_vista) {
+                if (in_view) {
                     const u64 src = reinterpret_cast<u64>(
-                        static_cast<uint8_t*>(c->shadow) + (off_mapeo - c->offset));
+                        static_cast<uint8_t*>(c->shadow) + (off_mapping - c->offset));
                     /*
                      * Permissions are tried first, which keeps the page readable. If the
-                     * kernel refuses, it falls back to the usual unmap. ProtegerConPermisos
+                     * kernel refuses, it falls back to the usual unmap. ProtectWithPermissions
                      * remembers whether it works.
                      */
-                    if (!ProtegerConPermisos(s.base + p, estaba)) {
+                    if (!ProtectWithPermissions(s.base + p, was)) {
                         const Result rc =
-                            estaba ? svcUnmapProcessMemory(s.base + p, Proc(), src, kPageSize)
+                            was ? svcUnmapProcessMemory(s.base + p, Proc(), src, kPageSize)
                                    : svcMapProcessMemory(s.base + p, Proc(), src, kPageSize);
                         if (R_FAILED(rc)) {
                             s.last_result = rc;
                             return false;
                         }
-                        if (estaba) s.mapped -= kPageSize;
+                        if (was) s.mapped -= kPageSize;
                         else s.mapped += kPageSize;
                     }
                 }
@@ -675,7 +732,7 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
             }
         }
 
-        if (debe_estar) s.protection.erase(p);
+        if (must_be) s.protection.erase(p);
         else s.protection[p] = access;
     }
     return true;
@@ -714,12 +771,12 @@ bool RexGmQueryProtect(uint8_t* address, size_t* length, RexGmAccess* out_access
      * On input *length is the maximum to walk (0 = one page); on output, the size of
      * the committed range with the same permission.
      */
-    size_t maximo = (length && *length) ? *length : kPageSize;
-    if (begin + maximo > s.size) maximo = s.size - begin;
+    size_t max = (length && *length) ? *length : kPageSize;
+    if (begin + max > s.size) max = s.size - begin;
 
     size_t p = begin;
-    const size_t tope = begin + maximo;
-    while (p < tope && AccessOf(s, p) == a && IsCommittedWindowAddress(s, wbase + p))
+    const size_t cap = begin + max;
+    while (p < cap && AccessOf(s, p) == a && IsCommittedWindowAddress(s, wbase + p))
         p += kPageSize;
     if (length) *length = p - begin;
     return true;
@@ -733,12 +790,12 @@ void* RexGmShadowFor(uint64_t window_address) {
     const View* v = ViewFor(s, window_address);
     if (!v) return nullptr;
 
-    const size_t off_mapeo =
+    const size_t off_mapping =
         v->offset + static_cast<size_t>(window_address - reinterpret_cast<uint64_t>(v->base));
-    Chunk* c = ChunkAt(s, off_mapeo);
+    Chunk* c = ChunkAt(s, off_mapping);
     if (!c) return nullptr;
 
-    return static_cast<uint8_t*>(c->shadow) + (off_mapeo - c->offset);
+    return static_cast<uint8_t*>(c->shadow) + (off_mapping - c->offset);
 }
 
 }  // extern "C"

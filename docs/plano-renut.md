@@ -1,0 +1,106 @@
+# Plan: Renut on plume/deko3d for Silent Hill: Homecoming
+
+Why: on the console, the emulated Xenos GPU draws the game wrong and runs the title movie at about 6 fps. The GPU is
+busy only about 600 ms a second, and render-target transfers take half of that. Every working ReXGlue Switch port of
+a 3D game draws through Renut's Direct3D-level renderer on deko3d instead: sa2-nx, mk9-nx, usf4-nx, mgr-nx-deko and
+naruto-nx. Reference: `C:\dev\sa2-nx-ref` (sa2-nx 32a81a8), `docs/deko3d-renderer-guide.md`.
+
+What Silent Hill has in its favour: its Direct3D (XDK 2.0.6690) has N&B's device layout (`d3d-censo.md`), and Renut was
+written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) apply as they are.
+
+## Stages (each verified before the next)
+
+1. **The sa2-nx SDK.** Replace `sdk/` with sa2-nx's fork (`patches/rexglue-sdk-v0.10.0.patch` against upstream
+   v0.10.0: the Horizon layer, the no-NVK build, the input hook, the codegen changes). Rebuild `rexglue`, re-run the
+   codegen, and re-check the gap rounds (`huecos.py`, `huecos_conflictos.py`). Gate: the PC build boots to the title
+   with the emulated GPU, as now.
+   **Done 2026-10-28.** sa2-nx's `sdk/` copied in. Its `thirdparty/` overlay was completed with the files of the old
+   tree (the same v0.10.0 release), and the old SDK is kept at `C:\dev\shh-nx-sdk-xenos-backup`. The codegen
+   (`REX_MAX_JUMP_TABLE_ENTRIES=1024`, image dumped to `out/default_image.bin`) gives no warnings, so the gap rounds
+   still hold. `shh_register.cpp` (-O1) now skips the precompiled header. The PC build reaches the title movie as
+   before.
+2. **Renut on the PC (plume, Vulkan back end),** with the emulated GPU still built in as the reference (a boot key
+   chooses the renderer, as sa2-nx's `sa2_renderer`):
+   - vendor `app/src/renut_engine`, `app/thirdparty/plume`, `app/thirdparty/reblue-XenosRecomp`, `app/cmake/*renut*`;
+   - point every `BANJO_RENUT_HOOK` at SHH's address (`d3d-censo.md`) and put N&B's offsets back where SA2's shifted
+     ones are;
+   - creation through SHH's type-2 (no hardware) path, then the title device's setup without the GPU;
+   - teach `tools/llamadas_directas.py` the hooks (sa2-nx's `direct_calls.py` reads `BANJO_RENUT_HOOK*`).
+   Gate: device created, ring sink, fences, Swap presenting the clear colour.
+   **Started 2026-10-28.** What is in the tree:
+   - the vendored trees above, from `C:\dev\sa2-nx-ref` (sa2-nx 32a81a8): `renut_engine` (112 files),
+     `plume` (875), `reblue-XenosRecomp` (1481), `imgui`, `uam`, and `app/cmake` (banjo's, sa2's, the two scripts).
+     The reference's `thirdparty/dxc-bin` had only headers, so DXC 1.9.0.5512 from `C:\VulkanSDK\1.4.363.0\Bin`
+     (`dxc.exe`, `dxcompiler.dll`) is placed in `bin/x64/`; the host shaders need nothing else. That folder is ignored
+     by `reblue-XenosRecomp`'s own `.gitignore` (`[Bb]in/`), so it is not in the repository: a fresh clone has to copy
+     the same pair there (any DXC 1.9 or newer).
+   - `app/cmake/shh_renut_gpu.cmake` (from sa2's), included by `app/CMakeLists.txt` behind
+     `SHH_RENUT_RENDERER` (default ON); the target is `shh_renut_gpu`, an OBJECT library so its hooks replace the
+     generated weak `sub_X` definitions. `shh_renderer` (`xenos` default / `renut`) picks the renderer at boot
+     (`banjo_renut_select.cpp`, adapted: SA2's key and its no-NVK branch dropped).
+   - `app/src/renut_engine/shh_compat` (from sa2_compat: the frame-latency probe, the profiler no-ops, the `banjo_*`
+     keys) with `app/src/cpu/shh_enhancements.h` (two masters, both on). `app/src/me/me_platform_compat.h` (thread
+     helpers, no-ops on the PC) and `app/src/me/sa2_render_mode.h` (a 720p shim; the vendored call sites keep SA2's
+     namespace).
+   - stage 2 has no translated shaders yet, so `RENUT_NO_SHADER_CACHE` compiles
+     `gpu/shaders/empty_shader_cache.cpp` instead of running XenosRecomp and dumping the game's containers (stage 3).
+     The game's screen width is `gpu/guest/shh_screen.cpp` (1280, as sa2-nx's).
+   - the renderer's core (backend, render, guest records, overlay) compiles and links. The Direct3D hook files are
+     not in yet; `gpu/d3d/shh_stage2_shims.cpp` stands in for the five symbols the core takes from them
+     (`native::BlockOnFence` and the four record lookups). Delete it as `d3d/hooks/device.cpp` and `shader.cpp` come
+     in.
+   - the device hooks, as retargeted (Silent Hill's address): CreateDevice `82910928`, InitializePresentationParameters
+     `82919758`, InitializeApiState `829194F0`, SynchronizeToPresentationInterval `82911880`, KickOff `8290FBB8`,
+     KickOffSegment `8290FA30`, BeginRingBig `8290FDD8`, AllocateInlineData `8290EE48`, the ring segment allocator
+     `8290F8A0`, Swap `82911D68`, BlockOnFence `8290F4A0`, IsFencePending `8290FCF0`, CBlocker::Check `82910448`.
+     No hook yet for InsertCallback, RingBufferDeviceAllocate or SetRingBufferParameters: the census has not placed
+     them.
+   - next, in this order: `shader.cpp`, `resource.cpp` and `hooks/draw.cpp`, then the setters (`state.cpp`).
+   - **2026-10-28, later:** `d3d/hooks/device.cpp` is retargeted (N&B's offsets back, Silent Hill's addresses on the
+     hooks above). Two things had to change to get there:
+     - the record heap could not take 64 MiB of Silent Hill's physical window (0xA0000000-0xBFFFFFFF) once the
+       emulated Xenos GPU had its share, so `guest_records.cpp` now takes the largest of 64/32/16/8 MiB that fits and,
+       when none does, the same block from the guest's own heap (the renderer only reaches it through a guest VA).
+     - with `shh_renderer = renut`, `src/shh_app.h` no longer loads the emulated Xenos GPU at all: the two renderers
+       would both draw, and the plugin's share of the physical window was what the renderer ran out of.
+     Run of 2026-10-28 19:20 (`shh_renderer=renut`): "Guest D3D device (type 1) created at 0xe2e7fe00", "Render
+     thread started", "Render resolution 1280x720", 296 game frames in 10 s (29.5 fps), 1481 kicks and 589 fence
+     queries with no stall, 0 draws (the draw and state hooks are stage 3).
+     The clear (stage 2's last gate item): `d3d/hooks/shh_clear.cpp` hooks ClearF (8290E528) and the game does call it
+     (flags 0x31 = colour 0 + depth + stencil, colour 0,0,0,0, no rect, every frame at the title), but the picture stays
+     black even with `shh_renut_clear_test=true`, which clears magenta instead: the Swap presents the *front buffer
+     texture*, and without the resource and Resolve hooks the renderer has no record of it, so it presents an empty
+     frame.
+     `d3d/hooks/shh_resolve.cpp` adds the resolve (82914EA8), and the Swap's front buffer is exactly the resolve's
+     destination (`0xe2e89ce0`, both), so the two line up.
+     The resolve still drew nothing, and the reason was the offsets: `d3d.h` and `d3d_native.h` still carried sa2-nx's
+     *shifted* device layout (render targets 12816, depth 12832, fence 11036, swap count 16968, ...) with N&B's in the
+     comments. With N&B's values back (12440/12456, 10908, 16560, and the rest), the device now reads its targets:
+     `targets=0xe2e88010,0x00000000 depth=0xe2e88048`, alternating with `0xe2e88080` as the game double-buffers. Four
+     `static_assert`s in `queued.cpp` that encode SA2's private layout (its setter marks, `kMarkSnapshotEnd`) are
+     commented out with a stage-3 note, since SHH has no setter marks yet.
+     **The gate is met (2026-10-28, 19:42).** The last missing link was not in the renderer at all: the app never
+     started it. sa2-nx starts it in `OnFinalizePaths` (and forwards window resizes), and `src/shh_app.h` did not, so
+     `Video::CreateHostDevice` never ran: no host device, `host_ready` false, `EnsureCommandListLocked` false, and every
+     resolve was dropped at its first line while the Swap presented an empty frame. With the same two calls in SHH's
+     app: `Renderer: D3D12 on AMD Radeon RX 6600`, `Swapchain: 3 images`, the resolve finds its source
+     (`1280x720, format 20`), and with `shh_renut_clear_test=true` (magenta instead of the game's black) the captured
+     screen is `(255,0,255)` in the centre and in a corner: Silent Hill's own ClearF reached the screen through Renut's
+     Swap. That closes stage 2: device created through Silent Hill's type-2 path, ring sink kicking (1478 kicks per
+     10 s), fences answered (587 queries), Swap presenting the game's clear colour, the PC build green in both
+     configurations (`xenos` and `renut`).
+3. **Shaders and draws on the PC:** dump the game's containers (CreateVertexShader / CreatePixelShader), translate
+   them with XenosRecomp, and draw. Compare with the emulated GPU frame by frame through boot, menus, the title
+   movie and gameplay.
+4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the
+   Switch build without NVK. Gate: a picture on the console.
+5. **The console:** render-thread work, pacing, then the browser installer for the shader package.
+
+## Open points
+
+- DrawVerticesUP / BeginVertices look unlinked: confirm at run time.
+- InsertCallback, SetRingBufferParameters, RingBufferDeviceAllocate and CBlocker::Check are not identified yet.
+- Bink: the title movie is decoded on the CPU into textures, which Renut uploads as it does any texture. The
+  emulated-read fix in `sdk/` (hot pages) belongs to the emulated GPU's watching and must be re-checked after stage 1.
+- The game's shader containers: where they live (a bundle in the PAKs, or created at load) decides how the installer
+  finds them.

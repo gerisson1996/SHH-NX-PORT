@@ -8,6 +8,7 @@ set(CODEGEN_CORE_SOURCES
     code_emitter.cpp
     decoded_binary.cpp
     codegen_writer.cpp
+    args_in_registers.cpp
     output_partition.cpp
     output_stamp.cpp
     config.cpp

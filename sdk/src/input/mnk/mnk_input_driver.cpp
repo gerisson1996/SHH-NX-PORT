@@ -18,6 +18,8 @@
 #include <rex/ui/window.h>
 
 #include <algorithm>
+#include <string>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -259,6 +261,51 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  // Mass Effect test harness (host only): SA2_AUTO_INPUT="T:BTN[:SECONDS];..." scripts the pad
+  // from the first poll, ignoring window focus, so unattended runs can get past menus and move.
+  // BTN: A B X Y START BACK LB RB LT RT UP DOWN LEFT RIGHT LX+ LX- LY+ LY- RX+ RX- RY+ RY-.
+  if (const char* script = std::getenv("SA2_AUTO_INPUT"); script && *script) {
+    static const auto start = std::chrono::steady_clock::now();
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    uint16_t b = 0; uint8_t lt = 0, rt = 0; int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+    std::string_view rest(script);
+    while (!rest.empty()) {
+      const size_t semi = rest.find(';');
+      std::string_view item = rest.substr(0, semi);
+      rest = semi == std::string_view::npos ? std::string_view{} : rest.substr(semi + 1);
+      const size_t c1 = item.find(':');
+      if (c1 == std::string_view::npos) continue;
+      const size_t c2 = item.find(':', c1 + 1);
+      const double at = std::atof(std::string(item.substr(0, c1)).c_str());
+      const std::string btn(item.substr(c1 + 1, c2 == std::string_view::npos ? std::string_view::npos : c2 - c1 - 1));
+      const double dur = c2 == std::string_view::npos ? 0.25 : std::atof(std::string(item.substr(c2 + 1)).c_str());
+      if (t < at || t >= at + dur) continue;
+      if (btn == "A") b |= X_INPUT_GAMEPAD_A; else if (btn == "B") b |= X_INPUT_GAMEPAD_B;
+      else if (btn == "X") b |= X_INPUT_GAMEPAD_X; else if (btn == "Y") b |= X_INPUT_GAMEPAD_Y;
+      else if (btn == "START") b |= X_INPUT_GAMEPAD_START; else if (btn == "BACK") b |= X_INPUT_GAMEPAD_BACK;
+      else if (btn == "LB") b |= X_INPUT_GAMEPAD_LEFT_SHOULDER; else if (btn == "RB") b |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
+      else if (btn == "UP") b |= X_INPUT_GAMEPAD_DPAD_UP; else if (btn == "DOWN") b |= X_INPUT_GAMEPAD_DPAD_DOWN;
+      else if (btn == "LEFT") b |= X_INPUT_GAMEPAD_DPAD_LEFT; else if (btn == "RIGHT") b |= X_INPUT_GAMEPAD_DPAD_RIGHT;
+      else if (btn == "LT") lt = 0xFF; else if (btn == "RT") rt = 0xFF;
+      else if (btn == "LX+") lx = INT16_MAX; else if (btn == "LX-") lx = -INT16_MAX;
+      else if (btn == "LY+") ly = INT16_MAX; else if (btn == "LY-") ly = -INT16_MAX;
+      else if (btn == "RX+") rx = INT16_MAX; else if (btn == "RX-") rx = -INT16_MAX;
+      else if (btn == "RY+") ry = INT16_MAX; else if (btn == "RY-") ry = -INT16_MAX;
+    }
+    if (out_state) {
+      std::memset(out_state, 0, sizeof(*out_state));
+      out_state->packet_number = ++packet_number_;
+      out_state->gamepad.buttons = b;
+      out_state->gamepad.left_trigger = lt;
+      out_state->gamepad.right_trigger = rt;
+      out_state->gamepad.thumb_lx = int16_t(lx);
+      out_state->gamepad.thumb_ly = int16_t(ly);
+      out_state->gamepad.thumb_rx = int16_t(rx);
+      out_state->gamepad.thumb_ry = int16_t(ry);
+    }
+    return X_ERROR_SUCCESS;
+  }
+
   // Mouse look is opt in. Without this gate, keyboard input alone would hide
   // and lock the cursor, breaking the ImGui overlays.
   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
@@ -274,61 +321,67 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   std::lock_guard lock(state_mutex_);
 
+  bool sampled_keys[256];
+  for (size_t i = 0; i < std::size(sampled_keys); ++i) {
+    sampled_keys[i] = key_down_[i] || key_pressed_[i];
+    key_pressed_[i] = false;
+  }
+
   uint16_t buttons = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_a)))
     buttons |= X_INPUT_GAMEPAD_A;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_b)))
     buttons |= X_INPUT_GAMEPAD_B;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_x)))
     buttons |= X_INPUT_GAMEPAD_X;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_y)))
     buttons |= X_INPUT_GAMEPAD_Y;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_left_shoulder)))
     buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_right_shoulder)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_press)))
     buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_rstick_press)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_back)))
     buttons |= X_INPUT_GAMEPAD_BACK;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_start)))
     buttons |= X_INPUT_GAMEPAD_START;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_guide)))
     buttons |= X_INPUT_GAMEPAD_GUIDE;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_up)))
     buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_down)))
     buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_left)))
     buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_right)))
     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
-  uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-  uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+  uint8_t lt = IsBindPressed(sampled_keys, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+  uint8_t rt = IsBindPressed(sampled_keys, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
 
   int32_t lx = 0;
   int32_t ly = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_left)))
     lx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_right)))
     lx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_up)))
     ly += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_down)))
     ly -= INT16_MAX;
 
   int32_t rx = 0;
   int32_t ry = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_rstick_left)))
     rx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_rstick_right)))
     rx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_rstick_up)))
     ry += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
+  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_rstick_down)))
     ry -= INT16_MAX;
 
   if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
@@ -476,6 +529,9 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
 
 void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
   if (vk < 256) {
+    if (down && !key_down_[vk]) {
+      key_pressed_[vk] = true;
+    }
     key_down_[vk] = down;
   }
 }

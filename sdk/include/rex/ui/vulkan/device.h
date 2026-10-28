@@ -16,10 +16,10 @@
 
 #include <rex/ui/vulkan/instance.h>
 
-// This SDK enables VK_EXT_extended_dynamic_state3 (NFSMW's ui_vulkan_estado_dinamico3.patch). The
+// This SDK enables VK_EXT_extended_dynamic_state3 (this fork's dynamic-state-3 patch). The
 // native renderer checks this marker to read Extensions::ext_EXT_extended_dynamic_state3 and its
 // three properties.
-#define REX_UI_VULKAN_ESTADO_DINAMICO3 1
+#define REX_UI_VULKAN_DYNAMIC_STATE3 1
 
 namespace rex {
 namespace ui {
@@ -95,6 +95,8 @@ class VulkanDevice {
     VkSampleCountFlags sampledImageStencilSampleCounts =
         VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     bool standardSampleLocations = false;
+    // sa2-nx: the native renderer draws guest lines lineWidth = render scale wide (wideLines).
+    float lineWidthRange[2] = {1.0f, 1.0f};
     VkDeviceSize optimalBufferCopyOffsetAlignment = 1;
     VkDeviceSize optimalBufferCopyRowPitchAlignment = 1;
     VkDeviceSize nonCoherentAtomSize = 256;
@@ -105,6 +107,7 @@ class VulkanDevice {
     bool geometryShader = false;
     bool tessellationShader = false;
     bool sampleRateShading = false;
+    bool wideLines = false;  // sa2-nx: lines wider than 1 (the native renderer's scaled render resolution)
     bool depthClamp = false;
     bool fillModeNonSolid = false;
     bool samplerAnisotropy = false;
@@ -184,7 +187,7 @@ class VulkanDevice {
 
     bool nullDescriptor = false;
 
-    // VK_EXT_extended_dynamic_state3 (#456). Only what the NFSMW native renderer uses (dynamic blend
+    // VK_EXT_extended_dynamic_state3 (#456). Only what the native renderer uses (dynamic blend
     // enable, blend equation and color write mask).
 
     bool extendedDynamicState3ColorBlendEnable = false;
@@ -221,7 +224,7 @@ class VulkanDevice {
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
-    // NFSMW native renderer (dynamic blending and color write masks).
+    // Native renderer (dynamic blending and color write masks).
     bool ext_EXT_extended_dynamic_state3 = false;  // #456
   };
 

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <string>
 
 #include <fmt/format.h>
@@ -27,6 +28,7 @@
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/kernel_module.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/static_modules.h>
 #include <rex/system/function_dispatcher.h>
 #include <chrono>
 #include <thread>
@@ -42,6 +44,7 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
+#include <rex/sys_counters.h>
 
 namespace rex::system {
 
@@ -52,9 +55,12 @@ constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
 // be using to stash their variables.
 KernelState* shared_kernel_state_ = nullptr;
 
+#if defined(_WIN32)
 KernelState* kernel_state() {
+  REX_SYS_CENSUS(rex::syscount::kCensusKernelState, 1);
   return shared_kernel_state_;
 }
+#endif
 
 KernelState::KernelState(Runtime* emulator)
     : emulator_(emulator),
@@ -759,15 +765,19 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     }
 
     rex::platform::DynamicLibrary library_local;
-    if (!library_local.Load(std::filesystem::path(recomp->shared_lib_name),
-                            rex::platform::SymbolResolution::kImmediate)) {
+    // A module linked into the executable (no dynamic loading, e.g. an NRO) registered its entry points.
+    const StaticModuleEntry* static_module = FindStaticModule(recomp->shared_lib_name.c_str());
+    if (!static_module && !library_local.Load(std::filesystem::path(recomp->shared_lib_name),
+                                              rex::platform::SymbolResolution::kImmediate)) {
       REXSYS_ERROR("Failed to load shared library for module '{}'", recomp->pe_name);
     } else {
-      auto register_func = reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
-          library_local.GetRawSymbol("ReXModule_Register"));
       using GetImageInfoFn = const rex::PPCImageInfo* (*)();
-      auto get_image_info =
-          reinterpret_cast<GetImageInfoFn>(library_local.GetRawSymbol("ReXModule_GetImageInfo"));
+      auto register_func = static_module ? static_module->register_fn
+                                         : reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
+                                               library_local.GetRawSymbol("ReXModule_Register"));
+      auto get_image_info = static_module ? static_module->get_image_info
+                                          : reinterpret_cast<GetImageInfoFn>(
+                                                library_local.GetRawSymbol("ReXModule_GetImageInfo"));
       if (!register_func) {
         REXSYS_ERROR("ReXModule_Register not found in '{}'", recomp->shared_lib_name);
       } else if (!get_image_info) {
@@ -1397,6 +1407,26 @@ const char* KernelState::GetOrCreateFiberName(uint32_t guest_addr, const char* t
   const char* ptr = buf.get();
   fiber_name_pool_.emplace(guest_addr, std::move(buf));
   return ptr;
+}
+
+}  // namespace rex::system
+
+namespace rex::system {
+namespace {
+std::map<std::string, StaticModuleEntry>& StaticModules() {
+  static std::map<std::string, StaticModuleEntry> modules;
+  return modules;
+}
+}  // namespace
+
+void RegisterStaticModule(const char* shared_lib_name, runtime::FunctionDispatcher::RegisterFn register_fn,
+                          const PPCImageInfo* (*get_image_info)()) {
+  StaticModules()[shared_lib_name] = StaticModuleEntry{register_fn, get_image_info};
+}
+
+const StaticModuleEntry* FindStaticModule(const char* shared_lib_name) {
+  const auto it = StaticModules().find(shared_lib_name);
+  return it == StaticModules().end() ? nullptr : &it->second;
 }
 
 }  // namespace rex::system

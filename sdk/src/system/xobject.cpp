@@ -26,8 +26,13 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
+#include <rex/sys_counters.h>
+
+#include "global_lock_spin.h"
 
 namespace rex::system {
+
+void ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20): xthread.cpp, RexSetGuestThreadCoreLayout
 
 XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
   handles_.reserve(10);
@@ -86,16 +91,6 @@ void XObject::RetainHandle() {
 bool XObject::ReleaseHandle() {
   // FIXME: Return true when handle is actually released.
   return kernel_state_->object_table()->ReleaseHandle(handles_[0]) == X_STATUS_SUCCESS;
-}
-
-void XObject::Retain() {
-  ++pointer_ref_count_;
-}
-
-void XObject::Release() {
-  if (--pointer_ref_count_ == 0) {
-    delete this;
-  }
 }
 
 X_STATUS XObject::Delete() {
@@ -202,6 +197,8 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
 
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
+  ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
+  REX_SYS_CENSUS(rex::syscount::kCensusWait, 1);
   auto wait_handle = GetWaitHandle();
   if (!wait_handle) {
     // Object doesn't support waiting.
@@ -235,6 +232,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
 X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
                                 uint32_t processor_mode, uint32_t alertable,
                                 uint64_t* opt_timeout) {
+  ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
   auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
@@ -262,6 +260,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
 X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_type,
                                uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout) {
+  ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
   std::vector<rex::thread::WaitHandle*> wait_handles(count);
   for (size_t i = 0; i < count; ++i) {
     wait_handles[i] = objects[i]->GetWaitHandle();
@@ -370,6 +369,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
 object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,
                                              int32_t as_type) {
   assert_not_null(native_ptr);
+  REX_SYS_CENSUS(rex::syscount::kCensusNativeObject, 1);
 
   // Unfortunately the XDK seems to inline some KeInitialize calls, meaning
   // we never see it and just randomly start getting passed events/timers/etc.
@@ -380,7 +380,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
   // We identify this by setting wait_list_flink to a magic value. When set,
   // wait_list_blink will hold a handle to our object.
 
-  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  auto global_lock = AcquireGlobalSpin(rex::thread::global_critical_region::mutex());
 
   auto header = reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr);
 

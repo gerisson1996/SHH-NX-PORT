@@ -42,6 +42,14 @@ class HostPathEntry : public Entry {
    */
   bool children_complete() const { return children_complete_; }
 
+  // Only for rebuilding the tree from the on-disk index (host_path_index.cpp).
+  void AddChildIndex(HostPathEntry* child) { children_.push_back(std::unique_ptr<Entry>(child)); }
+  void MarkCompleteIndex(bool complete) { children_complete_ = complete; }
+  void DiscardChildrenIndex() {
+    children_.clear();
+    children_complete_ = false;
+  }
+
   X_STATUS Open(uint32_t desired_access, File** out_file) override;
   bool Truncate() override;
 

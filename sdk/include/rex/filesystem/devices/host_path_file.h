@@ -26,53 +26,53 @@ class HostPathEntry;
 /*
  * How much is being served from RAM instead of from the SD.
  *
- * aciertos  = game reads answered without going to disk.
- * rellenos  = times the disk had to be read to fill the window.
- * directas  = reads that bypassed the window (large ones, writes, save files).
+ * hits      = game reads answered without going to disk.
+ * fills     = times the disk had to be read to fill the window.
+ * direct    = reads that bypassed the window (large ones, writes, save files).
  * bytes_ram = bytes the game received from the window.
  */
-struct EstadisticasVentana {
-  uint64_t aciertos = 0;
-  uint64_t rellenos = 0;
-  uint64_t directas = 0;
+struct StatsWindow {
+  uint64_t hits = 0;
+  uint64_t filled = 0;
+  uint64_t direct = 0;
   uint64_t bytes_ram = 0;
-  uint64_t ventanas_vivas = 0;
+  uint64_t live_windows = 0;
 };
-EstadisticasVentana LeerEstadisticasVentana();
+StatsWindow ReadStatsWindow();
 
 /*
- * Exact-range read cache. See nfsmw_io_rangos_mb in the .cpp.
+ * Exact-range read cache. See sa2_io_ranges_mb in the .cpp.
  *
  * Everything is cumulative since startup, not per interval: there are few events and the total is
  * what matters.
  *
- * aciertos     = large reads answered from RAM, without going to the SD.
- * fallos       = eligible large reads that did have to go to the SD.
+ * hits         = large reads answered from RAM, without going to the SD.
+ * misses       = eligible large reads that did have to go to the SD.
  * bytes_ram    = bytes delivered to the game from the cache.
- * bytes_disco  = bytes those same reads brought from the SD.
- * entradas     = ranges alive right now.
- * bytes_vivos  = what those ranges take in the host heap.
- * expulsiones  = ranges dropped because of the cap. If this grows, the cap is too small.
- * sin_memoria  = the cache turned itself off for lack of RAM.
+ * bytes_disk  = bytes those same reads brought from the SD.
+ * entries      = ranges alive right now.
+ * bytes_live  = what those ranges take in the host heap.
+ * evictions    = ranges dropped because of the cap. If this grows, the cap is too small.
+ * no_memory  = the cache turned itself off for lack of RAM.
  */
-struct EstadisticasRangos {
-  uint64_t aciertos = 0;
-  uint64_t fallos = 0;
+struct StatsRanges {
+  uint64_t hits = 0;
+  uint64_t failures = 0;
   uint64_t bytes_ram = 0;
-  uint64_t bytes_disco = 0;
-  uint64_t entradas = 0;
-  uint64_t bytes_vivos = 0;
-  uint64_t expulsiones = 0;
-  uint64_t tope_mb = 0;  // the cvar, so the summary does not have to declare it on its own
+  uint64_t bytes_disk = 0;
+  uint64_t inputs = 0;
+  uint64_t bytes_live = 0;
+  uint64_t cap_drops = 0;
+  uint64_t cap_mb = 0;  // the cvar, so the summary does not have to declare it on its own
   // Why something was not cached. Without this the cache could not be tuned.
-  uint64_t bajo_suelo = 0;          // lecturas demasiado pequenas
-  uint64_t sobre_techo = 0;         // demasiado grandes
-  uint64_t secuenciales = 0;        // the level-load sweep, which is not kept
-  uint64_t secuenciales_bytes = 0;
-  uint64_t suelo_kb = 0;
-  bool sin_memoria = false;
+  uint64_t low_floor = 0;          // reads that are too small
+  uint64_t over_ceiling = 0;         // too large
+  uint64_t sequential = 0;        // the level-load sweep, which is not kept
+  uint64_t sequential_bytes = 0;
+  uint64_t floor_kb = 0;
+  bool no_memory = false;
 };
-EstadisticasRangos LeerEstadisticasRangos();
+StatsRanges ReadStatsRanges();
 
 class HostPathFile : public File {
  public:
@@ -87,6 +87,7 @@ class HostPathFile : public File {
                      size_t* out_bytes_written) override;
   X_STATUS SetLength(size_t length) override;
   X_STATUS Flush() override;
+  X_STATUS Rename(const std::filesystem::path& file_path) override;
 
  private:
   /*
@@ -115,7 +116,7 @@ class HostPathFile : public File {
    *
    * The cause was the threshold: only requests of at most window/4 go into the window, i.e. 16 KB with a
    * 64 KB window. The game's average read is 375 KB; the smallest it does in a loop is 64 KB (it is in
-   * the binary itself: the loop at 0x8284FE78 calls NtReadFile with r9 = 0x10000). Not a single game read
+   * the binary itself: a loop calls NtReadFile with r9 = 0x10000). Not a single game read
    * was under 16 KB, so all of them took the direct path.
    *
    * Fix: the window is now 256 KB, which puts the threshold at 64 KB and catches exactly the game's
@@ -124,27 +125,29 @@ class HostPathFile : public File {
    * given at least one hit per refill, the pattern is not sequential and the window is turned off for
    * it; that way it can never again be pure cost in silence.
    */
-  bool RellenarVentana(size_t byte_offset, size_t pedido, std::span<uint8_t> buffer,
+  bool FillWindow(size_t byte_offset, size_t request, std::span<uint8_t> buffer,
                        size_t* out_bytes_read, X_STATUS* out_status);
 
-  // Direct read split into chunks. See the comment on nfsmw_io_trozo_mb in the .cpp.
-  X_STATUS LeerDirecta(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read);
+  // Direct read split into chunks. See the comment on sa2_io_chunk_mb in the .cpp.
+  X_STATUS DirectRead(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read);
 
   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
 
-  std::vector<uint8_t> ventana_;
-  size_t ventana_inicio_ = 0;
-  size_t ventana_bytes_ = 0;
-  size_t ventana_tam_ = 0;
-  uint32_t ventana_cortas_ = 0;
+  std::vector<uint8_t> window_;
+  size_t window_start_ = 0;
+  size_t window_bytes_ = 0;
+  size_t window_size_ = 0;
+  uint32_t short_window_ = 0;
   // Per-file audit: a window that does not hit turns itself off.
-  uint32_t ventana_rellenos_ = 0;
-  uint32_t ventana_aciertos_ = 0;
-  bool ventana_activa_ = false;
-  bool ventana_contada_ = false;
+  uint32_t filled_window_ = 0;
+  uint32_t window_hits_ = 0;
+  bool active_window_ = false;
+  bool counted_window_ = false;
   // File id inside the RAM cache (0 = this file is not cached). See
-  // nfsmw_io_cache_mb.
+  // sa2_io_cache_mb.
   uint32_t cache_id_ = 0;
+  // Tag in the startup trace (0 = not traced). See startup_trace.cpp.
+  uint32_t trace_tag_ = 0;
 };
 
 }  // namespace rex::filesystem

@@ -101,14 +101,14 @@ std::filesystem::path GetExecutablePath() {
 #elif defined(__SWITCH__)
   // Horizon has no /proc. The Linux branch would compile anyway and silently return
   // empty. hbloader passes the NRO path as argv[0], for example
-  // sdmc:/switch/nfsmw/nfsmw.nro, and libnx stores it in __system_argv.
+  // sdmc:/switch/masseffect-nx/masseffect-nx.nro, and libnx stores it in __system_argv.
   //
   // It is returned without the "sdmc:". libstdc++ does not know newlib's devices:
-  // to it, "sdmc:/switch/nfsmw" has no root, so it is relative, and
+  // to it, "sdmc:/switch/masseffect-nx" has no root, so it is relative, and
   // std::filesystem::absolute prepends the current directory. The result is
-  // "sdmc:/switch/nfsmw/sdmc:/switch/nfsmw/game_root", stat fails with an error
+  // "sdmc:/switch/masseffect-nx/sdmc:/switch/masseffect-nx/game_root", stat fails with an error
   // other than "does not exist" and exists() throws filesystem_error. That is how
-  // NFSMW's first boot died, in Runtime::SetupVfs, with nothing in the log.
+  // A first boot died, in Runtime::SetupVfs, with nothing in the log.
   // "/switch/..." does have a root, and newlib resolves it on the default device,
   // which is the SD. It is only stripped if that form can be queried.
   if (__system_argc > 0 && __system_argv && __system_argv[0] && __system_argv[0][0]) {
@@ -123,6 +123,17 @@ std::filesystem::path GetExecutablePath() {
     }
     return std::filesystem::path(path);
   }
+#if defined(REX_SWITCH_FALLBACK_EXE)
+  // sa2-nx (2026-10-20, from banjo-nx): an emulator (Ryujinx) starts NROs without argv, so the app would not know its
+  // folder (no toml, logs or game_root next to it). The app names its usual place on the SD (the root form, as above),
+  // used when it is there. hbloader on a console always passes argv[0].
+  {
+    struct stat st;
+    if (stat(REX_SWITCH_FALLBACK_EXE, &st) == 0) {
+      return std::filesystem::path(REX_SWITCH_FALLBACK_EXE);
+    }
+  }
+#endif
   return {};
 #else
   char buff[FILENAME_MAX] = "";

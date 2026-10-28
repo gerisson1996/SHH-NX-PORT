@@ -599,8 +599,14 @@ std::vector<std::string> Init(int argc, char** argv) {
     }
   }
 
+  // Homebrew loaders do not always pass a program name: an emulator (Ryujinx) starts NROs with argv[0] = null,
+  // and CLI11 takes strlen(argv[0]). Null entries become empty strings.
+  static char empty[] = "";
+  std::vector<char*> arguments;
+  for (int i = 0; i < argc; ++i) arguments.push_back(argv && argv[i] ? argv[i] : empty);
+  if (arguments.empty()) arguments.push_back(empty);
   try {
-    app.parse(argc, argv);
+    app.parse(int(arguments.size()), arguments.data());
   } catch (const CLI::ParseError& e) {
     // TODO(tomc): dumb workaround for the stupid chicken and its egg.
     //             dont call rex logging funcs here for now.
@@ -648,6 +654,16 @@ void LoadConfig(const std::filesystem::path& config_path) {
     REXLOG_DEBUG("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+  }
+}
+
+void LoadConfigString(std::string_view toml_text, std::string_view origin) {
+  try {
+    auto config = toml::parse(toml_text, origin);
+    ApplyTomlTable(config, "");
+    REXLOG_DEBUG("Loaded config from {}", origin);
+  } catch (const toml::parse_error& err) {
+    REXLOG_ERROR("Failed to parse config {}: {}", origin, err.what());
   }
 }
 
