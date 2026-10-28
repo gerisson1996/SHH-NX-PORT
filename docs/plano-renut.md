@@ -109,6 +109,13 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      the state setters at `82905xxx` (not identified one by one yet).
    - the sa2-nx pieces the draws use (setter marks, `src/me/sa2_d3d_api.cpp`) have no SHH counterpart, so the draws'
      device snapshot compares all chunks for now (`sa2_renut_snapshot_deltas_narrow = false`).
+   - **The game's shaders are dumped (2026-10-28).** `d3d/hooks/shader.cpp` is in the build with Silent Hill's three
+     hooks: XGRegisterVertexShader `82909990`, CreatePixelShader `82909ED0` (the object comes back in r3: the stub that
+     read an out parameter captured nothing) and CreateVertexDeclaration `82909D60`. RegisterGuestShader captures every
+     container the cache lacks, and one run to the title gives **893 containers: 205 vertex, 688 pixel**, in
+     `out/pc/shader_capture/` (~1 MB). That is the dump the cache needs; the next step is to turn
+     `RENUT_NO_SHADER_CACHE` off with those files in `app/shaders`, which builds XenosRecomp (its `dxcompiler.lib` is
+     now in place) and translates them, then the draws.
 4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the
    Switch build without NVK. Gate: a picture on the console.
    **The Switch today (2026-10-28).** The console build is still the stage 1 one (the emulated Xenos GPU); it is what

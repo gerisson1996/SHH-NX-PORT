@@ -261,6 +261,7 @@ function(renut_gpu_setup TARGET)
         # SHH's addresses and N&B's offsets. The draw, resource and shader hooks and the state setters come with stage
         # 3, once SHH's own setters and draws are identified.
         ${RENUT_GPU_DIR}/d3d/hooks/device.cpp
+        ${RENUT_GPU_DIR}/d3d/hooks/shader.cpp
         # shh-nx (2026-10-28): the clear, so the Swap has something to present (stage 2); the draws, resolves and the
         # setters are stage 3.
         ${RENUT_GPU_DIR}/d3d/hooks/shh_clear.cpp
@@ -273,7 +274,6 @@ function(renut_gpu_setup TARGET)
         # shh-nx (2026-10-28): the game's screen width (N&B's widescreen code is not SHH's).
         ${RENUT_GPU_DIR}/guest/shh_screen.cpp
         # shh-nx (2026-10-28): stands in for the device and shader hooks the core calls, until those are retargeted.
-        ${RENUT_GPU_DIR}/d3d/shh_stage2_shims.cpp
         # reNut's overlay and the SDK's menus.
         ${RENUT_GPU_DIR}/overlay/app_integration.cpp
         ${RENUT_GPU_DIR}/overlay/overlay_drawer.cpp

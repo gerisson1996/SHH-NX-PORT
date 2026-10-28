@@ -445,13 +445,16 @@ void D3DVertexShader_Bind_hook(u32 shader_va, u32 /*flags*/, u32 declaration_va,
 } // namespace
 
 // ---------------------------------------------------------------------------
-// sa2-nx (2026-10-20): SA2's hooks (N&B's addresses in brackets)
+// shh-nx (2026-10-28): Silent Hill's hooks
 // ---------------------------------------------------------------------------
-// SA2's shader objects stay the game's: its D3DDevice_CreateVertexShader / CreatePixelShader (sub_8255E750 /
-// sub_8255E568) copy the container into the object and call XGRegisterVertexShader / XGRegisterPixelShader on it
-// (the same object layout as N&B's: the container at +0x368 / +0x28, the physical part's pointer at +0x20 / +0x18).
-// So the two XGRegister functions are the hooks: SA2's own code first, then the host side keyed by the container's
-// hash (RegisterGuestShader). The vertex declarations stay the game's too: the host side is kept per object.
+// Silent Hill's shader objects are N&B's (docs/d3d-censo.md): the vertex container at +0x368 with its physical part at
+// +0x20, the pixel container at +0x28 with the physical part at +0x18. Its CreateVertexShader (82909FE0) calls
+// XGRegisterVertexShader (82909990), which is the hook here; its CreatePixelShader (82909ED0) has the registration
+// inlined and returns the object in r3, so the creation itself is the hook. The declarations stay the game's (82909D60)
+// and keep their host side per object, as SA2's do.
+//
+// RegisterGuestShader also captures every container the shader cache lacks (CaptureMissingShader,
+// render/shader_library.cpp): that capture is the dump stage 3 builds the XenosRecomp cache from.
 
 namespace {
 
@@ -470,26 +473,33 @@ void RegisterGuestDeclaration(u32 declaration_va, const GuestVertexElement *elem
   });
 }
 
+// The pixel shader object's physical part (the vertex shader's is at +0x20, and the game hands that one to
+// XGRegisterVertexShader itself).
+constexpr u32 kPixelShaderPhysicalPart = 0x18;
+
 }  // namespace
 
-// void XGRegisterVertexShader(D3DVertexShader*, void *pPhysicalPart) [sub_8255E658; N&B 0x8264E7B8]
-BANJO_RENUT_HOOK_RAW(sub_8255E658) {
+// void XGRegisterVertexShader(D3DVertexShader*, void *pPhysicalPart) [sub_82909990]
+BANJO_RENUT_HOOK_RAW(sub_82909990) {
   const u32 shader = ctx.r3.u32, physical = ctx.r4.u32;
-  __imp__sub_8255E658(ctx, base);
+  __imp__sub_82909990(ctx, base);
   RegisterGuestShader(shader, physical, false);
 }
 
-// void XGRegisterPixelShader(D3DPixelShader*, void *pPhysicalPart) [sub_8255DBF8; N&B 0x8264E670]
-BANJO_RENUT_HOOK_RAW(sub_8255DBF8) {
-  const u32 shader = ctx.r3.u32, physical = ctx.r4.u32;
-  __imp__sub_8255DBF8(ctx, base);
-  RegisterGuestShader(shader, physical, true);
+// D3DPixelShader *D3DDevice_CreatePixelShader(D3DDevice*, const void *pFunction) [sub_82909ED0]: the object comes back
+// in r3.
+BANJO_RENUT_HOOK_RAW(sub_82909ED0) {
+  __imp__sub_82909ED0(ctx, base);
+  const u32 shader = ctx.r3.u32;
+  const auto *physical_va = shader ? GuestPtr<const be_u32>(shader + kPixelShaderPhysicalPart) : nullptr;
+  if (shader && physical_va)
+    RegisterGuestShader(shader, u32(*physical_va), true);
 }
 
-// D3DVertexDeclaration *D3DDevice_CreateVertexDeclaration(const D3DVERTEXELEMENT9*) [sub_8255E198; N&B 0x8264EA90]
-BANJO_RENUT_HOOK_RAW(sub_8255E198) {
+// D3DVertexDeclaration *D3DDevice_CreateVertexDeclaration(const D3DVERTEXELEMENT9*) [sub_82909D60]
+BANJO_RENUT_HOOK_RAW(sub_82909D60) {
   const u32 elements_va = ctx.r3.u32;
-  __imp__sub_8255E198(ctx, base);
+  __imp__sub_82909D60(ctx, base);
   const u32 declaration = ctx.r3.u32;
   if (const auto *elements = declaration ? GuestPtr<const GuestVertexElement>(elements_va) : nullptr)
     RegisterGuestDeclaration(declaration, elements);
