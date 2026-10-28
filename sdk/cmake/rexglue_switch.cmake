@@ -13,10 +13,14 @@ include_guard(GLOBAL)
 
 set(REXGLUE_SWITCH_NVK_SDK "" CACHE PATH
     "portlibs/switch directory of the Mesa Horizon SDK (static NVK driver)")
-if(NOT EXISTS "${REXGLUE_SWITCH_NVK_SDK}/lib/libvulkan.a")
+# shh-nx (2026-10-28): a no-NVK build (REXGLUE_SWITCH_NO_NVK, the deko3d path of stage 4) has no driver to point at, so
+# the folder is only required when the driver is actually linked. The headers it also carries are then not needed: the
+# Vulkan sources compile against the SDK's own copies.
+option(REXGLUE_SWITCH_NO_NVK "Build without the static NVK driver (Vulkan back end cannot start)" OFF)
+if(NOT REXGLUE_SWITCH_NO_NVK AND NOT EXISTS "${REXGLUE_SWITCH_NVK_SDK}/lib/libvulkan.a")
     message(FATAL_ERROR
         "REXGLUE_SWITCH_NVK_SDK must point at <mesa-...-horizon-sdk>/opt/devkitpro/portlibs/switch "
-        "(no lib/libvulkan.a under '${REXGLUE_SWITCH_NVK_SDK}')")
+        "(no lib/libvulkan.a under '${REXGLUE_SWITCH_NVK_SDK}'; a build without a driver sets REXGLUE_SWITCH_NO_NVK)")
 endif()
 
 # sa2-nx (2026-10-20): a build whose renderer does not use Vulkan (SA2's Renut on deko3d) can leave the driver out.

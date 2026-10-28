@@ -30,7 +30,15 @@ rexglue_setup_target(shh GPU_PLUGINS xenos)
 # Renut's Direct3D-level renderer (docs/plano-renut.md): no PM4 ring, no EDRAM; the game's Direct3D runs natively
 # through plume. Linked in with this option, chosen at boot with shh_renderer = "renut" (src/renut_engine, from
 # sa2-nx). OFF builds exactly the stage 1 program.
-option(SHH_RENUT_RENDERER "Link Renut's Direct3D-level renderer (shh_renderer = renut)" ON)
+#
+# shh-nx (2026-10-28): the PC only. The Switch build cannot take this yet: plume there needs its deko3d back end, the
+# static NVK driver and the shader package (docs/plano-renut.md, stage 4), and cmake/shh_renut_gpu.cmake is written for
+# the PC's D3D12/Vulkan. Until stage 4, the console keeps the emulated Xenos GPU, which is what its NRO has today.
+if(REXGLUE_PLATFORM_SWITCH)
+    option(SHH_RENUT_RENDERER "Link Renut's Direct3D-level renderer (PC only; stage 4 adds the Switch)" OFF)
+else()
+    option(SHH_RENUT_RENDERER "Link Renut's Direct3D-level renderer (shh_renderer = renut)" ON)
+endif()
 if(SHH_RENUT_RENDERER)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/shh_renut_gpu.cmake")
 endif()

@@ -111,6 +111,22 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      device snapshot compares all chunks for now (`sa2_renut_snapshot_deltas_narrow = false`).
 4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the
    Switch build without NVK. Gate: a picture on the console.
+   **The Switch today (2026-10-28).** The console build is still the stage 1 one (the emulated Xenos GPU); it is what
+   `out/switch/shh.nro` holds, and that NRO predates the stage 1 SDK swap, so it has to be rebuilt before it is used as
+   a reference again. `SHH_RENUT_RENDERER` is OFF for the Switch toolchain on purpose: `cmake/shh_renut_gpu.cmake` is
+   the PC's D3D12/Vulkan path. What the console needs, in order:
+   - the deko3d back end of plume (banjo-nx's `plume_deko3d*.cpp`, the `PLUME_DEKO3D` path in `thirdparty/plume`) and
+     the `uam` that compiles variant shaders on the console (vendored in `app/thirdparty/uam`);
+   - devkitPro's deko3d: it is **not installed** on this machine (no `libdeko3d.a` under `C:\devkitPro`), so it has to
+     be installed first;
+   - the static NVK driver: no `libvulkan.a` exists anywhere on this machine either, although the Mesa tree it is built
+     from is at `C:\dev\mesa-switch` (`tools/build_mesa.sh`, and `REXGLUE_SWITCH_NVK_SDK` points at its
+     `portlibs/switch`), so `tools\build_mesa.sh` has to run again before `tools\build_switch.bat <nvk_sdk>`;
+   - the game shaders' GLSL package for deko3d (`tools/deko3d_shader_package.py` in sa2-nx) and the shader cache built on
+     the PC (`tools/renut_switch_shader_cache.py`), both of which first need stage 3's dump of Silent Hill's containers;
+   - `tools/build_switch.bat` takes the NVK SDK folder as its argument, and the CMake tree in `out/switch` also needs
+     the Renut pieces' Switch settings (plume's `PLUME_PLATFORM_SWITCH`/`PLUME_DEKO3D`, the `-mearly-ra=none` and LTO
+     options of sa2-nx's CMakeLists), which are not ported yet.
 5. **The console:** render-thread work, pacing, then the browser installer for the shader package.
 
 ## Open points
