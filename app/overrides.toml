@@ -1,0 +1,26 @@
+# ============================================================================
+#  Silent Hill: Homecoming - manual declarations for the codegen
+#
+#  Included from shh_manifest.toml via includes = ["overrides.toml"].
+#  Included files use the flat schema (sections at the root), not the one
+#  nested under [entrypoint] in the manifest.
+#
+#  Root keys (cr_as_local, non_volatile_as_local, ...) must go above the
+#  first [table], or TOML puts them inside it and the codegen ignores them.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+#  FUNCTIONS DECLARED BY HAND
+#
+#  Key = start address (hex, in quotes). Fields, all optional:
+#    name             symbol name (default: sub_XXXXXXXX)
+#    size / end       size in bytes, or end address (mutually exclusive)
+#    parent           address of the parent function (discontiguous fragment)
+#    share_registers  the fragment shares the parent's registers
+# ----------------------------------------------------------------------------
+[functions]
+
+# First codegen (Validate): targets of plain branches ("b", tail calls) that the
+# analysis did not mark as function starts. The analyzer finds their bounds.
+"0x827EB5B8" = {}   # b from 0x827EBF1C
+"0x8269CC98" = {}   # b from 0x82553448

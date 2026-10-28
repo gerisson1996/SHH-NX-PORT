@@ -1,0 +1,34 @@
+# Nothing derived from the game is ever committed: its files, the code generated from default.xex, and the
+# binaries built from that code.
+
+# --- Game files ---------------------------------------------------------------
+assets/
+*.xex
+*.xexp
+*.iso
+*.PAK
+*.pak
+*.bik
+*.xma
+
+# --- Generated from the game --------------------------------------------------
+generated/
+app*/generated/
+
+# --- Build output -------------------------------------------------------------
+out/
+build/
+*.nro
+*.nacp
+*.elf
+*.o
+*.obj
+*.a
+*.log
+*.err
+
+# --- Tools --------------------------------------------------------------------
+__pycache__/
+*.pyc
+.vs/
+.vscode/
