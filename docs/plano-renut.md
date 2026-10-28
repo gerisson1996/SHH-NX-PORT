@@ -92,6 +92,23 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
 3. **Shaders and draws on the PC:** dump the game's containers (CreateVertexShader / CreatePixelShader), translate
    them with XenosRecomp, and draw. Compare with the emulated GPU frame by frame through boot, menus, the title
    movie and gameplay.
+   **Started 2026-10-28.** What is ready and what is not:
+   - the XenosRecomp toolchain now has its import library: `thirdparty/dxc-bin/lib/x64/dxcompiler.lib` (from
+     `C:\VulkanSDK\1.4.363.0\Lib`; `bin/x64/` already has `dxc.exe` and `dxcompiler.dll`). Both folders are ignored by
+     reblue's own `.gitignore`, so they are local to this tree. There is no `dxil.dll`: the SPIR-V side (what Vulkan
+     builds use) is unaffected, and DXIL signing is only needed by D3D12 validation.
+   - `RENUT_NO_SHADER_CACHE` is still ON: the dump directory (`app/shaders`) does not exist because Silent Hill's
+     shader containers are not located yet (the plan's open point), and `tools/dump_shaders.py` has no SHH counterpart.
+     Turning it off with an empty directory makes XenosRecomp produce an empty cache, which is the way to prove the
+     toolchain before the dump exists.
+   - the Direct3D entry points the draws need, as `docs/d3d-censo.md` places them: SetRenderTarget/SetDepthStencilSurface
+     `82908128` (the census lists the two together: whether one function takes both or the depth has an index of its
+     own has to be settled before hooking it, or a wrong hook would break the working clear), DrawVertices `82908408`,
+     DrawIndexedVertices `829087F8`, SetIndices `82907640`, CreateVertexShader `82909FE0` (and XGRegisterVertexShader
+     `82909990`), CreatePixelShader `82909ED0`, CreateVertexDeclaration `82909D60`, the per-draw setter `8290D238`, and
+     the state setters at `82905xxx` (not identified one by one yet).
+   - the sa2-nx pieces the draws use (setter marks, `src/me/sa2_d3d_api.cpp`) have no SHH counterpart, so the draws'
+     device snapshot compares all chunks for now (`sa2_renut_snapshot_deltas_narrow = false`).
 4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the
    Switch build without NVK. Gate: a picture on the console.
 5. **The console:** render-thread work, pacing, then the browser installer for the shader package.

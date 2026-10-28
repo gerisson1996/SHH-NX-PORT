@@ -10,16 +10,15 @@
  * Adapted from sa2-nx's d3d/hooks/draw.cpp, which carries the same ClearF hook among N&B's draws and resolves; those
  * still wait for SHH's addresses (docs/plano-renut.md, stage 3).
  */
-#include <atomic>
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 
 #include "renut_engine/gpu/banjo_renut_select.h"
 #include "renut_engine/gpu/backend/queued.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
-#include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/render/draw.h"
 
 using namespace renut::gpu;
@@ -71,10 +70,6 @@ BANJO_RENUT_HOOK_RAW(sub_8290E528) {
     color[3] = 1.0f;
   }
   // Only the flags' targets that the call names are cleared; the renderer reads the rest from the device.
-  static std::atomic<int> logged{0};
-  if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
-    RGPU_INFO("ClearF device={:#010x} flags={:#x} rect={} colour={},{},{},{} z={} stencil={}", device, flags,
-              has_rect ? "yes" : "no", color[0], color[1], color[2], color[3], ctx.f1.f64, ctx.r8.u32);
   QueueClear(device, flags, has_rect ? &rect : nullptr, color, float(ctx.f1.f64), ctx.r8.u32);
   __imp__sub_8290E528(ctx, base);
 }

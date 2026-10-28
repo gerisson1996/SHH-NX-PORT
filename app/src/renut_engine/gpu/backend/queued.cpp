@@ -51,11 +51,15 @@ REXCVAR_DEFINE_BOOL(sa2_renut_capture_batches, true, "SA2/Renderer",
                     "the pool, and the render thread gives them back, 32 at a time instead of one lock of the pool's "
                     "per draw on each thread. Off: one at a time")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(sa2_renut_snapshot_deltas_narrow, true, "SA2/Renderer",
+// shh-nx (2026-10-28): off by default. The ranges below are sa2-nx's, derived for SA2's device layout; Silent Hill has
+// N&B's, where the vertex declaration (11820) sits inside the range treated as private-only, so the narrowing would
+// skip chunks the draws do read. Every chunk is compared until stage 3 re-derives the ranges for SHH's own setters.
+REXCVAR_DEFINE_BOOL(sa2_renut_snapshot_deltas_narrow, false, "SA2/Renderer",
                     "Renut's renderer (sa2_renut_snapshot_deltas): the game thread compares only the device chunks the "
-                    "render thread reads (40 of 77: not the dirty masks, ring pointers and call tables before the fetch "
-                    "constants, nor the private words from 11008 to 12223, which only the hooks use on the live "
-                    "device). The second console run: comparing all 77 was 9 % of the game thread. Off: all 77")
+                    "render thread reads (SA2's 40 of 77: not the dirty masks, ring pointers and call tables before the "
+                    "fetch constants, nor the private words from 11008 to 12223, which only the hooks use on the live "
+                    "device). Off, and the default here: all 77 (SHH's device is laid out as N&B's, so SA2's ranges do "
+                    "not apply)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sa2_renut_deferred_chain, true, "SA2/Renderer",
                     "Renut's renderer (from futari-nx, as peggle2-nx has it): Begin*Vertices draws are deltas of the "
@@ -333,12 +337,9 @@ constexpr bool DeltaChunkRead(u32 i) {
 static_assert(kDeltaUnreadEnd == 0x480 && kDeltaUnreadEnd % kDeltaUnitBytes == 0);
 static_assert((kDeltaPrivateUnreadBegin - kDeltaTailBegin) % kDeltaUnitBytes == 0 &&
               (kDeltaPrivateUnreadEnd - kDeltaTailBegin) % kDeltaUnitBytes == 0);
-// shh-nx (2026-10-28): these four checks describe SA2's device layout (its private words ran to 12223 and its vertex
-// declaration sat after them). Silent Hill has N&B's layout, where the declaration is at 11820, inside that range, and
-// the setter marks the last two compare against are sa2-nx's (src/me/sa2_setter_marks.cpp, which SHH has no
-// counterpart of yet). The narrowed comparison they guard is a sa2-nx optimisation of the draws' device snapshots;
-// stage 3 redoes it for SHH's own setters, and the checks come back then.
-// static_assert(d3d::kDeviceOffsetVertexDeclaration >= kDeltaPrivateUnreadEnd);
+// shh-nx (2026-10-28): sa2-nx's check here was `d3d::kDeviceOffsetVertexDeclaration >= kDeltaPrivateUnreadEnd`, which
+// holds for SA2 and not for Silent Hill (N&B's declaration is at 11820, inside the private range). The narrowing is
+// therefore off by default, and what has to hold is that the list below covers the whole snapshot (checked after it).
 // The chunks compared: all, or the read ones.
 struct DeltaChunkList {
   u32 count = 0;
@@ -353,8 +354,9 @@ constexpr DeltaChunkList MakeDeltaChunkList(bool narrow) {
 }
 constexpr DeltaChunkList kDeltaAllChunks = MakeDeltaChunkList(false);
 constexpr DeltaChunkList kDeltaReadChunks = MakeDeltaChunkList(true);
+static_assert(kDeltaAllChunks.count == kDeltaChunks);  // the whole snapshot, whenever the narrowing is off
 // sa2-nx (2026-10-28, sa2_renut_setter_marks): the same lists as chunk masks (bit i % 64 of word i / 64), and the
-// chunks every draw compares whatever the marks say: the vertex declaration's (0x2FC0, set inline without a tag).
+// chunks every draw compares whatever the marks say: the vertex declaration's (Silent Hill's is at 11820, N&B's layout).
 constexpr sa2::renut::ChunkBits MakeDeltaChunkMask(const DeltaChunkList &l) {
   sa2::renut::ChunkBits b{};
   for (u32 k = 0; k < l.count; ++k)
