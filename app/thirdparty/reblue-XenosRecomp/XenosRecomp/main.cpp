@@ -356,7 +356,10 @@ int main(int argc, char** argv)
             fmt::println(stderr, "Recompile failures ({}):", g_failures.size());
             for (const auto& failure : g_failures)
                 fmt::println(stderr, "  hash=0x{:016X} reason={}", failure.hash, failure.reason);
-            return 2;
+            // shh-nx (2026-10-29): the cache is written anyway. Silent Hill's translation has shaders DXC 1.8 and 1.9
+            // refuse ("partial explicit stage input location assignment via vk::location(X) unsupported", 31 of 893 at
+            // the title), and a cache with the other 862 is what the renderer can be debugged with: a draw whose shader
+            // is missing is skipped, and the failures above say which ones. The reference trees stop here (return 2).
         }
 
 #ifdef RENUT_RECOMP

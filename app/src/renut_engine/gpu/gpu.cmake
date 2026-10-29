@@ -264,6 +264,7 @@ function(renut_gpu_setup TARGET)
         ${RENUT_GPU_DIR}/d3d/hooks/shader.cpp
         # shh-nx (2026-10-28): the clear, so the Swap has something to present (stage 2); the draws, resolves and the
         # setters are stage 3.
+        ${RENUT_GPU_DIR}/d3d/hooks/shh_draw.cpp
         ${RENUT_GPU_DIR}/d3d/hooks/shh_clear.cpp
         # shh-nx (2026-10-28): the resolve, which gives the Swap its front buffer as a host texture.
         ${RENUT_GPU_DIR}/d3d/hooks/shh_resolve.cpp

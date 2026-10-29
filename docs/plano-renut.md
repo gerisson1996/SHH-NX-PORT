@@ -113,9 +113,23 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      hooks: XGRegisterVertexShader `82909990`, CreatePixelShader `82909ED0` (the object comes back in r3: the stub that
      read an out parameter captured nothing) and CreateVertexDeclaration `82909D60`. RegisterGuestShader captures every
      container the cache lacks, and one run to the title gives **893 containers: 205 vertex, 688 pixel**, in
-     `out/pc/shader_capture/` (~1 MB). That is the dump the cache needs; the next step is to turn
-     `RENUT_NO_SHADER_CACHE` off with those files in `app/shaders`, which builds XenosRecomp (its `dxcompiler.lib` is
-     now in place) and translates them, then the draws.
+     `out/pc/shader_capture/` (~1 MB).
+   - **They are in the cache (2026-10-29).** `app/shaders` holds the 893 containers and `RENUT_NO_SHADER_CACHE` is off:
+     XenosRecomp (built as an ExternalProject, with the DXC 1.8 trio and `dxcompiler.lib` in `dxc-bin/`) translates
+     them at build time. Three things were needed: `tools/renut_early_alpha.py` and `tools/early_alpha.py` copied from
+     sa2-nx, the early-alpha pass turned OFF (`BANJO_RENUT_EARLY_ALPHA`: DXC 1.8 and 1.9 both refuse the HLSL it
+     writes — "partial explicit stage input location assignment via vk::location(X) unsupported"), and that the PC
+     build name a native Windows Python (`C:\msys64\mingw64\bin\python.exe`): devkitPro's MSYS2 python on PATH cannot
+     read `C:/dev/...` paths. 31 of the 893 hit the same DXC restriction in the plain translation, so
+     `XenosRecomp/main.cpp` now writes the cache and keeps listing them (862 in the cache; a draw whose shader is
+     missing is skipped).
+   - **The draws are hooked (2026-10-29).** `d3d/hooks/shh_draw.cpp`: DrawVertices `82908408`, DrawIndexedVertices
+     `829087F8`, SetIndices `82907640` and SetRenderTarget/SetDepthStencilSurface `82908128` (an index of 4 or more is
+     taken as the depth surface, the census lists both at this address). Run of 07:37: **650 draws in 10 s**, the GPU
+     busy 0.41 ms a frame over 302 frames, and the window no longer black (12,12,12 at the centre, 7,7,7 near the
+     bottom: `out/renut_draws.png`) — the title's dark intro. One pipeline creation fails and is logged by key (VS
+     8763F4DD2B71AA32, PS 4D524BFF32A7299D, 1 target). Next: compare frame by frame with the emulated GPU
+     (`shh_renderer=xenos`), then the setters and the pipeline failure.
 4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the
    Switch build without NVK. Gate: a picture on the console.
    **The Switch today (2026-10-28).** The console build is still the stage 1 one (the emulated Xenos GPU); it is what

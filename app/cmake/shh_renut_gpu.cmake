@@ -10,7 +10,7 @@
 # and Swap. The game's shaders are not translated yet (stage 3), so the shader cache is empty (RENUT_NO_SHADER_CACHE).
 
 # Stage 3 turns this off: XenosRecomp then translates the containers tools/dump_shaders.py dumps from the game files.
-set(RENUT_NO_SHADER_CACHE ON)
+set(RENUT_NO_SHADER_CACHE OFF)
 set(RENUT_SHADER_DUMP_DIR "${CMAKE_SOURCE_DIR}/shaders")
 set(RENUT_ASSETS_DIR "${CMAKE_SOURCE_DIR}/../assets/game_root" CACHE PATH
     "Game assets (default.xex and the .PAK files)")
@@ -26,6 +26,11 @@ endif()
 if(TARGET o1heap AND NOT TARGET rex::o1heap)
     add_library(rex::o1heap ALIAS o1heap)
 endif()
+
+# shh-nx (2026-10-29): the early-alpha pass is off: it rewrites the pixel shaders' HLSL, and DXC 1.9 refuses the
+# result ("partial explicit stage input location assignment via vk::location(X) unsupported"). The exact shaders are
+# what stage 3 needs first; the pass can come back with a DXC that accepts them.
+set(BANJO_RENUT_EARLY_ALPHA OFF CACHE BOOL "" FORCE)
 
 include("${CMAKE_SOURCE_DIR}/src/renut_engine/gpu/gpu.cmake")
 
