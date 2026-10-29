@@ -29,18 +29,19 @@ jobs:
       - name: Build the SDK (host tools and codegen)
         run: |
           cmake -S sdk -B build/sdk-host -DCMAKE_BUILD_TYPE=Release -DREXGLUE_ENABLE_TRACY=OFF
-          cmake --build build/sdk-host -j$(sysctl -n hw.ncpu)
+            cmake --build build/sdk-host --target rexglue -j$(sysctl -n hw.ncpu)
 
       - name: Translate default.xex to C++
         run: |
-          REXGLUE="$(find build/sdk-host sdk/out -type f -name rexglue -perm -u+x 2>/dev/null | head -n1)"
+          REXGLUE="$(realpath "$(find build/sdk-host sdk/out -type f -name rexglue -perm -u+x 2>/dev/null | head -n1)")"
           echo "using $REXGLUE"
-          REXGLUE="$REXGLUE" tools/codegen.sh app
+          REXGLUE="$REXGLUE" tools/codegen.sh app || { tail -n 80 app/codegen.log; exit 1; }
 
       - name: Build the app for iOS
         run: |
           cmake -S app -B build/ios -G Xcode \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/ios/toolchain.cmake" \
+            -DREXSDK_DIR="$PWD/sdk" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build/ios --config Release -j$(sysctl -n hw.ncpu)
 
