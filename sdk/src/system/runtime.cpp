@@ -146,6 +146,9 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Create kernel state - this sets the global singleton
   kernel_state_ = std::make_unique<system::KernelState>(this);
 
+  // shh-nx (2026-10-29): boot checkpoints, to see on the console where the setup stops (the first deko3d run stopped
+  // after the guest memory arena, with no further log line).
+  REXSYS_INFO("[setup] input");
   // Initialize input from injected config
   if (config.input_factory) {
     input_system_ = config.input_factory(tool_mode_);
@@ -161,11 +164,13 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     }
   }
 
+  REXSYS_INFO("[setup] kernel modules");
   // HLE kernel modules and apps.
   if (config.kernel_init) {
     config.kernel_init(this, kernel_state_.get());
   }
 
+  REXSYS_INFO("[setup] audio");
   // Initialize the APU (Audio Processing Unit) from injected config
   if (config.audio_factory) {
     audio_system_ = config.audio_factory(function_dispatcher_.get());
@@ -181,6 +186,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     }
   }
 
+  REXSYS_INFO("[setup] file system: {}", game_data_root_.string());
   // Set up VFS: game_data_root as game:/d:, update_data_root as update:
   if (!SetupVfs()) {
     return fail(X_STATUS_UNSUCCESSFUL, "VFS setup failed");
@@ -347,6 +353,7 @@ bool Runtime::SetupVfs() {
     }
   }
   if (!device) {
+    REXSYS_INFO("[setup] mounting the game folder (no asset pack{})", use_pack ? ": unusable" : "");
     device = std::make_unique<rex::filesystem::HostPathDevice>(mount_path, abs_game_root,
                                                                !REXCVAR_GET(allow_game_relative_writes));
     if (!device->Initialize()) {

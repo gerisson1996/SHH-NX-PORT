@@ -6,9 +6,15 @@
  */
 #pragma once
 
+#include <cstdint>
+
 namespace rex::input {
 
 using ReadHook = void (*)();
 void SetReadHook(ReadHook hook);
+
+// shh-nx (2026-10-29): buttons the app holds down for user 0 on top of the controllers (XINPUT_GAMEPAD bits; 0 = none).
+// Silent Hill's fast boot presses A through the logos with it.
+void SetInjectedButtons(uint16_t buttons);
 
 }  // namespace rex::input

@@ -57,6 +57,7 @@
 #include "renut_engine/gpu/render/surfaces.h"
 #include "renut_engine/gpu/render/textures.h"
 #include "renut_engine/gpu/backend/video.h"
+#include "renut_engine/shh_compat/fast_boot.h"
 
 using namespace renut::gpu;
 
@@ -874,6 +875,7 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
   // layout are not SHH's (yet). What the renderer needs stays: the frame's fence, the present of
   // the game's front buffer, and the frame statistics.
   renut::frame_stats::OnGameFrame();
+  shh::fast_boot::Tick();  // shh-nx (2026-10-29): fast boot's time limit
   {
     static std::atomic<int> swap_logged{0};
     if (swap_logged.fetch_add(1, std::memory_order_relaxed) < 3)

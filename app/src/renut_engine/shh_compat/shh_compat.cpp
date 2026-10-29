@@ -88,7 +88,7 @@ REXCVAR_DEFINE_INT32(banjo_prewarm_threads, 1, "Banjo",
     .range(1, 3)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-REXCVAR_DEFINE_INT32(banjo_ring_core, 1, "Banjo",
+REXCVAR_DEFINE_INT32(banjo_ring_core, -1, "Banjo",
                      "Native renderer: the ring thread is pinned to this core (its affinity mask reduced to it). -1 = "
                      "the process's whole mask, as before. In-run A/B target 41 switches between the pin and the "
                      "whole mask")

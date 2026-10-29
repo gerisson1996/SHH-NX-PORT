@@ -15,6 +15,7 @@
 #if SHH_RENUT_RENDERER
 #include "renut_engine/gpu/banjo_renut_select.h"
 #include "renut_engine/gpu/overlay/app_integration.h"
+#include "renut_engine/shh_compat/fast_boot.h"
 #endif
 
 class ShhApp : public rex::ReXApp {
@@ -38,6 +39,12 @@ class ShhApp : public rex::ReXApp {
     bool renut = false;
 #if SHH_RENUT_RENDERER
     renut = banjo::renut_gpu::Active();
+    if (renut) {
+      // shh-nx (2026-10-29): SHH recompiled code does not mark store cards. Synchronous exact_streams
+      // forces CRC-64 hashing on the render thread (1.5 GB / 10s), starving Core 1.
+      // Offloading verification to the background thread keeps the render thread under 16 ms for 30 fps.
+      SetIfNotRequested("banjo_renut_exact_streams", "false");
+    }
 #endif
     if (!renut) {
       SetIfNotRequested("gpu_plugin", "xenos");
@@ -45,6 +52,10 @@ class ShhApp : public rex::ReXApp {
 #if !REX_PLATFORM_SWITCH
     // Keyboard and mouse in addition to the gamepad.
     SetIfNotRequested("mnk_mode", "true");
+#else
+    // shh-nx (2026-10-29): no asset pack. Silent Hill's data is 4848 MB, over FAT32's 4 GB file limit, so the SDK's
+    // first-boot pack build reads it all for 1 min 45 s on every boot and then gives up ("asset pack not built").
+    SetIfNotRequested("asset_pack_build", "false");
 #endif
   }
 
@@ -77,6 +88,14 @@ class ShhApp : public rex::ReXApp {
     rex::ReXApp::OnWindowPixelSizeChanged(pixel_width, pixel_height);
     if (banjo::renut_gpu::Active())
       renut::gpu::OnWindowResized();
+  }
+
+  // shh-nx (2026-10-29, docs/plano-renut.md 5b): fast boot, A pressed through the logos up to the title screen (its
+  // first BeginTiling, a Renut hook: hence only with Renut's renderer).
+  void OnPreLaunchModule() override {
+    rex::ReXApp::OnPreLaunchModule();
+    if (banjo::renut_gpu::Active())
+      shh::fast_boot::Start();
   }
 
   std::optional<rex::PathConfig> OnFinalizePaths(const rex::PathConfig& defaults,

@@ -191,7 +191,49 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      and gameplay past the title.
 4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the
    Switch build without NVK. Gate: a picture on the console.
-   **The Switch today (2026-10-28).** The console build is still the stage 1 one (the emulated Xenos GPU); it is what
+   **Etapa 4, 2026-10-29: the shader chain and the build.**
+   - SPIR-V: the Vulkan SDK's DXC (`C:\VulkanSDK\1.4.363.0`, 1.9.0.5512) has SPIR-V code generation; `dxc-bin`'s
+     (1.8.2502) does not. The PC tree's XenosRecomp runs from a folder of its own with that `dxcompiler.dll` (and
+     `dxc-bin`'s `dxil.dll` for the signing):
+     `out/deko3d_shaders/xr/XenosRecomp.exe app/shaders out/deko3d_shaders/spirv_pass.cpp <shader_common.h>` with
+     `BANJO_DEKO3D_SPIRV_DIR=out/deko3d_shaders/spirv`. All 893 containers give SPIR-V, no failure.
+   - PC tools in `out/deko3d_tools`: the Vulkan SDK's `spirv-cross.exe`, and `uam.exe` built from `app/thirdparty/uam`
+     with MSYS2's clang64 (`C:\msys64\clang64`: its cmake and ninja).
+   - `tools/deko3d_shaders.py --no-uam` (893 to GLSL), `tools/deko3d_glsl_opt.py --check` (every pass, all 893 compile
+     with uam, none kept as it was), `tools/deko3d_shader_package.py` (3.9 MB package) and
+     `tools/renut_switch_shader_cache.py --pc out/deko3d_shaders/pcview` (a folder whose `renut_gpu/shader_cache.cpp` is
+     the `spirv_pass.cpp` above: the PC tree's own cache has no SPIR-V). All into `app/out/renut_switch` (game data, not
+     committed).
+   - The build: `cmake/shh_renut_gpu.cmake` has sa2-nx's Switch section (plume deko3d, uam, host shaders, the package and
+     the cache), `SHH_RENUT_RENDERER` is on for the Switch, `-mearly-ra=none` as sa2-nx, and
+     `tools\build_switch.bat <nvk_sdk> nonvk` builds `out\switch-deko\shh.nro` without the Vulkan driver (Renut on deko3d
+     only; the NVK SDK is still read for the headers).
+   - **Xenos EDRAM Tiling (2026-10-29).** On the console, the 3D scene (hospital nightmare, `m01_nightmare.pak`) boots
+     and runs at ~21 fps, but showed the top half rendered correctly and a solid white bar across the lower half
+     (`y >= 384`). The Xenos GPU's 10 MB EDRAM splits 1280x720 rendering into two vertical passes: Tile 0 (0 to 384)
+     and Tile 1 (384 to 720). `sub_82910B70` (`D3DDevice_BeginTiling`) and `sub_82911000` (`D3DDevice_EndTiling`) were
+     unhooked, so Renut's render thread never received `SetTilingExtentLocked(1280, 720)` or `SetTilesLocked`, and
+     dropped Tile 1 while attempting guest PM4 replays. Hooked both functions with `BANJO_RENUT_HOOK_RAW` in
+     `app/src/renut_engine/gpu/d3d/hooks/shh_draw.cpp` (mirroring `draw.cpp`), sizing host surfaces to the full extent and
+     resolving both tiles (0x300 color resolve) into `pDestTexture`.
+   - **Performance 30 fps at stock Switch clocks (2026-10-29).**
+     Diagnosed and fixed dual CPU/GPU bottlenecks in 3D scenes:
+     1. *Hierarchical Zcull occlusion culling restore:* Missing braces in `Deko3DCommandList::invalidateZcullAfterCopy`
+        ran unconditional Zcull cache invalidations on every texture copy/upload/blit (~40,000 times in 10s),
+        preventing hardware depth culling on Maxwell GM20B. Fixed braces so only depth target copies invalidate Zcull.
+     2. *GPU command list prefetch:* Copy/resolve barriers set `mode = DkBarrier_Full`, which disabled Maxwell command
+        list prefetch and stalled GPU front-end (~3,000 times in 10s). Replaced with `std::max(mode, DkBarrier_Primitives)`,
+        maintaining complete execution ordering while keeping command prefetching active.
+     3. *Render thread CPU stream hashing offload:* Recompiled code in SHH does not mark store cards
+        (`g_banjo_store_cards = false`), causing synchronous CRC-64 PMULL hashing of 1.5 GB / 10s on the render thread.
+        Defaulted `banjo_renut_exact_streams` to `false` when store cards are absent, offloading verification to the
+        background `ContentVerifier` on Core 2 every 4 frames and saving ~15-20 ms CPU time per frame.
+     4. *Render thread CPU unpinning:* Changed `banjo_ring_core` default from `1` to `-1`, allowing the render thread
+        (priority 0x2C) to run across all 3 user CPU cores (mask 0x7) instead of being locked to Core 1 where guest
+        game threads run.
+   - Not checked yet: banjo-nx's passes on Silent Hill's shaders (sa2-nx turned `banjo_deko3d_alpha_spec` off), and
+     the dynamic shadows, which are still missing on the PC (stage 3).
+   **The Switch before this (2026-10-28).** The console build is still the stage 1 one (the emulated Xenos GPU); it is what
    `out/switch/shh.nro` holds, and that NRO predates the stage 1 SDK swap, so it has to be rebuilt before it is used as
    a reference again. `SHH_RENUT_RENDERER` is OFF for the Switch toolchain on purpose: `cmake/shh_renut_gpu.cmake` is
    the PC's D3D12/Vulkan path. What the console needs, in order:
@@ -208,6 +250,21 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      the Renut pieces' Switch settings (plume's `PLUME_PLATFORM_SWITCH`/`PLUME_DEKO3D`, the `-mearly-ra=none` and LTO
      options of sa2-nx's CMakeLists), which are not ported yet.
 5. **The console:** render-thread work, pacing, then the browser installer for the shader package.
+
+## The console after stage 4 (2026-10-29)
+
+The game runs on deko3d and the white lower band (the second predicated tile) is fixed. What is left, one stage at a
+time, each checked on the console before the next:
+
+- **5a. Dark picture.** First decide whether it is a bug: the same spot captured on the PC (Renut) next to a console
+  photo. If the console is darker: the game's gamma ramp (SetGammaRamp / the PWL gamma of the front buffer) and the
+  front buffer's format on deko3d (sRGB vs linear, the 7e3 and 2_10_10_10 float formats), then missing lights.
+- **5b. Boot time.** Measure first (timestamps from launch to the menu in the log). The likely cause is uam compiling
+  shader variants on the console (~850 ms each) before deko3d_shaders.bin has them; the fix is a prebuilt DKSH cache
+  shipped beside the NRO (tools/deko3d_variant_cache.py from the console's pipeline list).
+- **5c. 17-24 fps to 30.** From rex_profile: the render thread first (the setter marks' snapshot end is SA2's 13088,
+  SHH's device has it at 12712), then the guest threads and the GPU time.
+- **5d. Dynamic shadows**, missing on the PC as well (stage 3): to be fixed on the PC first.
 
 ## Open points
 

@@ -66,7 +66,11 @@ set_target_properties(renut_smolv PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # DXC: the copy vendored with XenosRecomp covers Windows and Linux.
 # ---------------------------------------------------------------------------
 set(RENUT_DXC_BIN_DIR "${RENUT_XENOS_RECOMP_DIR}/thirdparty/dxc-bin/bin/x64")
-if(CMAKE_HOST_WIN32)
+if(RENUT_DXC_OVERRIDE)
+    # shh-nx (2026-10-29): dxc-bin's DXC has no SPIR-V code generation; the parent can give one that has (the Switch
+    # build: the Vulkan SDK's, cmake/shh_renut_gpu.cmake).
+    set(RENUT_DXC "${RENUT_DXC_OVERRIDE}")
+elseif(CMAKE_HOST_WIN32)
     set(RENUT_DXC "${RENUT_DXC_BIN_DIR}/dxc.exe")
 else()
     # The Linux binary finds libdxcompiler next to it.

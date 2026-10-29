@@ -72,6 +72,13 @@ REXCVAR_DEFINE_BOOL(shh_renut_diag_2d_opaque, false, "Silent Hill/Renut",
                     "Diagnostic: draws of the 2D quad shader forced opaque, all channels written, no depth test");
 REXCVAR_DEFINE_BOOL(shh_renut_diag_2d_constants, false, "Silent Hill/Renut",
                     "Diagnostic: log the 2D quad shader's first pixel shader float constants (registers 0-15)");
+// shh-nx (2026-10-29, 30 fps at stock clocks): a buffer the vertex shader reads by another index (vfetchBound: the
+// skinning's bone rows, the particles' inputs) was copied whole from the fetch constant's address to its end (~560 KB a
+// draw, ~116 MB a frame through the upload ring and its cache clean). Copied up to this many rows instead, or the draw's
+// highest vertex index if larger (the particles index by vertex): the skinning's bone index is at most 255 * 3 + 2.
+REXCVAR_DEFINE_INT32(shh_renut_bound_fetch_rows, 1024, "Silent Hill/Renut",
+                     "Rows of a vfetchBound buffer copied per draw (at least the draw's vertex range; 0 = the whole "
+                     "buffer)");
 
 // sa2-nx (2026-10-20): see DrawStateLocked.
 REXCVAR_DEFINE_BOOL(sa2_renut_chain_reuse, true, "SA2/Renderer",
@@ -555,6 +562,8 @@ std::vector<PendingCopy> g_copy_fills;
 // the same bytes takes the queued copy rather than another. Where in its
 // upload chunk the copy is (the draw's fetch slots count from the chunk's
 // start). A generation, bumped at each flush, retires them all at once.
+// shh-nx (2026-10-29): by start address alone, and a queued copy at least as long serves a shorter one (the bound
+// fetches' copies are cut to each draw's rows, so their sizes differ between draws of the same buffer).
 struct FetchCopy {
   const u8 *src = nullptr;
   u32 size = 0;
@@ -562,12 +571,12 @@ struct FetchCopy {
   const plume::RenderBuffer *buffer = nullptr;
   u32 offset = 0;
 };
-constexpr u32 kFetchCopyBits = 8;
+constexpr u32 kFetchCopyBits = 10;
 FetchCopy g_fetch_copies[1u << kFetchCopyBits];
 uint64_t g_fetch_copy_generation = 1;
 
-FetchCopy &FetchCopyFor(const u8 *src, u32 size) {
-  const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(src)) ^ (uint64_t(size) << 40);
+FetchCopy &FetchCopyFor(const u8 *src) {
+  const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(src));
   return g_fetch_copies[(key * 0x9E3779B97F4A7C15ull) >> (64 - kFetchCopyBits)];
 }
 
@@ -2797,10 +2806,11 @@ bool BindStreams(const GuestDevice &device, const DrawCall &call, const ShaderRe
 // The vertex inputs the shader reads from its declaration by an index other
 // than the vertex index (vfetchBound): each described from the declaration's
 // element for it. Returns the fetch constants (bit i = index 64 + i) whose
-// buffers those reads need copied.
+// buffers those reads need copied. shh-nx (2026-10-29, shh_renut_bound_fetch_rows): with rows, the bytes of each
+// such buffer that rows of its elements span (limits[bit], the most of its elements'); 0 = no limit.
 u32 DescribeBoundFetches(const GuestDevice &device, const DrawCall &call, const ShaderRecord &vs,
                          const VertexDeclarationRecord &declaration, const u32 *shader_strides,
-                         SharedConstants &sc) {
+                         SharedConstants &sc, u32 rows, u32 *limits) {
   if (!vs.entry)
     return 0;
   const ShaderVertexInput *inputs = g_shaderVertexInputs + vs.entry->vertexInputOffset;
@@ -2838,7 +2848,13 @@ u32 DescribeBoundFetches(const GuestDevice &device, const DrawCall &call, const 
       sc.bound_fetch[i][1] = u32(e.Offset) / 4;
       sc.bound_fetch[i][2] = src.stride / 4;
       sc.bound_fetch[i][3] = BoundDeclType(u32(e.Type)) & 0x3FFFFFu;
-      mask |= 1u << (fetch_index - 64);
+      const u32 bit = fetch_index - 64;
+      mask |= 1u << bit;
+      if (rows) {
+        // The element's last row, and 16 bytes past its offset for its widest type.
+        const uint64_t span = (uint64_t(rows) * src.stride + u32(e.Offset) + 16u + 15u) & ~uint64_t(15);
+        limits[bit] = std::max(limits[bit], u32(std::min<uint64_t>(span, kMaxFetchCopyBytes)));
+      }
       break;
     }
   }
@@ -2861,7 +2877,7 @@ bool EnsureBuffer(std::unique_ptr<plume::RenderBuffer> &buffer, uint64_t &capaci
 bool g_dump_fetch = false;
 
 UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall &call, u32 mask,
-                                       SharedConstants &sc) {
+                                       const u32 *limits, SharedConstants &sc) {
   struct Copy {
     u32 index;
     const u8 *src;
@@ -2895,6 +2911,11 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
     if (!c.src)
       c.size = 0;
     c.size = std::min(c.size, kMaxFetchCopyBytes);
+    if (limits[bit] && limits[bit] < c.size) {
+      if (DiagCountsOn())
+        banjo::renut_gpu::CountFetchCopy(0, c.size - limits[bit], 0);
+      c.size = limits[bit];
+    }
     if (c.size && FetchFromExportWindow(device, call, index, c.export_slot, c.export_offset))
       any_exported = c.exported = true;
     copies[copy_count++] = c;
@@ -2916,8 +2937,8 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
     for (u32 i = 0; i < copy_count; ++i) {
       const Copy &c = copies[i];
       if (c.size && !c.exported && !(c.index == up_fetch_index && call.up_vertices)) {
-        const FetchCopy &known = FetchCopyFor(c.src, c.size);
-        reused[i] = known.generation == g_fetch_copy_generation && known.src == c.src && known.size == c.size &&
+        const FetchCopy &known = FetchCopyFor(c.src);
+        reused[i] = known.generation == g_fetch_copy_generation && known.src == c.src && known.size >= c.size &&
                     known.buffer == chunk;
       }
       if (!reused[i])
@@ -2940,23 +2961,31 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
     u32 at = u32(chunk_offset) + offset;
     if (reused[i]) {
       // Queued in this chunk by an earlier draw: read there, no room here.
-      sc.vertex_fetch_slots[c.index] = FetchCopyFor(c.src, c.size).offset | c.endian;
+      sc.vertex_fetch_slots[c.index] = FetchCopyFor(c.src).offset | c.endian;
+      if (DiagCountsOn())
+        banjo::renut_gpu::CountFetchCopy(0, 0, c.size);
       continue;
     }
     if (c.size && !c.exported) {
       if (c.index == up_fetch_index && call.up_vertices) {
         std::memcpy(dst, c.src, c.size);
       } else if (shared) {
-        FetchCopy &known = FetchCopyFor(c.src, c.size);
+        FetchCopy &known = FetchCopyFor(c.src);
         if (known.generation == g_fetch_copy_generation && known.src == c.src &&
-            known.size == c.size && known.buffer == alloc.ref.ref) {
+            known.size >= c.size && known.buffer == alloc.ref.ref) {
           at = known.offset;
+          if (DiagCountsOn())
+            banjo::renut_gpu::CountFetchCopy(0, 0, c.size);
         } else {
           g_copy_fills.push_back({c.src, dst, c.size});
           known = {c.src, c.size, g_fetch_copy_generation, alloc.ref.ref, at};
+          if (DiagCountsOn())
+            banjo::renut_gpu::CountFetchCopy(c.size, 0, 0);
         }
       } else {
         g_copy_fills.push_back({c.src, dst, c.size});
+        if (DiagCountsOn())
+          banjo::renut_gpu::CountFetchCopy(c.size, 0, 0);
       }
     }
     sc.vertex_fetch_slots[c.index] = at | c.endian;
@@ -3975,6 +4004,8 @@ void FlushVertexFillsLocked() {
   ++g_flush_serial;  // banjo-nx: banjo_renut_exact_streams' intervals
   banjo::renut_gpu::CountKick();
   for (const PendingStreamFill &f : g_stream_fills) {
+    if (DiagCountsOn())
+      banjo::renut_gpu::CountStreamConverted(uint64_t(f.stride) * f.count);
     ConvertVertices(f.stream, f.guest, f.stride, f.count, f.endian, f.host);
     if (f.cacheable)
       TrackConvertedStream(f);
@@ -4532,8 +4563,18 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     return false;
   }
 
-  const u32 fetch_mask = (vs->entry ? vs->entry->vertexFetchMemoryMask : 0) |
-                         DescribeBoundFetches(device, call, *vs, *declaration, shader_strides, sc);
+  // shh-nx (2026-10-29, shh_renut_bound_fetch_rows): the rows of the bound fetches' buffers copied: none cut for
+  // tessellated draws (their index is the guest's own), nor for buffers the shader also reads by address.
+  static const u32 bound_rows = u32(std::max(0, REXCVAR_GET(shh_renut_bound_fetch_rows)));
+  const u32 rows = bound_rows && !call.tessellation
+                       ? std::max(bound_rows, geometry.first_vertex + std::max(geometry.vertex_range, 1u))
+                       : 0u;
+  u32 fetch_limits[32] = {};
+  const u32 memory_mask = vs->entry ? vs->entry->vertexFetchMemoryMask : 0;
+  const u32 fetch_mask =
+      memory_mask | DescribeBoundFetches(device, call, *vs, *declaration, shader_strides, sc, rows, fetch_limits);
+  for (u32 m = memory_mask; m; m &= m - 1)
+    fetch_limits[std::countr_zero(m)] = 0;
   {
     static const uint64_t want = [] {
       const std::string v = REXCVAR_GET(banjo_renut_diag_stream_dump_vs);
@@ -4541,7 +4582,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     }();
     g_dump_fetch = want && vs->hash == want;
   }
-  UploadAllocation fetch_alloc = UploadVertexFetchData(device, call, fetch_mask, sc);
+  UploadAllocation fetch_alloc = UploadVertexFetchData(device, call, fetch_mask, fetch_limits, sc);
   if (g_dump_fetch) {
     static uint32_t logged = 0;
     if (logged++ < 24)

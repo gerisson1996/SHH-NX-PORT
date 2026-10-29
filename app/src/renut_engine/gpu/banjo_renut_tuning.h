@@ -312,6 +312,10 @@ inline bool PushConstantsVerifyOn() { return Latch().push_constants_verify; }
 void CountPushedConstants(uint64_t bytes, int what);
 // banjo-nx (2026-10-19, render-thread proposal 23): upload ring bytes cleaned at the submits.
 void CountRingPublished(uint64_t bytes);
+// shh-nx (2026-10-29, shh_renut_bound_fetch_rows): fetch data bytes copied, cut by the rows, read from a queued copy;
+// guest stream bytes converted at the kicks.
+void CountFetchCopy(uint64_t copied, uint64_t cut, uint64_t reused);
+void CountStreamConverted(uint64_t bytes);
 void CountHandOver(int what);
 void CountSkippedResolve(bool depth);
 // banjo_renut_cache_save_quiet (package 28): a pipeline was built (render/pipeline.cpp Build, any thread).

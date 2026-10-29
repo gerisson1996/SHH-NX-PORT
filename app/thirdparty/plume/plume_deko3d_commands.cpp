@@ -217,7 +217,7 @@ namespace plume {
         if (stages & RenderBarrierStage::COMPUTE)
             mode = std::max(mode, DkBarrier_Primitives);
         if (copy)
-            mode = DkBarrier_Full;
+            mode = std::max(mode, DkBarrier_Primitives);
         if (mode == DkBarrier_None && textureBarriersCount == 0 && bufferBarriersCount == 0)
             mode = DkBarrier_Primitives;
         if (Deko3DGetOptions().mergeBarriers) {
@@ -232,6 +232,12 @@ namespace plume {
     }
 
     void Deko3DCommandList::emitBarrier(DkBarrier mode, uint32_t invalidate) {
+        if (mode == DkBarrier_None && invalidate == 0) {
+            pendingBarrier = false;
+            pendingBarrierMode = DkBarrier_None;
+            pendingBarrierInvalidate = 0;
+            return;
+        }
         {
             // banjo-nx (2026-10-19): counted for the renderer's report (a load and a store: diagnostics).
             Deko3DStats &st = GetDeko3DStats();
@@ -940,9 +946,10 @@ namespace plume {
         // banjo-nx (2026-10-18): deko3d drops the Zcull data only when another depth target is bound; a copy into the
         // bound one (the copy engine does not update Zcull) leaves it describing the old depth, which would cull draws
         // the new depth passes.
-        if (Deko3DGetOptions().zcull && (dst->desc.flags & RenderTextureFlag::DEPTH_TARGET))
+        if (Deko3DGetOptions().zcull && (dst->desc.flags & RenderTextureFlag::DEPTH_TARGET)) {
             flushBarriers();
             dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+        }
     }
 
     void Deko3DCommandList::copyBuffer(const RenderBuffer *dst, const RenderBuffer *src) {

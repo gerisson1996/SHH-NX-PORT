@@ -8,6 +8,16 @@ project(shh LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# shh-nx (2026-10-29, from sa2-nx): -mearly-ra=none for everything compiled for the console. devkitA64 GCC 16.1's
+# AArch64 early register allocation pass (on at -O2 and above) dropped the table lookups of the XDK's streaming copy
+# in Peggle 2's console build (garbage textures on the console only), and SA2's copy of that routine shows the same
+# damage. Here, before the SDK is added, so its libraries and the LTO link get it too.
+option(SHH_SWITCH_EARLY_RA "Leave GCC's AArch64 early register allocation pass on (Switch; miscompiles)" OFF)
+if(REXGLUE_PLATFORM_SWITCH AND NOT SHH_SWITCH_EARLY_RA)
+    add_compile_options(-mearly-ra=none)
+    add_link_options(-mearly-ra=none)
+endif()
+
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/rexglue.cmake")
     message(FATAL_ERROR "Run the codegen first: REXGLUE=sdk/out/win-amd64/rexglue.exe tools/codegen.sh app")
 endif()
@@ -31,14 +41,9 @@ rexglue_setup_target(shh GPU_PLUGINS xenos)
 # through plume. Linked in with this option, chosen at boot with shh_renderer = "renut" (src/renut_engine, from
 # sa2-nx). OFF builds exactly the stage 1 program.
 #
-# shh-nx (2026-10-28): the PC only. The Switch build cannot take this yet: plume there needs its deko3d back end, the
-# static NVK driver and the shader package (docs/plano-renut.md, stage 4), and cmake/shh_renut_gpu.cmake is written for
-# the PC's D3D12/Vulkan. Until stage 4, the console keeps the emulated Xenos GPU, which is what its NRO has today.
-if(REXGLUE_PLATFORM_SWITCH)
-    option(SHH_RENUT_RENDERER "Link Renut's Direct3D-level renderer (PC only; stage 4 adds the Switch)" OFF)
-else()
-    option(SHH_RENUT_RENDERER "Link Renut's Direct3D-level renderer (shh_renderer = renut)" ON)
-endif()
+# shh-nx (2026-10-29, stage 4): the Switch too, on plume's deko3d back end with the shader package from the PC
+# (cmake/shh_renut_gpu.cmake). A Switch build with REXGLUE_SWITCH_NO_NVK (tools\build_switch.bat nonvk) has only Renut.
+option(SHH_RENUT_RENDERER "Link Renut's Direct3D-level renderer (shh_renderer = renut)" ON)
 if(SHH_RENUT_RENDERER)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/shh_renut_gpu.cmake")
 endif()

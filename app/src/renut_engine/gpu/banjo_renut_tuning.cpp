@@ -415,13 +415,13 @@ REXCVAR_DEFINE_BOOL(banjo_renut_linked_stages, true, "Banjo/Enhancements",
                     "with the per-stage keys of masseffect_nvk_cache_per_stage (disable_lto), so the vertex outputs the "
                     "pixel shader does not read are dropped: Renut's vertex shaders write every output, zeros for the "
                     "unused ones. More compiling, kept by banjo_renut_pipeline_cache. Same image");
-REXCVAR_DEFINE_BOOL(banjo_renut_exact_streams, true, "Banjo",
+REXCVAR_DEFINE_BOOL(banjo_renut_exact_streams, g_banjo_store_cards, "Banjo",
                     "Renut's renderer: a cached copy of a vertex stream or index range is hashed whole on its first use "
                     "after each kick (where the game may learn the GPU is done with a buffer and rewrite it) and "
                     "converted again if its guest bytes changed, instead of Renut's check on a background thread once "
                     "every 4 frames, after which a rewritten range could draw from its old copy for about 5 frames. "
-                    "The exact rule (banjo-nx's renderer proves its persistent vertex blocks the same way); not under "
-                    "a master switch");
+                    "The exact rule (banjo-nx's renderer proves its persistent vertex blocks the same way); defaults to "
+                    "false when store cards are not marked");
 #if REX_PLATFORM_SWITCH
 constexpr bool kMemoryPolicyDefault = true;
 #else
@@ -514,6 +514,7 @@ std::atomic<uint64_t> g_exp_adjust[3];  // 2026-10-20: binds with an exponent ad
 std::atomic<uint64_t> g_skin_miss[6];  // near misses by field: streams, fetch window, index, first vertex, shared, any
 std::atomic<uint64_t> g_header_differ[7];  // 2026-10-20: binds whose header (same data) differs from the device, per dword
 std::atomic<uint64_t> g_ring_published{0};  // render-thread proposal 23
+std::atomic<uint64_t> g_fetch_copy[4];      // shh-nx 2026-10-29: fetch bytes copied, cut, reused; stream bytes converted
 std::atomic<uint64_t> g_kick_submit[4];      // lists submitted at a kick, ranges cleaned by the thread / by the render thread
 std::atomic<uint64_t> g_pushed[4];      // banjo_deko3d_push_constants: float bytes, shared bytes, draws, verify misses
 std::atomic<uint64_t> g_depth_float_sampled{0};  // 2026-10-18 census
@@ -789,6 +790,15 @@ void StatsGameFrame() {
               g_kick_submit[1].exchange(0, std::memory_order_relaxed),
               g_kick_submit[2].exchange(0, std::memory_order_relaxed),
               g_kick_submit[0].exchange(0, std::memory_order_relaxed));
+  {
+    constexpr double kMB = double(1u << 20);
+    REXLOG_INFO("[renut] fetch data: {:.1f} MB copied, {:.1f} MB cut by shh_renut_bound_fetch_rows, {:.1f} MB read "
+                "from queued copies; streams: {:.1f} MB converted",
+                double(g_fetch_copy[0].exchange(0, std::memory_order_relaxed)) / kMB,
+                double(g_fetch_copy[1].exchange(0, std::memory_order_relaxed)) / kMB,
+                double(g_fetch_copy[2].exchange(0, std::memory_order_relaxed)) / kMB,
+                double(g_fetch_copy[3].exchange(0, std::memory_order_relaxed)) / kMB);
+  }
   // banjo-nx (2026-10-20): tools/deko3d_glsl_opt.py's aw4 pass reads bone rows as 16-byte loads; the fetch data's
   // offset, slots and size must stay multiples of 16 (render/draw.cpp UploadVertexFetchData). Expected: 0 off.
   if (const uint64_t checked = g_fetch_misaligned[0].exchange(0, std::memory_order_relaxed)) {
@@ -970,6 +980,17 @@ void CountKickSubmit(int what) {
 
 void CountRingPublished(uint64_t bytes) {
   g_ring_published.store(g_ring_published.load(std::memory_order_relaxed) + bytes, std::memory_order_relaxed);
+}
+
+void CountFetchCopy(uint64_t copied, uint64_t cut, uint64_t reused) {
+  const uint64_t add[3] = {copied, cut, reused};
+  for (int i = 0; i < 3; ++i)
+    if (add[i])
+      g_fetch_copy[i].store(g_fetch_copy[i].load(std::memory_order_relaxed) + add[i], std::memory_order_relaxed);
+}
+
+void CountStreamConverted(uint64_t bytes) {
+  g_fetch_copy[3].store(g_fetch_copy[3].load(std::memory_order_relaxed) + bytes, std::memory_order_relaxed);
 }
 
 void CountPushedConstants(uint64_t bytes, int what) {

@@ -353,6 +353,18 @@ std::atomic<ReadHook> g_read_hook{nullptr};
 
 void SetReadHook(ReadHook hook) { g_read_hook.store(hook, std::memory_order_release); }
 
+// shh-nx (2026-10-29): SetInjectedButtons. Each change counts as a new packet, as a real press would.
+namespace {
+std::atomic<uint32_t> g_injected{0};  // the buttons, and the change count above them
+}  // namespace
+
+void SetInjectedButtons(uint16_t buttons) {
+  uint32_t old = g_injected.load(std::memory_order_relaxed);
+  while (uint16_t(old) != buttons &&
+         !g_injected.compare_exchange_weak(old, ((old >> 16) + 1) << 16 | buttons, std::memory_order_acq_rel)) {
+  }
+}
+
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
   if (const ReadHook hook = g_read_hook.load(std::memory_order_acquire))
@@ -410,6 +422,11 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
   if (!any) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (user_index == 0) {
+    const uint32_t injected = g_injected.load(std::memory_order_acquire);
+    merged.gamepad.buttons = uint16_t(uint16_t(merged.gamepad.buttons) | uint16_t(injected));
+    merged.packet_number = uint32_t(merged.packet_number) + (injected >> 16);
   }
   if (out_state) {
     *out_state = merged;
