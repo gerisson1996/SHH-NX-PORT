@@ -9,7 +9,7 @@ evidência antes e depois, e só fica se for medido e repetível. O plano técni
 | Campo | Valor |
 |---|---|
 | Jogo | Silent Hill: Homecoming, Xbox 360 (arquivos do próprio usuário, `assets/game_root`) |
-| Repositório | `C:\dev\shh-nx` (git); último commit `1722db5a`, mudanças da etapa 4 e 5 ainda sem commit |
+| Repositório | `C:\dev\shh-nx` (git); versão de referência: commit `1af54758` |
 | Base | ReXGlue (recompilação estática do PowerPC), SDK em `sdk/` |
 | Engine | Nuts & Bolts (Double Helix): Direct3D do Xbox 360, tiling preditivo em 2 tiles (EDRAM) |
 | Gráficos no PC | Renut (renderizador no nível do Direct3D) sobre plume/D3D12; referência: Xenos emulado |
