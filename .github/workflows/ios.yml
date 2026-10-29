@@ -29,7 +29,7 @@ jobs:
       - name: Build the SDK (host tools and codegen)
         run: |
           cmake -S sdk -B build/sdk-host -DCMAKE_BUILD_TYPE=Release -DREXGLUE_ENABLE_TRACY=OFF
-          cmake --build build/sdk-host -j$(sysctl -n hw.ncpu)
+            cmake --build build/sdk-host --target rexglue -j$(sysctl -n hw.ncpu)
 
       - name: Translate default.xex to C++
         run: |
