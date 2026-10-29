@@ -40,6 +40,7 @@ jobs:
           cmake -S app -B build/ios -G Xcode \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/ios/toolchain.cmake" \
             -DREXSDK_DIR="$PWD/sdk" \
+            -DSHH_RENUT_RENDERER=OFF \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build/ios --config Release --target shh -j$(sysctl -n hw.ncpu)
