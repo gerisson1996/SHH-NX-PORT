@@ -1,0 +1,59 @@
+# Build shh-nx for iOS (unsigned .ipa) on a macOS runner.
+#
+# Keep this file at .github/workflows/ios.yml. It is in ci/ only because the local token cannot push workflow files.
+name: ios
+on:
+  workflow_dispatch:
+  push:
+    tags: ["ios-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decrypt the game image
+        env:
+          XEX_KEY: ${{ secrets.XEX_KEY }}
+        run: |
+          if [ -z "$XEX_KEY" ]; then echo "::error::The XEX_KEY secret is missing"; exit 1; fi
+          mkdir -p assets/game_root
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in ci/default.xex.enc -out assets/game_root/default.xex -pass "pass:$XEX_KEY"
+          ls -l assets/game_root/default.xex
+
+      - name: Build the SDK (host tools and codegen)
+        run: |
+          cmake -S sdk -B build/sdk-host -DCMAKE_BUILD_TYPE=Release -DREXGLUE_ENABLE_TRACY=OFF
+          cmake --build build/sdk-host -j$(sysctl -n hw.ncpu)
+
+      - name: Translate default.xex to C++
+        run: |
+          REXGLUE="$(find build/sdk-host sdk/out -type f -name rexglue -perm -u+x 2>/dev/null | head -n1)"
+          echo "using $REXGLUE"
+          REXGLUE="$REXGLUE" tools/codegen.sh app
+
+      - name: Build the app for iOS
+        run: |
+          cmake -S app -B build/ios -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/ios/toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/ios --config Release -j$(sysctl -n hw.ncpu)
+
+      - name: Package the ipa
+        run: |
+          APP="$(find build/ios -name 'shh.app' -maxdepth 4 | head -n1)"
+          echo "app: $APP"
+          mkdir -p out/ipa/Payload
+          cp -R "$APP" out/ipa/Payload/
+          cd out/ipa && zip -qry SHH-iOS-0.1.0.ipa Payload
+          ls -l SHH-iOS-0.1.0.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHH-ios-ipa
+          path: out/ipa/SHH-iOS-0.1.0.ipa

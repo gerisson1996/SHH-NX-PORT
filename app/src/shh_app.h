@@ -7,8 +7,12 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/input/read_hook.h>
 #include <rex/rex_app.h>
+#include <rex/ui/keybinds.h>
+#include <rex/ui/overlay/quick_settings.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <system_error>
 
@@ -16,6 +20,7 @@
 #include "renut_engine/gpu/banjo_renut_select.h"
 #include "renut_engine/gpu/overlay/app_integration.h"
 #include "renut_engine/shh_compat/fast_boot.h"
+#include "me/sa2_render_mode.h"
 #endif
 
 class ShhApp : public rex::ReXApp {
@@ -56,6 +61,14 @@ class ShhApp : public rex::ReXApp {
     // shh-nx (2026-10-29): no asset pack. Silent Hill's data is 4848 MB, over FAT32's 4 GB file limit, so the SDK's
     // first-boot pack build reads it all for 1 min 45 s on every boot and then gives up ("asset pack not built").
     SetIfNotRequested("asset_pack_build", "false");
+    // shh-nx (2026-10-29, docs/perfil-shh.md SHH-05): the handheld's OLED crushes the game's dark tones; 0.6 at scan-out
+    // is what the user found right on the console (1.0, the game's own picture, stays the PC's).
+    SetIfNotRequested("shh_output_gamma", "0.6");
+    // shh-nx (2026-10-29, docs/perfil-shh.md SHH-07): the scene's 2x MSAA cost the GPU its resolves and twice the
+    // depth and colour traffic; single-sample on the Switch (the PC keeps the game's 2x).
+    SetIfNotRequested("shh_renut_single_sample", "true");
+    // shh-nx (2026-10-29, docs/perfil-shh.md SHH-08): the shadow maps at 2/3 (a menu choice later).
+    SetIfNotRequested("shh_shadow_quality", "Medium");
 #endif
   }
 
@@ -78,12 +91,35 @@ class ShhApp : public rex::ReXApp {
         return;
       }
     }
+#if defined(__APPLE__)
+    // iOS: the game files live in the app's Documents folder (Files app or Finder), in the same game_root layout as
+    // the Switch's sdmc:/switch/shh-nx/game_root
+    if (const char* home = std::getenv("HOME")) {
+      const std::filesystem::path documents = std::filesystem::path(home) / "Documents";
+      for (const auto& candidate : {documents / "game_root", documents}) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate / "default.xex", ec)) {
+          paths.game_data_root = candidate;
+          REXLOG_INFO("Game files found at {}", paths.game_data_root.string());
+          return;
+        }
+      }
+    }
+#endif
   }
 
   // shh-nx (2026-10-28): Renut's renderer has to be started where SA2 starts it: once the paths are final (the window
   // and its drawer exist by then) and on every window resize. Without this the renderer's GPU device is never created,
   // no command list ever opens, and its resolve and Swap have nowhere to draw (docs/plano-renut.md).
 #if SHH_RENUT_RENDERER
+  // shh-nx (2026-10-29): the SDK's menus (and the game's, OnCreateDialogs) are drawn by Renut's present, as in sa2-nx;
+  // without this drawer the SDK sets up no menus at all.
+  std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
+    if (banjo::renut_gpu::Active())
+      return renut::gpu::CreateOverlayDrawer();
+    return rex::ReXApp::OnCreateImmediateDrawer();
+  }
+
   void OnWindowPixelSizeChanged(uint32_t pixel_width, uint32_t pixel_height) override {
     rex::ReXApp::OnWindowPixelSizeChanged(pixel_width, pixel_height);
     if (banjo::renut_gpu::Active())
@@ -106,7 +142,68 @@ class ShhApp : public rex::ReXApp {
   }
 #endif
 
+  // shh-nx (2026-10-29, docs/perfil-shh.md SHH-10): the game's menu (F5; L+R+Plus on the Switch): resolution, shadows,
+  // brightness and MSAA, applied at once and saved to the configuration file.
+  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    rex::ReXApp::OnCreateDialogs(drawer);
+    rex::ui::RegisterBind("bind_shh_menu", "F5", "Silent Hill menu", [this] { ToggleMenu(); });
+    // LB+RB+Start (L+R+Plus on the Switch), read where every controller's input passes (input_system.cpp): from the
+    // thread that reads input, so the menu opens on the UI thread.
+    menu_app_ = this;
+    rex::input::SetMenuComboCallback([] {
+      if (ShhApp* app = menu_app_)
+        app->app_context().CallInUIThread([app] { app->ToggleMenu(); });
+    });
+    // A measurement aid: the menu open from the start (PC screenshots, shot_run.ps1).
+    if (rex::cvar::GetFlagByName("shh_diag_open_menu") == "true")
+      ToggleMenu();
+  }
+
  private:
+  void ToggleMenu() {
+    REXLOG_INFO("[menu] toggled");
+    rex::ui::ToggleQuickSettings(imgui_drawer(), "Silent Hill: Homecoming", MenuSettings(), config_path());
+  }
+  static inline ShhApp* menu_app_ = nullptr;
+
+  static std::vector<rex::ui::QuickSetting> MenuSettings() {
+    std::vector<rex::ui::QuickSetting> settings;
+#if SHH_RENUT_RENDERER
+    rex::ui::QuickSetting resolution;
+    resolution.cvar = "shh_resolution";
+    resolution.label = "Resolucao";
+    resolution.choices = {{"480p", "480p"}, {"600p", "600p"}, {"720p", "720p"}, {"1080p", "1080p"}};
+#if REX_PLATFORM_SWITCH
+    // 1080p only docked, where the GPU runs faster; in handheld mode the renderer draws it at 720p.
+    resolution.available = [](const std::string& value) { return value != "1080p" || sa2::render::Docked(); };
+    resolution.note = "1080p so no modo dock";
+#endif
+    settings.push_back(std::move(resolution));
+
+    rex::ui::QuickSetting shadows;
+    shadows.cvar = "shh_shadow_quality";
+    shadows.label = "Sombras";
+    shadows.choices = {{"Medium", "Media"}, {"High", "Alta"}};
+    settings.push_back(std::move(shadows));
+
+    rex::ui::QuickSetting gamma;
+    gamma.cvar = "shh_output_gamma";
+    gamma.label = "Gama da tela (menor = mais claro)";
+    gamma.min = 0.3f;
+    gamma.max = 1.2f;
+    gamma.note = "0.6 no Switch, 1.0 e a imagem original";
+    settings.push_back(std::move(gamma));
+
+    rex::ui::QuickSetting msaa;
+    msaa.cvar = "shh_renut_single_sample";
+    msaa.label = "Anti-aliasing (MSAA 2x)";
+    msaa.choices = {{"true", "Desligado"}, {"false", "Ligado"}};
+    msaa.note = "vale ao reiniciar o jogo";
+    settings.push_back(std::move(msaa));
+#endif
+    return settings;
+  }
+
   static void SetIfNotRequested(const char* name, const char* value) {
     if (rex::cvar::GetFlagInfo(name) == nullptr) {
       REXLOG_DEBUG("Setting '{}' not registered yet; left alone.", name);

@@ -29,6 +29,17 @@ set(SHH_SOURCES
 
 if(WIN32)
     add_executable(shh WIN32 ${SHH_SOURCES})
+elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # the app bundle's Info.plist is ios/Info.plist; the .ipa is packed unsigned
+    add_executable(shh MACOSX_BUNDLE ${SHH_SOURCES})
+    set_target_properties(shh PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/../ios/Info.plist"
+        MACOSX_BUNDLE_BUNDLE_NAME "Silent Hill"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.gerisson.shh"
+        XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
+        XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED "NO")
+    target_link_libraries(shh PRIVATE "-framework UIKit" "-framework Foundation" "-framework Metal"
+        "-framework QuartzCore" "-framework CoreGraphics" "-framework AudioToolbox" "-framework CoreAudio")
 else()
     add_executable(shh ${SHH_SOURCES})
 endif()
