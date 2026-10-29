@@ -37,13 +37,14 @@ jobs:
           echo "using $REXGLUE"
           REXGLUE="$REXGLUE" tools/codegen.sh app || { tail -n 80 app/codegen.log; exit 1; }
 
-      - name: Build the app for iOS
-        run: |
+          - name: Build the app for iOS
+          run: |
           cmake -S app -B build/ios -G Xcode \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/ios/toolchain.cmake" \
             -DREXSDK_DIR="$PWD/sdk" \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/ios --config Release -j$(sysctl -n hw.ncpu)
+          cmake --build build/ios --config Release --target shh -j$(sysctl -n hw.ncpu)
 
       - name: Package the ipa
         run: |
