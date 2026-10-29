@@ -150,6 +150,26 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      renderer does not parse. So the draws have no vertices: 650 draws, nothing on screen. Next: give the draws their
      fetch constants from the bound streams (source address, stride and the vertex buffer's header, as D3D's
      SetStreamSource does), or hook Silent Hill's SetStreamSource once its address is known.
+     **Correction (2026-10-29, later):** the constants were not empty. `0x6F0` is the slot of stream 17: the array runs
+     in reverse (stream s at `0x6F0 + 8 * (17 - s)`, so stream 0 at `0x778`, which is what Renut's `StreamFetchIndex`
+     reads). Silent Hill's SetStreamSource is `82907520` (device, stream, vertex buffer, offset, stride). It writes the
+     constant there at once, with the offset added to the address and taken from the size, and it tags the buffer's
+     fence with the current one. The rebuild (FillVertexFetchConstants) passed offset 0, so every batch past the start
+     of a shared vertex buffer drew the first batch's vertices: the copyright text showed a line and a half with holes,
+     and the logo and "Press START" never showed. The rebuild is now off (`shh_renut_rebuild_vertex_fetch`, a
+     diagnostic). What made the title draw was the removal of the 82908128 hook in the same commit.
+   - **The title screen is complete (2026-10-29).** With the game's own vertex fetch constants: the copyright screen
+     is identical to the emulated GPU's, and the title shows the logo and "Press START to Begin" over each of its
+     camera shots (`out/serie_renut_folha.png`: 20, 24, 28 and 36 s; the black frame seen at 32 s was a cut between
+     shots, the log loading `m01_nightmare_76.pak`). About 29.7 fps, no draw dropped for a missing shader.
+     Two SA2 literals were also fixed in `render/draw.cpp`: the chain-reuse checks of the render targets (SA2's
+     12816-12835) and the texture slots (12920-13023) now use `d3d.h`'s offsets. A draw whose shader is missing from
+     the cache is now logged once per shader ("Draws dropped").
+     `out/shot_run.ps1` captures the window's own content (PrintWindow) instead of photographing the screen, and takes
+     a series with `-Also "20,24,28"`.
+     Left: the one pipeline that fails to create (VS 8763F4DD2B71AA32, PS 4D524BFF32A7299D and a depth-only variant),
+     `sa2_setter_marks.h`'s `kMarkSnapshotEnd = 13088` (SA2's snapshot size; Silent Hill's is 12712, and the marks are off),
+     and gameplay past the title.
 4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the
    Switch build without NVK. Gate: a picture on the console.
    **The Switch today (2026-10-28).** The console build is still the stage 1 one (the emulated Xenos GPU); it is what

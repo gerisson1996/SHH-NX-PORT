@@ -66,6 +66,12 @@ REXCVAR_DEFINE_INT32(banjo_renut_diag_draw_log_s, 0, "Banjo/Renut",
                      "([drawlog]: shaders, counts, target, state; 0 = off)");
 REXCVAR_DEFINE_STRING(banjo_renut_diag_blend_skip_exclude, "", "Banjo/Renut",
                       "Diagnostic: pixel shader hashes (hex, comma separated) banjo_gpu_blend_skip leaves alone");
+// shh-nx (2026-10-29, a diagnostic for the 2D layer that never appears): the draws of this pixel shader are made opaque
+// (ONE/ZERO/ADD) with every channel written and no depth test.
+REXCVAR_DEFINE_BOOL(shh_renut_diag_2d_opaque, false, "Silent Hill/Renut",
+                    "Diagnostic: draws of the 2D quad shader forced opaque, all channels written, no depth test");
+REXCVAR_DEFINE_BOOL(shh_renut_diag_2d_constants, false, "Silent Hill/Renut",
+                    "Diagnostic: log the 2D quad shader's first pixel shader float constants (registers 0-15)");
 
 // sa2-nx (2026-10-20): see DrawStateLocked.
 REXCVAR_DEFINE_BOOL(sa2_renut_chain_reuse, true, "SA2/Renderer",
@@ -2627,8 +2633,9 @@ bool StreamDumpLog(const ShaderRecord &vs, u32 stream, const StreamSource &src, 
     return false;
   std::string guest_words, host_words;
   if (guest && count) {
+    const u32 shown = std::min<u32>(count, 4);  // shh-nx: 4 (a sprite's whole quad)
     const u32 n = std::min<u32>(src.stride / 4, 16);
-    for (u32 v = 0; v < std::min<u32>(count, 2); ++v) {
+    for (u32 v = 0; v < shown; ++v) {
       for (u32 i = 0; i < n; ++i) {
         u32 w;
         std::memcpy(&w, guest + size_t(v) * src.stride + i * 4, 4);
@@ -2636,9 +2643,9 @@ bool StreamDumpLog(const ShaderRecord &vs, u32 stream, const StreamSource &src, 
       }
       guest_words += "| ";
     }
-    std::vector<u8> host(size_t(hs.host_stride) * 2 + 16);
-    ConvertVertices(hs, guest, src.stride, std::min<u32>(count, 2), src.endian, host.data());
-    for (u32 i = 0; i < std::min<u32>(hs.host_stride * 2 / 4, 32); ++i) {
+    std::vector<u8> host(size_t(hs.host_stride) * 4 + 16);
+    ConvertVertices(hs, guest, src.stride, shown, src.endian, host.data());
+    for (u32 i = 0; i < std::min<u32>(hs.host_stride * 4 / 4, 64); ++i) {
       u32 w;
       std::memcpy(&w, host.data() + i * 4, 4);
       host_words += fmt::format("{:08X} ", w);
@@ -4151,6 +4158,24 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   // (WaitForExportsLocked may submit the list: before anything is recorded).
   const FloatConstants vs_constants = DrawFloatConstants(device_state, replay, false);
   const FloatConstants ps_constants = DrawFloatConstants(device_state, replay, true);
+  // shh-nx (2026-10-29, shh_renut_diag_2d_constants): the 2D quad shader's first float constants, which its colour and
+  // alpha are made from (mFinalTint, mFinalAdd, mDiffuseMultiplier, the fog's), for a 2D layer that draws nothing.
+  {
+    static const bool on = REXCVAR_GET(shh_renut_diag_2d_constants);
+    if (on && ps && ps->hash == 0xFC4645A98C571A93ull && DiagCountsOn()) {
+      static uint32_t logged = 0;
+      if (logged++ < 8) {
+        std::string line = fmt::format("[2dconst] vs {:016X} ps {:016X} registers 0-15:", vs->hash, ps->hash);
+        for (u32 r = 0; r < 16; ++r) {
+          const u8 *p = ps_constants.Register(r);
+          u32 w[4];
+          std::memcpy(w, p, sizeof(w));
+          line += fmt::format(" {}:{:08X}{:08X}{:08X}{:08X}", r, w[0], w[1], w[2], w[3]);
+        }
+        RGPU_INFO("{}", line);
+      }
+    }
+  }
   // banjo-nx (2026-10-19, render-thread proposal 4): the draw's memexport streams, gathered once here (they were
   // gathered for each pass of the loop below and again for the draw: the same constants each time).
   MemExportStream exports[kMaxMemExportStreams];
@@ -4182,8 +4207,18 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
 
   plume::RenderShader *host_vs = GetHostShader(vs);
   plume::RenderShader *host_ps = ps ? GetHostShader(ps) : nullptr;
-  if (!host_vs || (ps && !host_ps))
+  if (!host_vs || (ps && !host_ps)) {
+    // shh-nx (2026-10-29): name each shader whose draws are dropped, once: 31 of Silent Hill's containers do not
+    // translate (DXC's vk::location restriction), and a missing layer of the picture is looked for among them.
+    static std::mutex dropped_mutex;
+    static std::unordered_set<uint64_t> dropped;
+    const uint64_t missing = !host_vs ? vs->hash : ps->hash;
+    std::lock_guard lock(dropped_mutex);
+    if (dropped.insert(missing).second)
+      RGPU_WARN("Draws dropped: {} shader {:016X} has no host shader (VS {:016X}, PS {:016X})",
+                !host_vs ? "vertex" : "pixel", missing, vs->hash, ps ? ps->hash : 0);
     return false;  // missing from the shader cache (captured for the next build)
+  }
 
   // sa2-nx (2026-10-20, sa2_renut_chain_reuse): the previous chain draw's targets when the device's target words (bytes
   // 12816-12835) did not change, no target was built, retired or rebound since (the surface epoch), and the targets'
@@ -4193,7 +4228,10 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   const ChainHint &chain = g_chain_hint;
   Targets targets;
   bool targets_reused = false;
-  if (targets_reuse_on && chain.seq && chain.seq == g_targets_reuse.seq + 1 && !ChainChanged(chain, 12816, 12835) &&
+  // shh-nx (2026-10-29): the target words from d3d.h (the four targets and the depth surface), not SA2's 12816-12835,
+  // which on Silent Hill's N&B layout are other fields: a change of render target went unseen.
+  if (targets_reuse_on && chain.seq && chain.seq == g_targets_reuse.seq + 1 &&
+      !ChainChanged(chain, d3d::kDeviceOffsetRenderTargets, d3d::kDeviceOffsetDepthStencil + 3) &&
       g_targets_reuse.epoch == SurfaceEpochLocked()) {
     targets_reused = true;
     for (u32 i = 0; targets_reused && i <= d3d::kMaxRenderTargets; ++i) {
@@ -4317,7 +4355,10 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   };
   static TexturesReuse treuse;
   bool textures_reused = targets_reuse_on && chain.seq && chain.seq == treuse.seq + 1 && treuse.mask == texture_mask &&
-                         !ChainChanged(chain, 1152, 1775) && !ChainChanged(chain, 12920, 13023) &&
+                         // shh-nx (2026-10-29): the texture slots from d3d.h, not SA2's 12920-13023.
+                         !ChainChanged(chain, 1152, 1775) &&
+                         !ChainChanged(chain, d3d::kDeviceOffsetTextures,
+                                       d3d::kDeviceOffsetTextures + d3d::kTextureFetchSlots * 4 - 1) &&
                          treuse.frame == TextureFrameLocked() && treuse.epoch == g_texture_epoch &&
                          treuse.depth_epoch == g_depth_epoch && treuse.depth == targets.depth;
   for (u32 r = 0; textures_reused && r < d3d::kTextureFetchSlots; ++r) {
@@ -4683,6 +4724,15 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     reuse.depth = targets.depth;
     if (!reused)
       reuse.key = key;
+  }
+  // shh-nx (2026-10-29, shh_renut_diag_2d_opaque): the 2D layer's draws forced opaque with every channel written and
+  // no depth test, to tell a draw that never rasterizes from one the blend hides.
+  static const bool diag_2d_opaque = REXCVAR_GET(shh_renut_diag_2d_opaque);
+  if (diag_2d_opaque && ps && ps->hash == 0xFC4645A98C571A93ull) {
+    for (u32 i = 0; i < d3d::kMaxRenderTargets; ++i)
+      key.blend_control[i] = 0x00010001;
+    key.color_mask = 0xF;
+    key.depth_control &= ~1u;
   }
   if (DiagCountsOn()) {  // sa2-nx (2026-10-20, sa2_renut_lean_diagnostics)
     // banjo-nx (package 28, a census): draws that write no colour, nothing at all, or part of a target's channels.
