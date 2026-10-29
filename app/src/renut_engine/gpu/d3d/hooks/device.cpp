@@ -60,9 +60,10 @@
 
 using namespace renut::gpu;
 
-// shh-nx (2026-10-28): the game's frame count, the gamma ramp and the console's core layout that SA2's hooks kept here
-// are not SHH's yet: SHH's frame counter lives in its own Direct3D (documented in docs/d3d-censo.md with the rest of
-// the Swap path), its gamma ramp offset is unidentified, and the Switch thread layout belongs to stage 5.
+// shh-nx (2026-10-28): the game's frame count and the console's core layout that SA2's hooks kept here are not SHH's
+// yet: SHH's frame counter lives in its own Direct3D (documented in docs/d3d-censo.md with the rest of the Swap path),
+// and the Switch thread layout belongs to stage 5. The gamma ramp is back (2026-10-29): see D3DDevice_Swap_hook.
+REXCVAR_DECLARE(bool, sa2_renut_gamma_ramp);  // backend/present.cpp
 
 // Kernel exports the device code uses.
 REX_IMPORT(__imp__rex_GetCurrentThreadId, GuestGetCurrentThreadId, u32());
@@ -859,9 +860,18 @@ void D3DDevice_RunCommandBuffer_hook(u32 device_va, u32 command_buffer,
 // The frame goes to the render thread, which presents it; the game thread
 // goes on with the next one, waiting only when it is more than
 // render_thread::kMaxFramesAhead ahead.
+//
+// shh-nx (2026-10-29): Silent Hill's display gamma ramp is where N&B keeps it, +0x3A9C (15004): its SetGammaRamp
+// (82907758) compares and copies 1536 bytes there and sets bit 0x02 of +16708, and its Swap reads them back
+// (`addi r27,r31,15004`) for the display controller.
+constexpr u32 kShhDeviceOffsetGammaRamp = 0x3A9C;
+// Which of the two setters wrote those 1536 bytes last: SetGammaRamp (82907758, 256 values a channel) or SetPWLGamma
+// (82907820, 128 base and delta pairs a channel). Both mark the same device bits, so the hooks below tell them apart.
+std::atomic<bool> g_shh_gamma_pwl{false};
+
 void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
-  // shh-nx (2026-10-28): SA2's pacing off the console's vertical blank, its lockstep captures, its gamma ramp offset
-  // and its Switch core layout are not SHH's (yet). What the renderer needs stays: the frame's fence, the present of
+  // shh-nx (2026-10-28): SA2's pacing off the console's vertical blank, its lockstep captures and its Switch core
+  // layout are not SHH's (yet). What the renderer needs stays: the frame's fence, the present of
   // the game's front buffer, and the frame statistics.
   renut::frame_stats::OnGameFrame();
   {
@@ -887,6 +897,11 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
     word(d3d::kDeviceOffsetSwapFenceTag) = fence_tag;
     word(d3d::kDeviceOffsetPresentFenceTag) = fence_tag;
     device[d3d::kDeviceOffsetSwapFlags] &= u8(~d3d::kSwapFlagPending);
+    // shh-nx (2026-10-29): the game's display gamma ramp to the scan-out (backend/present.cpp, sa2_renut_gamma_ramp),
+    // as the original Swap gives it to the display controller. Without it the dark tones came out 12-15 levels
+    // lighter than the emulated GPU's, which applies the same table (DC_LUT): the brightness screen's bars showed.
+    if (REXCVAR_GET(sa2_renut_gamma_ramp))
+      Video::SetGammaRamp(device + kShhDeviceOffsetGammaRamp, g_shh_gamma_pwl.load(std::memory_order_relaxed));
     // banjo-nx (package 27c): the frame's last vertex and texture fills are read here, before the Swap's fence
     // completes. They were read at the present, after it: the game, told the frame was done, could rewrite a dynamic
     // buffer for the next frame first, and the frame's last draws (the composite, the HUD) took the new bytes.
@@ -1378,3 +1393,15 @@ BANJO_RENUT_HOOK(sub_82911D68, D3DDevice_Swap_hook);                         // 
 BANJO_RENUT_HOOK(sub_8290F4A0, BlockOnFence_hook);                           // CDevice::BlockOnFence
 BANJO_RENUT_HOOK_SHARED(sub_82910448, CBlocker_Check_hook);                  // CBlocker::Check (?)
 BANJO_RENUT_HOOK(sub_8290FCF0, IsFencePending_hook);                         // D3DDevice_IsFencePending
+
+// void D3DDevice_SetGammaRamp(D3DDevice*, DWORD Flags, const D3DGAMMARAMP*) [sub_82907758] and
+// void D3DDevice_SetPWLGamma(D3DDevice*, DWORD Flags, const D3DPWLGAMMA*) [sub_82907820]: the game's own code, which
+// writes the device's table; the hooks only note which of the two formats it now holds (D3DDevice_Swap_hook).
+BANJO_RENUT_HOOK_RAW(sub_82907758) {
+  __imp__sub_82907758(ctx, base);
+  g_shh_gamma_pwl.store(false, std::memory_order_relaxed);
+}
+BANJO_RENUT_HOOK_RAW(sub_82907820) {
+  __imp__sub_82907820(ctx, base);
+  g_shh_gamma_pwl.store(true, std::memory_order_relaxed);
+}

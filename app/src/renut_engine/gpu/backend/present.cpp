@@ -130,9 +130,11 @@ struct GammaRamp {
   // The game thread's last copy (SetGammaRamp's compare, that thread only).
   uint8_t seen[1536] = {};
   bool seen_any = false;
+  bool seen_pwl = false;
   // Handed to the render thread.
   std::mutex mutex;
   uint8_t words[1536] = {};
+  bool pwl = false;  // shh-nx: words is the piecewise-linear table (Video::SetGammaRamp)
   std::atomic<uint64_t> version{0};
   // Render thread, under State().mutex.
   uint64_t uploaded = 0;  // the version the texels below hold
@@ -176,16 +178,32 @@ void UpdateGammaRampLocked(VideoState &s) {
   const bool changed = version != g.uploaded;
   if (changed) {
     uint8_t words[1536];
+    bool pwl;
     {
       std::lock_guard lock(g.mutex);
       std::memcpy(words, g.words, sizeof(words));
+      pwl = g.pwl;
     }
+    const auto word = [&words](uint32_t index) {
+      const uint8_t *w = words + index * 2;
+      return ((uint32_t(w[0]) << 8 | w[1]) >> 6) & 0x3FF;
+    };
     // The native renderer's table (sa2_native_targets.cpp RecomputeRamp): the 10-bit value / 1023, alpha 1.
     for (uint32_t i = 0; i < 256; ++i) {
       for (uint32_t c = 0; c < 3; ++c) {
-        const uint8_t *w = words + (c * 256 + i) * 2;
-        const uint32_t value = ((uint32_t(w[0]) << 8 | w[1]) >> 6) & 0x3FF;
-        g.texels[i * 4 + c] = float(value) / 1023.0f;
+        float value;
+        if (pwl) {
+          // shh-nx (2026-10-29): the piecewise-linear table (D3DDevice_SetPWLGamma): the 8-bit value's 10-bit input
+          // falls in segment input / 8, whose output is base + delta * (input % 8) / 8.
+          const uint32_t input = (i * 1023 + 127) / 255;
+          const uint32_t segment = std::min<uint32_t>(input >> 3, 127);
+          const float base_value = float(word(c * 256 + segment * 2));
+          const float delta = float(word(c * 256 + segment * 2 + 1));
+          value = std::min(base_value + delta * float(input - segment * 8) / 8.0f, 1023.0f);
+        } else {
+          value = float(word(c * 256 + i));
+        }
+        g.texels[i * 4 + c] = value / 1023.0f;
       }
       g.texels[i * 4 + 3] = 1.0f;
     }
@@ -531,9 +549,10 @@ PresentFence g_present_fences[kPresentFences];
 std::atomic<uint64_t> g_present_count{0};
 } // namespace
 
-void Video::SetGammaRamp(const uint8_t *big_endian_words) {
+void Video::SetGammaRamp(const uint8_t *big_endian_words, bool pwl) {
   GammaRamp &g = g_gamma;
-  if (!big_endian_words || (g.seen_any && std::memcmp(g.seen, big_endian_words, sizeof(g.seen)) == 0))
+  if (!big_endian_words ||
+      (g.seen_any && g.seen_pwl == pwl && std::memcmp(g.seen, big_endian_words, sizeof(g.seen)) == 0))
     return;
   // A device that has no ramp yet (all zero) would black the picture out: the emulated display starts linear.
   bool any = false;
@@ -543,9 +562,11 @@ void Video::SetGammaRamp(const uint8_t *big_endian_words) {
     return;
   std::memcpy(g.seen, big_endian_words, sizeof(g.seen));
   g.seen_any = true;
+  g.seen_pwl = pwl;
   {
     std::lock_guard lock(g.mutex);
     std::memcpy(g.words, big_endian_words, sizeof(g.words));
+    g.pwl = pwl;
   }
   g.version.fetch_add(1, std::memory_order_acq_rel);
 }

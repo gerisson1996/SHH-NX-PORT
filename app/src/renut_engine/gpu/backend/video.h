@@ -292,7 +292,10 @@ public:
   // sa2-nx (2026-10-20, sa2_renut_gamma_ramp): the game's display gamma ramp, as its Direct3D keeps it in the device
   // (768 big-endian words: red, green, blue, 256 each, the 10-bit value << 6), for the scan-out to apply as the Xbox
   // 360's display controller does. Any thread; a copy that has not changed costs a compare.
-  static void SetGammaRamp(const uint8_t *big_endian_words);
+  // shh-nx (2026-10-29): pwl = the same 1536 bytes as the display controller's piecewise-linear table, which
+  // D3DDevice_SetPWLGamma writes there instead: per channel 128 segments of 8 input steps (of 1024), each a base and a
+  // delta (the 10-bit values << 6). Silent Hill sets its gamma this way.
+  static void SetGammaRamp(const uint8_t *big_endian_words, bool pwl = false);
 
   // The guest D3DDevice (guest VA) created by the Direct3D_CreateDevice hook.
   static void SetGuestDevice(uint32_t device_va);

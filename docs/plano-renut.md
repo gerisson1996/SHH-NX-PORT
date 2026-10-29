@@ -167,7 +167,26 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      the cache is now logged once per shader ("Draws dropped").
      `out/shot_run.ps1` captures the window's own content (PrintWindow) instead of photographing the screen, and takes
      a series with `-Also "20,24,28"`.
-     Left: the one pipeline that fails to create (VS 8763F4DD2B71AA32, PS 4D524BFF32A7299D and a depth-only variant),
+   - **Gameplay on the PC (2026-10-29).** `--input_script=25:START,29:A,33:A,37:A,41:A,45:A` (the SDK's scripted pad:
+     no keyboard or focus needed) goes through the menu, the brightness screen and the opening, the hospital
+     nightmare, and both renderers reach the same scenes at the same seconds (`out/jogo_renut_folha.png`,
+     `out/jogo_xenos_folha.png`). Fixed on the way:
+     - **The display gamma ramp.** The Swap hook did not hand it to the scan-out: every dark tone came out 12-15 levels
+       lighter. It is at N&B's +0x3A9C (15004): SetGammaRamp `82907758` and SetPWLGamma `82907820` both write 1536
+       bytes there and set bit 0x02 of +16708. **Silent Hill uses the PWL form**: per channel 128 segments, each a base
+       and a delta (`82916098`), not 256 values. Read as 256 values it gave mismatched channels. Hooks on the two
+       setters note which form the table holds, and `Video::SetGammaRamp(words, pwl)` expands the segments. The
+       brightness screen now matches the emulated GPU pixel for pixel (8,9,9 / 4,4,4 / 3,2,2).
+     - **Vertex inputs Normal 1, Tangent 1 and Binormal 1** have locations 23-25 in `RENUT_VERTEX_INPUT_LOCATIONS`
+       (XenosRecomp's `shader_common.h`). 31 vertex shaders read them, and they are exactly the 31 DXC refused. The one
+       pipeline that failed (VS 8763F4DD2B71AA32) had NORMAL1 without a location. No pipeline fails now.
+     - Note: `dxc-bin`'s DXC (the Windows Kits one) has no SPIR-V code generation, so every container reports
+       `dxc-spirv-compile-failed`. The PC's D3D12 path only needs DXIL. The SPIR-V needed for deko3d (stage 4) needs a
+       DXC built with SPIR-V, such as the Vulkan SDK's.
+     Still different: **the dynamic shadows are missing** in the opening (the hanging lamp darkens the upper and
+     middle wall on the emulated GPU; under Renut the wall is lit evenly). The likely place is the shadow map path:
+     depth-only draws, their resolve to a texture, and the comparison fetch.
+     Left: the shadows above,
      `sa2_setter_marks.h`'s `kMarkSnapshotEnd = 13088` (SA2's snapshot size; Silent Hill's is 12712, and the marks are off),
      and gameplay past the title.
 4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the

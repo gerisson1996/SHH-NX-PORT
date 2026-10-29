@@ -28,6 +28,9 @@
 // SPIR-V vertex input locations for reNut, shared with its host input-layout
 // builder. Covers every vertex element N&B's shaders declare. Like reblue's
 // above, only a define: the recompiler reads it under RENUT_RECOMP.
+// shh-nx (2026-10-29): Normal 1, Tangent 1 and Binormal 1 at 23-25. Silent Hill's vertex declarations use them (31
+// of its 205 vertex shaders: 26 read NORMAL1, 6 TANGENT1, 6 BINORMAL1), and an input with no location made DXC refuse
+// the shader ("partial explicit stage input location assignment") and D3D12 the pipeline of the one that got through.
 #define RENUT_VERTEX_INPUT_LOCATIONS(X) \
     X(Position,  0,  0) \
     X(Position,  1,  1) \
@@ -51,7 +54,10 @@
     X(TexCoord,  7, 19) \
     X(TexCoord,  8, 20) \
     X(TexCoord,  9, 21) \
-    X(TexCoord, 10, 22)
+    X(TexCoord, 10, 22) \
+    X(Normal,    1, 23) \
+    X(Tangent,   1, 24) \
+    X(Binormal,  1, 25)
 
 // SPEC_CONSTANTS_ONLY keeps the HLSL below out of host C++ TUs, which IntelliSense would otherwise parse.
 #if (!defined(__cplusplus) || defined(__INTELLISENSE__)) && !defined(SHADER_COMMON_SPEC_CONSTANTS_ONLY)
