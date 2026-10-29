@@ -1,6 +1,4 @@
 # Build shh-nx for iOS (unsigned .ipa) on a macOS runner.
-#
-# Keep this file at .github/workflows/ios.yml. It is in ci/ only because the local token cannot push workflow files.
 name: ios
 on:
   workflow_dispatch:
@@ -29,7 +27,7 @@ jobs:
       - name: Build the SDK (host tools and codegen)
         run: |
           cmake -S sdk -B build/sdk-host -DCMAKE_BUILD_TYPE=Release -DREXGLUE_ENABLE_TRACY=OFF
-            cmake --build build/sdk-host --target rexglue -j$(sysctl -n hw.ncpu)
+          cmake --build build/sdk-host --target rexglue -j$(sysctl -n hw.ncpu)
 
       - name: Translate default.xex to C++
         run: |
@@ -37,8 +35,8 @@ jobs:
           echo "using $REXGLUE"
           REXGLUE="$REXGLUE" tools/codegen.sh app || { tail -n 80 app/codegen.log; exit 1; }
 
-          - name: Build the app for iOS
-          run: |
+      - name: Build the app for iOS
+        run: |
           cmake -S app -B build/ios -G Xcode \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/ios/toolchain.cmake" \
             -DREXSDK_DIR="$PWD/sdk" \
@@ -48,8 +46,9 @@ jobs:
 
       - name: Package the ipa
         run: |
-          APP="$(find build/ios -name 'shh.app' -maxdepth 4 | head -n1)"
+          APP="$(find build/ios -name 'shh.app' -maxdepth 5 | head -n1)"
           echo "app: $APP"
+          if [ -z "$APP" ]; then echo "::error::shh.app not found"; find build/ios -name '*.app' -maxdepth 5; exit 1; fi
           mkdir -p out/ipa/Payload
           cp -R "$APP" out/ipa/Payload/
           cd out/ipa && zip -qry SHH-iOS-0.1.0.ipa Payload
