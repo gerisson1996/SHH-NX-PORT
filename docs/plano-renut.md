@@ -118,7 +118,7 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      XenosRecomp (built as an ExternalProject, with the DXC 1.8 trio and `dxcompiler.lib` in `dxc-bin/`) translates
      them at build time. Three things were needed: `tools/renut_early_alpha.py` and `tools/early_alpha.py` copied from
      sa2-nx, the early-alpha pass turned OFF (`BANJO_RENUT_EARLY_ALPHA`: DXC 1.8 and 1.9 both refuse the HLSL it
-     writes â€” "partial explicit stage input location assignment via vk::location(X) unsupported"), and that the PC
+     writes Ã¢â‚¬â€ "partial explicit stage input location assignment via vk::location(X) unsupported"), and that the PC
      build name a native Windows Python (`C:\msys64\mingw64\bin\python.exe`): devkitPro's MSYS2 python on PATH cannot
      read `C:/dev/...` paths. 31 of the 893 hit the same DXC restriction in the plain translation, so
      `XenosRecomp/main.cpp` now writes the cache and keeps listing them (862 in the cache; a draw whose shader is
@@ -127,17 +127,25 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      `829087F8`, SetIndices `82907640` and SetRenderTarget/SetDepthStencilSurface `82908128` (an index of 4 or more is
      taken as the depth surface, the census lists both at this address). Run of 07:37: **650 draws in 10 s**, the GPU
      busy 0.41 ms a frame over 302 frames, and the window no longer black (12,12,12 at the centre, 7,7,7 near the
-     bottom: `out/renut_draws.png`) â€” the title's dark intro. One pipeline creation fails and is logged by key (VS
+     bottom: `out/renut_draws.png`) Ã¢â‚¬â€ the title's dark intro. One pipeline creation fails and is logged by key (VS
      8763F4DD2B71AA32, PS 4D524BFF32A7299D, 1 target).
    - **Compared with the emulated GPU (2026-10-29, 32 s).** `shh_renderer=xenos` shows the title screen (logo, clock,
      "Press START to Begin": `out/cmp_xenos_32s.png`); `renut` shows black with Renut's own overlay over it
      (`out/cmp_renut_32s.png`), and with `shh_renut_clear_test=true` it is black too, so the 650 draws paint over the
      clear rather than the Swap losing it.
-   - **Where the geometry is lost (2026-10-29).** At the first draws: texture slot 0 = `0xe432c7e0` (N&B's `+12544` is
+   - **The title renders through Renut (2026-10-29).** Two fixes after the comparison: the vertex fetch constants are
+     rebuilt from the streams before each draw's snapshot (`shh_draw.cpp`, FillVertexFetchConstants — Silent Hill builds
+     them in the ring, not in the device), and — the decisive one — **the 82908128 hook is gone**: the calls it receives
+     pass the surface in r4 and 0 in r5, so hooking it as `(device, index, surface)` wrote a surface address into the
+     render target slot, every draw went to a broken 1x1 target, and the window stayed black. With the game's own
+     writes to the device left alone, `out/renut_title.png` is the clock tower and street of the title screen, 296
+     frames in 10 s at 29.5 fps, 650 draws. Still missing: the title's 2D layer (logo, "Press START"), the one pipeline
+     that fails to create, and the 31 shaders DXC rejects.
+   - **Where the geometry was lost (2026-10-29).** At the first draws: texture slot 0 = `0xe432c7e0` (N&B's `+12544` is
      Silent Hill's offset) and the device's fetch constant for it (`0x480`) holds a real, D3D-built fetch
      (`81004802 079f2052 ...`, the texture header's own form with the physical address), so textures are not the
      problem. Stream 0's source is set (`0xe4362fb0`, stride 24 from the packed `u8`, `+12528`), but the **vertex fetch
-     constants are empty** (`0x6F0`: `00000001 00000000` — type 1 with address 0). Silent Hill writes the vertex
+     constants are empty** (`0x6F0`: `00000001 00000000` â€” type 1 with address 0). Silent Hill writes the vertex
      buffers into the device but builds their fetch constants when the draw's state is flushed, in the ring, which this
      renderer does not parse. So the draws have no vertices: 650 draws, nothing on screen. Next: give the draws their
      fetch constants from the bound streams (source address, stride and the vertex buffer's header, as D3D's
