@@ -35,7 +35,7 @@ jobs:
         run: |
           REXGLUE="$(find build/sdk-host sdk/out -type f -name rexglue -perm -u+x 2>/dev/null | head -n1)"
           echo "using $REXGLUE"
-          REXGLUE="$REXGLUE" tools/codegen.sh app
+          REXGLUE="$REXGLUE" tools/codegen.sh app || { tail -n 80 app/codegen.log; exit 1; }
 
       - name: Build the app for iOS
         run: |
