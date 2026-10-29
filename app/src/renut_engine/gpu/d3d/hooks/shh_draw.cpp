@@ -19,6 +19,7 @@
 #include "renut_engine/gpu/d3d/d3d_native.h"
 #include "renut_engine/gpu/guest/command_buffers.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
+#include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/render/draw.h"
 
 using namespace renut::gpu;
@@ -33,7 +34,21 @@ void QueueOrRecord(u32 device, DrawCall &call) {
 }
 
 // void D3DDevice_DrawVertices(D3DDevice*, D3DPRIMITIVETYPE, UINT StartVertex, UINT VertexCount)
+// shh-nx (2026-10-29): temporary, stage 3: the first draws' texture bindings. Silent Hill writes its textures into
+// the device at N&B's +12544; if these are all zero while the draw is textured, the offset is not Silent Hill's.
+void LogTextureSlots(u32 device) {
+  static int logged = 0;
+  if (logged++ >= 6)
+    return;
+  const auto *slots = GuestPtr<const be_u32>(device + d3d::kDeviceOffsetTextures);
+  if (!slots)
+    return;
+  RGPU_INFO("[shh] draw texture slots: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}", u32(slots[0]),
+            u32(slots[1]), u32(slots[2]), u32(slots[3]), u32(slots[4]), u32(slots[5]), u32(slots[6]), u32(slots[7]));
+}
+
 void D3DDevice_DrawVertices_hook(u32 device, u32 primitive, u32 start_vertex, u32 vertex_count) {
+  LogTextureSlots(device);
   DrawCall call;
   call.primitive = primitive;
   call.start_vertex = start_vertex;

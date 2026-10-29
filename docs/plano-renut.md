@@ -128,8 +128,14 @@ written for N&B. Renut's N&B offsets (given in brackets in sa2-nx's sources) app
      taken as the depth surface, the census lists both at this address). Run of 07:37: **650 draws in 10 s**, the GPU
      busy 0.41 ms a frame over 302 frames, and the window no longer black (12,12,12 at the centre, 7,7,7 near the
      bottom: `out/renut_draws.png`) — the title's dark intro. One pipeline creation fails and is logged by key (VS
-     8763F4DD2B71AA32, PS 4D524BFF32A7299D, 1 target). Next: compare frame by frame with the emulated GPU
-     (`shh_renderer=xenos`), then the setters and the pipeline failure.
+     8763F4DD2B71AA32, PS 4D524BFF32A7299D, 1 target).
+   - **Compared with the emulated GPU (2026-10-29, 32 s).** `shh_renderer=xenos` shows the title screen (logo, clock,
+     "Press START to Begin": `out/cmp_xenos_32s.png`); `renut` shows black with Renut's own overlay over it
+     (`out/cmp_renut_32s.png`), and with `shh_renut_clear_test=true` it is black too, so the 650 draws paint over the
+     clear rather than the Swap losing it. The first draws do bind a texture (slot 0 = `0xe432c7e0`, read at N&B's
+     `+12544`, so the offset is Silent Hill's), which leaves the texture's *host* side: its fetch constant (the
+     sampler's format and type, `d3d::kDeviceOffsetFetchConstants`) and the upload of the Bink frames' contents. That is
+     what to look at next, with `shh_renderer=xenos` as the reference for every comparison.
 4. **deko3d:** the shader chain (HLSL -> SPIR-V -> GLSL -> package, uam on the console), the deko3d back end, and the
    Switch build without NVK. Gate: a picture on the console.
    **The Switch today (2026-10-28).** The console build is still the stage 1 one (the emulated Xenos GPU); it is what
