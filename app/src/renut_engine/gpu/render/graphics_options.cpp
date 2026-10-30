@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file    gpu/render/graphics_options.cpp
  */
 #include "renut_engine/gpu/render/graphics_options.h"
@@ -11,6 +11,7 @@
 
 #include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/guest/widescreen.h"
+#include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/render/format.h"
 
 REXCVAR_DEFINE_STRING(renut_shadow_resolution, "Resolution", "Nuts&Bolts/Graphics",
@@ -35,6 +36,12 @@ REXCVAR_DEFINE_STRING(renut_post_process_precision, "Game", "Nuts&Bolts/Graphics
                       "uses 16 bits.")
     .allowed({"Game", "High"});
 
+// shh-nx (2026-10-29, docs/perfil-shh.md SHH-08): SHH's shadow maps at a lower scale on the host, on every back end.
+REXCVAR_DEFINE_STRING(shh_shadow_quality, "High", "Silent Hill/Renut",
+                      "Shadow map resolution: High is the console's (1024x1024 a light), Medium is 2/3 of it (less GPU "
+                      "time, softer shadow edges)")
+    .allowed({"High", "Medium"});
+
 namespace renut::gpu {
 
 namespace {
@@ -48,6 +55,11 @@ constexpr u32 kAmbientOcclusionEdramBase = 1864;
 constexpr u32 kGuestScreenHeight = 720;
 
 bool IsShadowMap(const d3d::SurfaceDesc &desc, u32 width, u32 height) {
+  // shh-nx: SHH draws each light's 1024x1024 map into a depth target (1280x1024 on the host: the tiling's width) and
+  // resolves it into a 2048x2048 atlas; its format is not N&B's D24S8.
+  if (d3d::IsDepthFormat(desc.Format) && height == 1024 && (width == 1024 || width == 1280) &&
+      !((u32(desc.SurfaceInfo) >> 16) & 3))
+    return true;
   if (width != height)
     return false;
   if ((u32(desc.Format) & 0x3F) == kFormatD24S8)
@@ -112,6 +124,11 @@ void LatchGraphicsOptionsLocked() {
     g_latched.shadow_scale = {};
     g_latched.full_ambient_occlusion = false;
   }
+  // shh-nx (shh_shadow_quality): after the deko3d defaults, which it overrides.
+  if (REXCVAR_GET(shh_shadow_quality) == "Medium") {
+    g_latched.shadow_follows_resolution = false;
+    RenderScale::FromRatio(2, 3, g_latched.shadow_scale);
+  }
   const int anisotropy = std::atoi(REXCVAR_GET(renut_anisotropic_filtering).c_str());
   g_latched.min_anisotropy = anisotropy >= 2 ? uint32_t(anisotropy) : 1;
   g_latched.high_precision_post = REXCVAR_GET(renut_post_process_precision) != "Game";
@@ -122,6 +139,12 @@ RenderScale SurfaceRenderScale(const d3d::SurfaceDesc &desc, RenderScale resolut
     return resolution;  // multisampled: the scene's
   const u32 width = d3d::SurfaceWidth(desc.Size);
   const u32 height = d3d::SurfaceHeight(desc.Size);
+  if (IsShadowMap(desc, width, height)) {
+    static uint32_t logged = 0;
+    if (logged++ < 4)
+      RGPU_INFO("Shadow map target {}x{} format {:08X}: scale {}", width, height, u32(desc.Format),
+                (g_latched.shadow_follows_resolution ? resolution : g_latched.shadow_scale).Factor());
+  }
   if (IsShadowMap(desc, width, height))
     return g_latched.shadow_follows_resolution ? resolution : g_latched.shadow_scale;
   if (g_latched.full_ambient_occlusion && IsAmbientOcclusion(desc, width, height))

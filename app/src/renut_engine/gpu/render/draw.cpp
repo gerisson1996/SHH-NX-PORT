@@ -54,6 +54,9 @@
 
 // banjo-nx (2026-10-17, a diagnostic for the deko3d renderer's missing river water): draws that read memexport results
 // as vertices take them through the CPU path (wait for the export, read it back) instead of stream_convert_cs.
+REXCVAR_DEFINE_BOOL(shh_renut_depth_bias, true, "Silent Hill/Renut",
+                    "Renut's renderer: draw with the game's polygon offset (depth bias), which keeps the shadow maps from "
+                    "shadowing the surfaces that cast them");
 REXCVAR_DEFINE_BOOL(banjo_renut_diag_no_stream_convert, false, "Banjo/Renut",
                     "Diagnostic: exported streams reach their draws through the CPU (no stream_convert_cs)");
 // banjo-nx (2026-10-17, a diagnostic for the depth of field that banjo_gpu_blend_skip breaks): pixel shaders (their
@@ -149,6 +152,13 @@ REXCVAR_DEFINE_BOOL(sa2_renut_colour_handover, true, "SA2/Renderer",
                     "texture, copies it as before. The same pixels. Off: every resolve copied")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(shh_renut_resolve_halves, true, "Silent Hill/Renut",
+                    "Renut's renderer: a colour resolve of a target's first rows that clears them after, followed by "
+                    "nothing but the resolve of the other rows into the same texture (SHH's scene, in two halves), is "
+                    "done as one whole resolve and clear: the colour hand-over and the clear's image swap instead of "
+                    "two copies and two clears. The same pixels. Off: each half as it comes")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DECLARE(bool, sa2_renut_neon_compare);  // sa2-nx (2026-10-20): backend/queued.cpp
 
 namespace renut::gpu {
@@ -172,6 +182,11 @@ bool DiagCountsOn() {
 // sa2-nx (2026-10-28): sa2_renut_lazy_resolve_mips, once.
 bool LazyResolveMipsOn() {
   static const bool on = REXCVAR_GET(sa2_renut_lazy_resolve_mips);
+  return on;
+}
+// shh-nx (2026-10-30): shh_renut_resolve_halves, once.
+bool ResolveHalvesOn() {
+  static const bool on = REXCVAR_GET(shh_renut_resolve_halves);
   return on;
 }
 // sa2-nx (2026-10-28): sa2_renut_colour_handover, once.
@@ -3105,6 +3120,23 @@ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const Sha
     if (any)
       banjo::renut_gpu::CountBoolSpec(banjo::renut_gpu::BoolSpecEvent::kDraw);
   }
+  // shh-nx (2026-10-30, shh_deko3d_bound_spec): the element type of each input the vertex shader fetches by another
+  // index (vfetchBound), as DescribeBoundFetches writes it into SharedConstants.bound_fetch[i].w, + 1.
+  if (vs && vs->entry && declaration && BoundSpecOn()) {
+    const ShaderVertexInput *inputs = g_shaderVertexInputs + vs->entry->vertexInputOffset;
+    const u32 count = std::min<u32>(vs->entry->vertexInputCount, kMaxBoundFetches);
+    for (u32 i = 0; i < count; ++i) {
+      if (!(inputs[i].flags & kVertexInputBoundFetch))
+        continue;
+      for (const GuestVertexElement &e : declaration->elements) {
+        if (e.Usage == inputs[i].usage && e.UsageIndex == inputs[i].usageIndex) {
+          if (e.Stream < kMaxVertexStreams)
+            key.bound_types[i] = (BoundDeclType(u32(e.Type)) & 0x3FFFFFu) + 1;
+          break;
+        }
+      }
+    }
+  }
   const d3d::Device &dev = device.dev();
   key.vertex_shader = vs->entry;
   key.pixel_shader = ps ? ps->entry : nullptr;
@@ -3126,6 +3158,18 @@ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const Sha
   key.stencil_ref_mask = t.depth ? u32(dev.m_ValuesPacket.StencilRefMask) & 0xFFFFFF : 0;
   key.stencil_ref_mask_bf = t.depth ? u32(dev.m_ValuesPacket.StencilRefMaskBF) & 0xFFFFFF : 0;
   key.mode_control = u32(cp.ModeControl) & 0x7;
+  // shh-nx (2026-10-29, PipelineKey::depth_bias_constant): front faces' offset when it is on, else back faces'.
+  if (t.depth && REXCVAR_GET(shh_renut_depth_bias)) {
+    const u32 mode = u32(cp.ModeControl);
+    const auto *offsets = reinterpret_cast<const be_f32 *>(reinterpret_cast<const u8 *>(&dev) + 0x2A50);
+    const int face = (mode & (1u << 11)) ? 0 : (mode & (1u << 12)) ? 2 : -1;  // scale, offset: front 0-1, back 2-3
+    if (face >= 0) {
+      const float slope = float(offsets[face]) * (1.0f / 16.0f);
+      const float constant = std::round(float(offsets[face + 1]) * 16777216.0f);
+      key.depth_bias_slope = std::bit_cast<u32>(slope);
+      key.depth_bias_constant = u32(i32(std::clamp(constant, -1.0e9f, 1.0e9f)));
+    }
+  }
   key.alpha_to_coverage = (u32(cp.ColorControl) >> 4) & 1;
   if (primitive == kRectangleList) {
     if (State().rectangle_list_gs)
@@ -3195,6 +3239,8 @@ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const Sha
       key.reserved |= 1u;
     else if (ab_off == 16 && banjo::renut_gpu::Gpr32On())
       key.reserved |= 2u;
+    else if (ab_off == 19 && LightGateOn())
+      key.reserved |= 4u;  // shh-nx: shh_deko3d_light_gate's off half
   }
   return key;
 }
@@ -4019,10 +4065,12 @@ void FlushVertexFillsLocked() {
 }
 
 void SetTilesLocked(const ClearRect *rects, u32 count) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   g_tiles.assign(rects, rects + (rects ? count : 0));
 }
 
 u32 SetReplayPredicationLocked(u32 mask) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   const u32 previous = g_replay_predication;
   g_replay_predication = mask;
   return previous;
@@ -4129,6 +4177,7 @@ bool SameTargets(const Targets &a, const Targets &b) {
 }
 
 bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayConstants *replay) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   ++g_trace_draws;
   auto &s = State();
   const GuestDevice device(device_state);
@@ -4992,6 +5041,7 @@ void ForgetVertexDeclarationLocked(u32 declaration_va) {
 }
 
 void AdvanceStreamCacheFrameLocked() {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   banjo::renut_gpu::ResolveTraceFrameStart();
   // banjo-nx (2026-10-19): banjo_renut_store_cards_verify's diagnostics, every 10 s.
   if (banjo::renut_gpu::StoreCardsVerifyOn()) {
@@ -5525,6 +5575,7 @@ plume::RenderRect ClampRect(const ClearRect *rect, uint32_t width, uint32_t heig
 
 void ClearStateLocked(const u8 *device_state, u32 flags, const ClearRect *rect,
                       const float color[4], float depth, u32 stencil) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   auto &s = State();
   if (!Video::EnsureCommandListLocked())
     return;
@@ -5564,6 +5615,7 @@ void ClearStateLocked(const u8 *device_state, u32 flags, const ClearRect *rect,
 constexpr uint32_t kDepthWordsProbe = 300;
 
 void EnsureDepthWordsLocked(HostTexture &dest) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   if (!banjo::renut_gpu::DepthWordsLazyOn())
     return;
   dest.words_wanted = true;
@@ -5780,6 +5832,9 @@ bool ColourMaterialiseLocked(HostTexture &d) {
       banjo::renut_gpu::CountHandOver(5);  // lost: the target changed without a bind (none expected)
       return false;
     }
+    if (banjo::renut_gpu::ResolveTraceOn())  // shh-nx (2026-10-30): which hand-overs are copied after all
+      RGPU_INFO("[trace]   colour hand-over copied after all ({}x{} fmt {}, from the target)", d.width, d.height,
+                u32(d.host_format));
     CopyColourResolveLocked(source, &d, WholeHostRect(*source, d), 0, 0, 0, 0);
     return true;
   }
@@ -5796,6 +5851,9 @@ bool ColourMaterialiseLocked(HostTexture &d) {
   image.samples = held.samples;
   image.format_word = held.format_word;
   SwapDepthImageLocked(image, held);
+  if (banjo::renut_gpu::ResolveTraceOn())
+    RGPU_INFO("[trace]   colour hand-over copied after all ({}x{} fmt {}, from a taken image)", d.width, d.height,
+              u32(d.host_format));
   CopyColourResolveLocked(&image, &d, WholeHostRect(image, d), 0, 0, 0, 0);
   SwapDepthImageLocked(image, held);
   ColourDropHeldLocked(d);
@@ -5814,6 +5872,17 @@ bool ColourHandOverResolveLocked(HostSurface *s, HostTexture *d, const ClearRect
                    d->alloc_height == s->scale.Size(s->height) && d->host_format == s->format &&
                    d->view_desc.format == s->format && d->dimension == TextureDimension::Tex2D && !d->stacked &&
                    d->mip_levels == 1 + d->extra_levels && !d->words;  // one guest level (and its host levels)
+  if (!can && banjo::renut_gpu::ResolveTraceOn()) {
+    // shh-nx (2026-10-30): why it is copied (each test of 'can', 1 = failed)
+    RGPU_INFO("[trace]   colour copied: whole {} slice {} src {}x{} samples {} dest {}x{} size {} fmt {}/{} dim {} "
+              "levels {}+{} words {}",
+              !whole, slice != 0 || z != 0, s->width, s->height, s->samples != plume::RenderSampleCount::COUNT_1,
+              d->width, d->height,
+              !(d->scale == s->scale && d->alloc_width == s->scale.Size(s->width) &&
+                d->alloc_height == s->scale.Size(s->height)),
+              u32(d->host_format), u32(s->format), d->dimension != TextureDimension::Tex2D || d->stacked,
+              d->mip_levels, d->extra_levels, bool(d->words));
+  }
   if (!can) {
     if (d->colour_from || d->colour_current) {
       const bool covers = dest_x == 0 && dest_y == 0 && slice == 0 && z == 0 &&
@@ -5979,10 +6048,128 @@ static uint64_t ResolveSignature(const HostSurface *surface, const ClearRect &sr
   return h ? h : 1;
 }
 
+namespace {
+
+// shh-nx (2026-10-30, shh_renut_resolve_halves): SHH resolves its scene (a 1280x720 RGBA16F target) in two halves,
+// rows 0-384 and 384-720, each clearing its half after, with nothing between them. Each half is a copy (the colour
+// hand-over takes whole resolves only). The first half waits here; the second makes them one whole resolve and one
+// whole clear (a hand-over and the clear's image swap): the destination gets both halves and the target is cleared,
+// as before. Anything else the renderer does first (a draw, a clear, another resolve, a bind, a release, any other
+// render thread work: FlushDeferredResolveLocked) does the first half as it was, first.
+struct DeferredHalf {
+  bool active = false;
+  HostSurface *surface = nullptr;
+  u32 source_va = 0;
+  u32 flags = 0;
+  ClearRect rect{};
+  u32 dest_texture_va = 0;
+  bool has_dest_format = false;
+  d3d::TextureFetchConstant dest_format{};
+  bool has_color = false;
+  float color[4] = {};
+  float depth = 0;
+  u32 stencil = 0;
+  uint64_t generation = 0;
+  uint64_t writes = 0;
+};
+DeferredHalf g_deferred_half;
+std::atomic<bool> g_deferred_half_pending{false};
+
+}  // namespace
+
+static void ResolveSurfaceLocked(HostSurface *surface, u32 source_va, u32 flags, const ClearRect *source_rect,
+                                 u32 dest_texture_va, const d3d::TextureFetchConstant *dest_format, i32 dest_x,
+                                 i32 dest_y, u32 dest_level, u32 dest_slice, const float clear_color[4],
+                                 float clear_depth, u32 clear_stencil);
+
+void FlushDeferredResolveLocked() {
+  if (!g_deferred_half.active)
+    return;
+  DeferredHalf h = g_deferred_half;
+  g_deferred_half.active = false;
+  g_deferred_half_pending.store(false, std::memory_order_relaxed);
+  ResolveSurfaceLocked(h.surface, h.source_va, h.flags, &h.rect, h.dest_texture_va,
+                       h.has_dest_format ? &h.dest_format : nullptr, 0, 0, 0, 0, h.has_color ? h.color : nullptr,
+                       h.depth, h.stencil);
+}
+
+bool DeferredResolvePending() { return g_deferred_half_pending.load(std::memory_order_relaxed); }
+
 void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *source_rect,
                         u32 dest_texture_va, const d3d::TextureFetchConstant *dest_format,
                         i32 dest_x, i32 dest_y, u32 dest_level, u32 dest_slice,
                         const float clear_color[4], float clear_depth, u32 clear_stencil) {
+  if (!Video::EnsureCommandListLocked())
+    return;
+  SyncBound(State());  // as before the surface is looked up
+  const GuestDevice device(device_state);
+  if (!device.valid()) {
+    FlushDeferredResolveLocked();
+    return;
+  }
+  const u32 source = flags & 7;
+  const u32 source_va = source == 4 ? device.U32(d3d::kDeviceOffsetDepthStencil)
+                                    : device.U32(d3d::kDeviceOffsetRenderTargets + source * 4);
+  HostSurface *surface = GetHostSurfaceLocked(source_va);
+  // shh-nx (shh_renut_resolve_halves): the second half of a waiting first half: one whole resolve and clear.
+  DeferredHalf &h = g_deferred_half;
+  const bool colour_whole_rows = surface && !surface->depth && surface->texture &&
+                                 surface->samples == plume::RenderSampleCount::COUNT_1 && source_rect &&
+                                 source_rect->x1 == 0 && source_rect->x2 == int32_t(surface->width) && dest_x == 0 &&
+                                 dest_level == 0 && dest_slice == 0 && (flags & 0x100);
+  if (h.active) {
+    const bool same_clear = (clear_color != nullptr) == h.has_color &&
+                            (!clear_color || std::memcmp(clear_color, h.color, sizeof(h.color)) == 0) &&
+                            std::memcmp(&clear_depth, &h.depth, sizeof(float)) == 0 && clear_stencil == h.stencil;
+    const bool same_format = (dest_format != nullptr) == h.has_dest_format &&
+                             (!dest_format || std::memcmp(dest_format, &h.dest_format, sizeof(h.dest_format)) == 0);
+    if (colour_whole_rows && surface == h.surface && source_va == h.source_va && flags == h.flags &&
+        dest_texture_va == h.dest_texture_va && source_rect->y1 == h.rect.y2 && dest_y == h.rect.y2 &&
+        source_rect->y2 == int32_t(surface->height) && same_clear && same_format &&
+        surface->generation == h.generation && surface->writes == h.writes) {
+      h.active = false;
+      g_deferred_half_pending.store(false, std::memory_order_relaxed);
+      const ClearRect whole{0, 0, int32_t(surface->width), int32_t(surface->height)};
+      if (banjo::renut_gpu::ResolveTraceOn())
+        RGPU_INFO("[trace]   halves joined: one whole resolve and clear");
+      ResolveSurfaceLocked(surface, source_va, flags, &whole, dest_texture_va, dest_format, 0, 0, 0, 0, clear_color,
+                           clear_depth, clear_stencil);
+      return;
+    }
+    FlushDeferredResolveLocked();
+  }
+  // The first half: rows from 0 down to part of the target, into the destination at (0, 0), clearing after.
+  if (ResolveHalvesOn() && colour_whole_rows && source_rect->y1 == 0 && dest_y == 0 && source_rect->y2 > 0 &&
+      source_rect->y2 < int32_t(surface->height) && dest_texture_va) {
+    h.active = true;
+    h.surface = surface;
+    h.source_va = source_va;
+    h.flags = flags;
+    h.rect = *source_rect;
+    h.dest_texture_va = dest_texture_va;
+    h.has_dest_format = dest_format != nullptr;
+    if (dest_format)
+      h.dest_format = *dest_format;
+    h.has_color = clear_color != nullptr;
+    if (clear_color)
+      std::memcpy(h.color, clear_color, sizeof(h.color));
+    h.depth = clear_depth;
+    h.stencil = clear_stencil;
+    h.generation = surface->generation;
+    h.writes = surface->writes;
+    g_deferred_half_pending.store(true, std::memory_order_relaxed);
+    if (banjo::renut_gpu::ResolveTraceOn())
+      RGPU_INFO("[trace] resolve colour {:08X} rows 0-{} waits for its other half", source_va, source_rect->y2);
+    return;
+  }
+  ResolveSurfaceLocked(surface, source_va, flags, source_rect, dest_texture_va, dest_format, dest_x, dest_y,
+                       dest_level, dest_slice, clear_color, clear_depth, clear_stencil);
+}
+
+static void ResolveSurfaceLocked(HostSurface *surface, u32 source_va, u32 flags, const ClearRect *source_rect,
+                                 u32 dest_texture_va, const d3d::TextureFetchConstant *dest_format, i32 dest_x,
+                                 i32 dest_y, u32 dest_level, u32 dest_slice, const float clear_color[4],
+                                 float clear_depth, u32 clear_stencil) {
   auto &s = State();
   static const uint32_t kProfileLabel = gpu_profile::Label("resolves");
   gpu_profile::Mark(s, kProfileLabel);
@@ -5991,14 +6178,6 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
   if (!Video::EnsureCommandListLocked())
     return;
   SyncBound(s);
-  const GuestDevice device(device_state);
-  if (!device.valid())
-    return;
-
-  const u32 source = flags & 7;
-  const u32 source_va = source == 4 ? device.U32(d3d::kDeviceOffsetDepthStencil)
-                                    : device.U32(d3d::kDeviceOffsetRenderTargets + source * 4);
-  HostSurface *surface = GetHostSurfaceLocked(source_va);
   if (banjo::renut_gpu::ResolveTraceOn() && surface) {
     const ClearRect r = source_rect ? *source_rect : ClearRect{0, 0, -1, -1};
     RGPU_INFO("[trace] resolve {} {:08X} ({}x{} fmt {} samples {}) -> texture {:08X} at ({},{}) level {} slice {}, "
@@ -6045,10 +6224,17 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
         // probing a new destination).
         const bool lazy = banjo::renut_gpu::DepthWordsLazyOn();
         const bool words = !lazy || dest->words_wanted || dest->words_probe < kDepthWordsProbe;
+        const bool trace = banjo::renut_gpu::ResolveTraceOn();
+        bool handed = false;
         if (banjo::renut_gpu::ResolveSkipOn() && dest->resolve_signature == sig) {
           banjo::renut_gpu::CountSkippedResolve(true);
-        } else if (HandOverResolveLocked(surface, dest, src, dest_x, dest_y, words) ||
+          if (trace)
+            RGPU_INFO("[trace]   depth skipped (unchanged)");
+        } else if ((handed = HandOverResolveLocked(surface, dest, src, dest_x, dest_y, words)) ||
                    ResolveDepth(surface, dest, src, dest_x, dest_y, words)) {
+          if (trace)  // shh-nx (2026-10-30)
+            RGPU_INFO("[trace]   depth {} (dest {}x{}, words {})", handed ? "handed over" : "drawn", dest->width,
+                      dest->height, words);
           dest->resolve_signature = sig;
           dest->words_current = words;
           if (!dest->words_wanted && dest->words_probe < kDepthWordsProbe)
@@ -6099,6 +6285,8 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
         // copied as before (CopyColourResolveLocked: drawn or copied, then the host levels).
         if (ColourHandOverResolveLocked(surface, dest, src, dest_x, dest_y, slice, z)) {
           // banjo::renut_gpu::CountHandOver(0) counted it
+          if (banjo::renut_gpu::ResolveTraceOn())
+            RGPU_INFO("[trace]   colour handed over");
         } else if (!multisampled) {
           CopyColourResolveLocked(surface, dest, rect, host_x, host_y, slice, z);
         } else {
@@ -6176,6 +6364,7 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
 
 bool ReadRenderTargetLocked(const u8 *device_state, u32 source, u32 &width, u32 &height,
                             std::vector<u32> &words) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   auto &s = State();
   if (!s.target_readback_pipeline || !Video::EnsureCommandListLocked())
     return false;
@@ -6274,11 +6463,13 @@ bool ReadRenderTargetLocked(const u8 *device_state, u32 source, u32 &width, u32 
 }
 
 bool FrontBufferWrittenLocked(u32 texture_va) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   const HostTexture *texture = FindHostTextureLocked(texture_va);
   return texture && texture->texture && texture->gpu_written;
 }
 
 PresentImage FrontBufferImageLocked(u32 texture_va) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   PresentImage image;
   HostTexture *texture = FindHostTextureLocked(texture_va);
   if (!texture || !texture->texture || texture->slot == UINT32_MAX)

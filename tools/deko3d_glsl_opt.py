@@ -1987,6 +1987,431 @@ def pass_aw4(text):
     return text[:decl.end()] + '\n' + AW4_DECL + text[decl.end():]
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# pass: boundtype — the bound fetches' element types as specialization constants 920-935 (shh-nx, 2026-10-30)
+
+BOUND_RE = re.compile(r'g_UboShared\.v\[(6[6-9]|7\d|8[01])u\]\.w')
+
+
+def pass_boundtype(text):
+    """vfetchBound (shader_common.h) reads its element's D3DDECLTYPE from SharedConstants.bound_fetch[i].w
+    (g_UboShared.v[66 + i].w: format bits 0-5, signed 8, integer 9, swizzles 10-21) and switches on it at run time, the
+    same at every vertex of the draw. SHH's skinned shaders fetch a dozen bone rows so: 12 format switches with their
+    signed / integer branches and swizzle selects, ~300 KB of GLSL each. With constant 920 + i the draw's type + 1
+    (render/pipeline.cpp, from the key's bound_types; 0: read at run time) uam folds all of it to the one format."""
+    span = main_span(text)
+    if not span:
+        return text
+    a, b = span
+    body = text[a:b]
+    slots = sorted({int(m.group(1)) for m in BOUND_RE.finditer(body)})
+    if not slots:
+        return text
+    decl = ''
+    for n in slots:
+        k, cid = n - 66, 920 + n - 66
+        decl += (f'#ifndef SPIRV_CROSS_CONSTANT_ID_{cid}\n#define SPIRV_CROSS_CONSTANT_ID_{cid} 0u\n#endif\n'
+                 f'const uint g_banjoBoundType{k} = SPIRV_CROSS_CONSTANT_ID_{cid};\n'
+                 f'#define DK_BOUND_TYPE_{k} ((g_banjoBoundType{k} != 0u) ? (g_banjoBoundType{k} - 1u) : '
+                 f'g_UboShared.v[{n}u].w)\n')
+    body = BOUND_RE.sub(lambda m: f'DK_BOUND_TYPE_{int(m.group(1)) - 66}', body)
+    return insert_before_main(text[:a] + body + text[b:], decl)
+
+
+_LG_RANGE = re.compile(r'float\((g_UboPixel\.v\[\d+u\]\.z) > (_\d+)\)')
+_LG_STMT = re.compile(r'^([ \t]*)(?:(float|vec[234]|bool|bvec[234]|int|uint|ivec[234]|uvec[234]) )?(_\d+)(\.[xyzw]+)?(?: = (.*))?;$')
+_LG_SIZE = {'float': 1, 'bool': 1, 'int': 1, 'uint': 1}
+_LG_TOKEN = re.compile(r'\s*(?:(\d+\.\d*(?:e[-+]?\d+)?|\d+u?)|([A-Za-z_]\w*)|(>=|<=|==|!=|&&|\|\||[-+*/(),.\[\]<>!?:]))')
+_SWZ = {'x': 0, 'y': 1, 'z': 2, 'w': 3}
+
+
+def _lg_size(t):
+    return _LG_SIZE.get(t) or int(t[-1])
+
+
+class _LgExpr:
+    """A tiny GLSL expression reader for pass_lightgate: each value is a list of component states, 'Z' (0 when the
+    light is out of range), ('L', hi) (-hi: a clamp of log2(0)), ('N', p, hi) (p * -hi) or 'U', and its text."""
+
+    def __init__(self, text, state, sizes, rng_text, hi_of, res_of=lambda name: None):
+        self.toks = []
+        at = 0
+        while at < len(text):
+            m = _LG_TOKEN.match(text, at)
+            if not m or m.end() == at:
+                raise ValueError(text[at:])
+            self.toks.append((m.group(1) and 'num' or m.group(2) and 'id' or 'op', m.group(m.lastindex), m.start(m.lastindex)))
+            at = m.end()
+            while at < len(text) and text[at] == ' ':
+                at += 1
+        self.text, self.state, self.sizes, self.rng, self.hi_of, self.res_of = text, state, sizes, rng_text, hi_of, res_of
+        self.k = 0
+        self.reqs = set()  # (p, hi): the condition's P * M >= 151 terms the zeros rest on
+
+    def peek(self):
+        return self.toks[self.k][1] if self.k < len(self.toks) else None
+
+    def take(self, want=None):
+        t = self.toks[self.k]
+        if want is not None and t[1] != want:
+            raise ValueError(want)
+        self.k += 1
+        return t
+
+    def pos(self):
+        return self.toks[self.k][2] if self.k < len(self.toks) else len(self.text)
+
+    def parse(self):
+        v = self.cmp()
+        if self.k != len(self.toks):
+            raise ValueError('trailing')
+        return v
+
+    def cmp(self):
+        a = self.add()
+        if self.peek() in ('>', '<', '>=', '<=', '==', '!=', '&&', '||', '?'):
+            raise ValueError('cmp')
+        return a
+
+    def add(self):
+        s = self.pos()
+        a = self.mul()
+        while self.peek() in ('+', '-'):
+            op = self.take()[1]
+            b = self.mul()
+            n = max(len(a[0]), len(b[0]))
+            ca, cb = (a[0] * n if len(a[0]) == 1 else a[0]), (b[0] * n if len(b[0]) == 1 else b[0])
+            # the skipped value: a side that is all 0 drops out (x + 0 = x)
+            res = None
+            if all(c == 'Z' for c in ca) and len(ca) == len(b[0]) and op == '+':
+                res = b[2]
+            elif all(c == 'Z' for c in cb) and len(cb) == len(a[0]):
+                res = a[2]
+            a = (['Z' if x == 'Z' and y == 'Z' else 'U' for x, y in zip(ca, cb)], self.text[s:self.pos()].strip(), res)
+        return a
+
+    def mul(self):
+        s = self.pos()
+        a = self.unary()
+        while self.peek() in ('*', '/'):
+            op = self.take()[1]
+            b = self.unary()
+            n = max(len(a[0]), len(b[0]))
+            ca, cb = (a[0] * n if len(a[0]) == 1 else a[0]), (b[0] * n if len(b[0]) == 1 else b[0])
+            out = []
+            for x, y in zip(ca, cb):
+                if op == '*' and (x == 'Z' or y == 'Z') and not any(c == '-inf' or isinstance(c, tuple) and c[0] == 'N'
+                                                                    for c in (x, y)):
+                    out.append('Z')  # 0 * a finite value (-inf and p * -M may not be)
+                elif op == '*' and isinstance(x, tuple) and x[0] == 'L' and y == 'P' or \
+                        op == '*' and isinstance(y, tuple) and y[0] == 'L' and x == 'P':
+                    lt = x if isinstance(x, tuple) else y
+                    out.append(('N', (a if x == 'P' else b)[1], lt[1]))
+                else:
+                    out.append('U')
+            a = (out, self.text[s:self.pos()].strip(), None)
+        return a
+
+    def unary(self):
+        if self.peek() == '-':
+            s = self.pos()
+            self.take()
+            v = self.unary()
+            return ([c if c == 'Z' else 'U' for c in v[0]], self.text[s:self.pos()].strip(), None)
+        return self.postfix()
+
+    def postfix(self):
+        s = self.pos()
+        v = self.primary()
+        while self.peek() in ('.', '['):
+            if self.take()[1] == '[':
+                depth = 1
+                while depth:
+                    t = self.take()[1]
+                    depth += {'[': 1, ']': -1}.get(t, 0)
+                v = (['P' if all(c == 'P' for c in v[0]) else 'U'] * 4, self.text[s:self.pos()].strip(), None)
+                continue
+            name = self.take()[1]
+            if all(c in _SWZ for c in name):
+                comps = v[0] * 4 if len(v[0]) == 1 else v[0]
+                v = ([comps[_SWZ[c]] if _SWZ[c] < len(comps) else 'U' for c in name], self.text[s:self.pos()].strip(),
+                     f'{v[2]}.{name}' if v[2] is not None else None)
+            else:
+                v = (['P' if all(c == 'P' for c in v[0]) else 'U'] * 4, self.text[s:self.pos()].strip(), None)
+        return v
+
+    def args(self):
+        self.take('(')
+        out = []
+        if self.peek() != ')':
+            out.append(self.cmp_or_any())
+            while self.peek() == ',':
+                self.take()
+                out.append(self.cmp_or_any())
+        self.take(')')
+        return out
+
+    def cmp_or_any(self):
+        """An argument: the range test's comparison is text; any other comparison is unknown."""
+        s, k = self.pos(), self.k
+        try:
+            return self.cmp()
+        except ValueError:
+            self.k = k
+            depth = 0
+            while self.k < len(self.toks):
+                t = self.peek()
+                if depth == 0 and t in (',', ')'):
+                    break
+                depth += {'(': 1, ')': -1}.get(t, 0)
+                self.take()
+            return (['U'], self.text[s:self.pos()].strip(), None)
+
+    def primary(self):
+        s = self.pos()
+        kind, tok, _ = self.take()
+        if tok == '(':
+            v = self.cmp()
+            self.take(')')
+            return (v[0], self.text[s:self.pos()].strip(), f'({v[2]})' if v[2] is not None else None)
+        if kind == 'num':
+            z = float(tok.rstrip('u')) == 0.0
+            return (['Z' if z else 'U'], tok, None)
+        if kind != 'id':
+            raise ValueError(tok)
+        if self.peek() != '(':
+            if tok in self.state:
+                return (list(self.state[tok]), tok, self.res_of(tok))
+            # not written by the light: its own value when the light is skipped; a uniform is a possible P
+            return (['P' if tok.startswith('g_Ubo') else 'U'] * self.sizes.get(tok, 4), tok, tok)
+        a = self.args()
+        txt = self.text[s:self.pos()].strip()
+        if tok in ('float', 'vec2', 'vec3', 'vec4') and len(a) == 1 and len(a[0][0]) == 1 and tok != 'float':
+            return (a[0][0] * int(tok[-1]), txt, None)
+        if tok == 'float':
+            if a[0][1] == self.rng:
+                return (['Z'], txt, None)
+            return (['U'], txt, None)
+        if tok in ('vec2', 'vec3', 'vec4'):
+            comps = [c for x in a for c in x[0]]
+            return (comps[:int(tok[-1])] if len(comps) >= int(tok[-1]) else ['U'] * int(tok[-1]), txt, None)
+        if tok == 'abs':
+            return ([c if c == 'Z' else 'U' for c in a[0][0]], txt, None)
+        if tok == 'log2' and all(c == 'Z' for c in a[0][0]):
+            return (['-inf'] * len(a[0][0]), txt, None)
+        if tok == 'clamp' and len(a) == 3:
+            lo, hi = a[1][1], a[2][1]
+            out = []
+            for c in a[0][0]:
+                if c == '-inf' and self.hi_of.get(lo) == hi:
+                    out.append(('L', hi))
+                elif c == 'Z' and a[1][1] == '0.0' and re.fullmatch(r'\d+\.\d+', hi):
+                    out.append('Z')
+                else:
+                    out.append('U')
+            res = None
+            if out and all(isinstance(c, tuple) for c in out) and len(out) == 1:
+                res = f'clamp(log2(abs(0.0)), {lo}, {hi})'  # its value when skipped (another light reads it)
+            return (out, txt, res)
+        if tok == 'max' and len(a) == 2:
+            ca, cb = a[0][0], a[1][0]
+            n = max(len(ca), len(cb))
+            ca, cb = (ca * n if len(ca) == 1 else ca), (cb * n if len(cb) == 1 else cb)
+            return (['Z' if x == 'Z' and y == 'Z' else 'U' for x, y in zip(ca, cb)], txt, None)
+        if tok == 'exp2' and len(a) == 1 and len(a[0][0]) == 1 and isinstance(a[0][0][0], tuple) and a[0][0][0][0] == 'N':
+            self.reqs.add((a[0][0][0][1], a[0][0][0][2]))
+            return (['Z'], txt, None)
+        if tok == 'dot' and len(a) == 2 and len(a[0][0]) == len(a[1][0]):
+            return (['Z' if x == 'Z' or y == 'Z' else 'U' for x, y in zip(a[0][0], a[1][0])] and
+                    ['Z' if all(x == 'Z' or y == 'Z' for x, y in zip(a[0][0], a[1][0])) else 'U'], txt, None)
+        size = max((len(x[0]) for x in a), default=1)
+        return (['U'] * size, txt, None)
+
+
+def pass_lightgate(text):
+    """SHH's lit pixel shaders add up to five point lights, each in `if (5.0 + v[4].z > N)`, ~40-70 instructions (rsq,
+    sqrt, log2 / exp2 pairs) at every pixel, though the light's work reaches its sums only through its range test
+    float(range > dist): out of range that factor is 0, log2(0) clamps to -M (the shader's clamp bounds) and
+    exp2(P * -M) is 0 once P * M >= 151. A light is gated when, with that factor 0, every value it leaves to the rest
+    of the shader is one it would have had anyway: a sum `x + prev` whose x is 0 (prev), a clamped log2 of 0, or a
+    value made only of what the light does not write (moved ahead, as its distance). Its other statements go into
+    `if (g_banjoLightGate == 0u || range > dist || !(P * M >= 151.0) ...)`, the else giving those values. Constant 914
+    (0 by default: the code as before; 1 from shh_deko3d_light_gate): warps with no pixel in a light's reach skip it.
+    Exact for finite values (0 * x = 0)."""
+    span = main_span(text)
+    if not span:
+        return text
+    a, b = span
+    lines = text[a:b].split('\n')
+    hi_of, sizes = {}, {}
+    for ln in lines:
+        m = re.match(r'^[ \t]*float (_\d+) = -(_\d+);$', ln)
+        if m:
+            hi_of[m.group(1)] = m.group(2)
+        m = re.match(r'^[ \t]*(float|vec[234]|bool|bvec[234]|int|uint|ivec[234]|uvec[234]) (_\d+)\b', ln)
+        if m:
+            sizes[m.group(2)] = _lg_size(m.group(1))
+    edits = []
+    done_until = -1
+    for i, ln in enumerate(lines):
+        m = _LG_RANGE.search(ln)
+        if not m or i <= done_until:
+            continue
+        ind = ln[:len(ln) - len(ln.lstrip(' \t'))]
+        # the light's block: from the line after its `{` to the last plain statement at its level
+        s = i
+        while s > 0 and not (lines[s - 1].strip() == '{' and len(lines[s - 1]) - len(lines[s - 1].lstrip()) == len(ind) - 4):
+            s -= 1
+        if s == 0 or not lines[s - 2].strip().startswith('if ('):
+            continue
+        e = s
+        stmts = []
+        while e < len(lines):
+            mm = _LG_STMT.match(lines[e])
+            if not mm or mm.group(1) != ind:
+                break
+            stmts.append((e, mm.group(2), mm.group(3), mm.group(4), mm.group(5)))
+            e += 1
+        if e <= i:
+            continue
+        end = e - 1
+        written = {st[2] for st in stmts}
+        reads = {k: set(re.findall(r'\b_\d+\b', st[4] or '')) for k, st in enumerate(stmts)}
+        after = '\n'.join(lines[end + 1:])
+        read_after = {v for v in written if re.search(rf'\b{v}\b', after)}
+        # values that do not depend on the range test (the rest of what the light writes does)
+        tainted = set()
+        changed = True
+        while changed:
+            changed = False
+            for k, st in enumerate(stmts):
+                if st[2] not in tainted and (reads[k] & tainted or _LG_RANGE.search(st[4] or '')):
+                    tainted.add(st[2])
+                    changed = True
+        pure = written - tainted
+        dist = m.group(2)
+        if dist in written and dist not in pure:
+            continue
+        extra = set()
+        for _ in range(4):
+            need = ({dist} & written) | (read_after & pure) | extra
+            while True:
+                more = set()
+                for k, st in enumerate(stmts):
+                    if st[2] in need:
+                        more |= reads[k] & written
+                if more <= need:
+                    break
+                need |= more
+            ahead = need
+            state, reqs, ok, wanted = {}, set(), True, set()
+            comps = {}  # var -> its components' values when the light is skipped (texts), where known
+
+            def res_of(name):
+                c = comps.get(name)
+                if c is None or any(x is None for x in c):
+                    return None
+                return c[0] if len(c) == 1 else f'vec{len(c)}({", ".join(c)})'
+
+            for k, (ln_i, typ, v, swz, expr) in enumerate(stmts):
+                if v in ahead:
+                    continue
+                if expr is None:
+                    state[v] = ['U'] * _lg_size(typ)
+                    comps.pop(v, None)
+                    continue
+                try:
+                    p = _LgExpr(expr, state, sizes, m.group(0)[6:-1], hi_of, res_of)
+                    val = p.parse()
+                except (ValueError, IndexError):
+                    val = (['U'] * (len(swz) - 1 if swz else sizes.get(v, 4)), expr, None)
+                    p = None
+                if p:
+                    reqs |= p.reqs
+                r = val[2]
+                if r is not None:
+                    wanted |= set(re.findall(r'\b_\d+\b', r)) & pure - ahead
+                    if set(re.findall(r'\b_\d+\b', r)) & (written - ahead):
+                        r = None
+                n = sizes.get(v, 4)
+                if swz:
+                    cur = list(state.get(v, ['U'] * n))
+                    cs = val[0] * len(swz[1:]) if len(val[0]) == 1 else val[0]
+                    for c, st in zip(swz[1:], cs):
+                        if _SWZ[c] < len(cur):
+                            cur[_SWZ[c]] = st
+                    state[v] = cur
+                    if v in comps:
+                        for j, c in enumerate(swz[1:]):
+                            if _SWZ[c] < n:
+                                comps[v][_SWZ[c]] = None if r is None else (r if len(swz) == 2 else f'({r}).{"xyzw"[j]}')
+                else:
+                    state[v] = val[0] * (n if len(val[0]) == 1 else 1)
+                    if r is None:
+                        comps.pop(v, None)
+                    else:
+                        comps[v] = [r] if n == 1 else [f'({r}).{c}' if not re.fullmatch(r'[\w.\[\]]+', r) else
+                                                       f'{r}.{c}' for c in 'xyzw'[:n]]
+                        if n > 1 and re.fullmatch(r'_\d+\.[xyzw]{%d}' % n, r):
+                            comps[v] = [f'{r.split(".")[0]}.{c}' for c in r.split('.')[1]]
+            residual = {v: res_of(v) for v in comps if res_of(v) is not None}
+            if wanted <= extra:
+                break
+            extra |= wanted
+        # what the rest of the shader reads: ahead, a skipped value, or remade after the if from those
+        post = set()
+        for v in sorted(read_after - ahead - set(residual)):
+            ks = [k for k, st in enumerate(stmts) if st[2] == v]
+            if all(not (reads[k] & written) - ahead - set(residual) - post - {v} for k in ks):
+                post.add(v)
+            else:
+                ok = False
+        gated = [k for k, st in enumerate(stmts) if st[2] not in ahead and st[2] not in post]
+        if not ok or not gated:
+            continue
+        if any(reads[k] & post for k in gated):
+            continue
+        # implicit derivatives (texture(), dFdx) are not taken in a branch that differs from pixel to pixel
+        if any(re.search(r'\b(texture|textureOffset|textureProj|dFdx|dFdy|dFdxFine|dFdyFine|fwidth)\(', stmts[k][4] or '')
+               for k in gated):
+            continue
+        post_reads = set().union(*[reads[k] for k, st in enumerate(stmts) if st[2] in post]) & written
+        hs = [st[2] for st in stmts if (st[2] in read_after or st[2] in post_reads) and st[2] in residual]
+        if (post_reads - ahead - post) - set(hs):
+            continue
+        hs = list(dict.fromkeys(hs))
+        # what is read after the if is declared ahead of it
+        decl_of = {}
+        for k, st in enumerate(stmts):
+            if st[2] in hs and st[1]:
+                decl_of[st[2]] = st[1]
+        cond = ' || '.join(['g_banjoLightGate == 0u', f'{m.group(1)} > {dist}'] +
+                           [f'!(({pp} * {hi}) >= 151.0)' for pp, hi in sorted(reqs)])
+        edits.append((s, end, ind, stmts, ahead, post, hs, decl_of, residual, cond))
+        done_until = end
+    if not edits:
+        return text
+    for s, end, ind, stmts, ahead, post, hs, decl_of, residual, cond in reversed(edits):
+        pre = [lines[st[0]] for st in stmts if st[2] in ahead]
+        postl = [lines[st[0]] for st in stmts if st[2] in post]
+        body = []
+        for st in stmts:
+            if st[2] in ahead or st[2] in post:
+                continue
+            ln = lines[st[0]]
+            if st[2] in hs and st[1] and st[4] is not None:
+                ln = f'{ind}{st[2]}{st[3] or ""} = {st[4]};'
+            elif st[2] in hs and st[1]:
+                continue
+            body.append('    ' + ln)
+        lines[s:end + 1] = (pre + [f'{ind}{decl_of[v]} {v};' for v in hs if v in decl_of] + [f'{ind}if ({cond})', f'{ind}{{'] + body +
+                            [f'{ind}}}', f'{ind}else', f'{ind}{{'] + [f'{ind}    {v} = {residual[v]};' for v in hs] +
+                            [f'{ind}}}'] + postl)
+    decl = ('#ifndef SPIRV_CROSS_CONSTANT_ID_914\n#define SPIRV_CROSS_CONSTANT_ID_914 0u\n#endif\n'
+            'const uint g_banjoLightGate = SPIRV_CROSS_CONSTANT_ID_914;\n')
+    return insert_before_main(text[:a] + '\n'.join(lines) + text[b:], decl)
+
+
 PASSES = [
     ('scale1', pass_scale1),
     ('fragscale', pass_fragscale),
@@ -2015,12 +2440,14 @@ PASSES = [
     ('gpr32', pass_gpr32),
     ('bonesel', pass_bonesel),
     ('aw4', pass_aw4),
+    ('boundtype', pass_boundtype),
+    ('lightgate', pass_lightgate),
 ]
 DEFAULT = ','.join(name for name, _ in PASSES)
 
 
 # The passes for one stage only.
-STAGE_OF = {'bonesel': 'vert', 'aw4': 'vert', 'lightbranch': 'frag', 'nullps': 'frag', 'gpr32': 'frag', 'earlyz': 'frag', 'txq': 'frag', 'alpha': 'frag', 'alphamask': 'frag', 'earlyhoist': 'frag', 'tess': 'vert', 'vsout': 'vert', 'vszero': 'vert', 'pszero': 'frag'}
+STAGE_OF = {'lightgate': 'frag', 'boundtype': 'vert', 'bonesel': 'vert', 'aw4': 'vert', 'lightbranch': 'frag', 'nullps': 'frag', 'gpr32': 'frag', 'earlyz': 'frag', 'txq': 'frag', 'alpha': 'frag', 'alphamask': 'frag', 'earlyhoist': 'frag', 'tess': 'vert', 'vsout': 'vert', 'vszero': 'vert', 'pszero': 'frag'}
 
 
 def optimise(text, passes=DEFAULT, stage=None, name=None):

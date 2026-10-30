@@ -344,6 +344,16 @@ inline void NoteOpening(uint64_t us, bool ok, const std::string_view path) {
   g_io.us_opens.fetch_add(us, std::memory_order_relaxed);
   MaxAtomic(g_io.us_opening_worst, us);
 
+  // Fork (shh-nx, 2026-10-29): every video and stream opened, for the audio timeline (SHH-12).
+  if (ok && path.size() > 4) {
+    std::string ext(path.substr(path.size() - 4));
+    for (char &c : ext)
+      c = char(std::tolower(static_cast<unsigned char>(c)));
+    static std::atomic<uint32_t> media_logged{0};
+    if ((ext == ".bik" || ext == ".ogg") && media_logged.fetch_add(1, std::memory_order_relaxed) < 400)
+      REXKRNL_INFO("[io] media open '{}'", path);
+  }
+
   const int32_t warning_ms = REXCVAR_GET(sa2_io_warning_ms);
   if (warning_ms > 0 && us >= static_cast<uint64_t>(warning_ms) * 1000ull &&
       g_io_warnings.fetch_add(1, std::memory_order_relaxed) < 300) {

@@ -94,7 +94,8 @@ add_library(shh_renut_gpu OBJECT
     # The pieces banjo-nx's SDK and generated code would give the renderer, app-side here (shh_compat).
     "${CMAKE_SOURCE_DIR}/src/renut_engine/shh_compat/frame_latency.cpp"
     "${CMAKE_SOURCE_DIR}/src/renut_engine/shh_compat/shh_compat.cpp"
-    "${CMAKE_SOURCE_DIR}/src/renut_engine/shh_compat/fast_boot.cpp")
+    "${CMAKE_SOURCE_DIR}/src/renut_engine/shh_compat/fast_boot.cpp"
+    "${CMAKE_SOURCE_DIR}/src/me/sa2_render_mode.cpp")
 if(NOT REXGLUE_PLATFORM_SWITCH)
     # The Switch profiler counters the renderer feeds (sdk/src/ui/switch_perf.cpp on the console): no-ops on the PC.
     target_sources(shh_renut_gpu PRIVATE "${CMAKE_SOURCE_DIR}/src/me/me_pc_stubs.cpp")

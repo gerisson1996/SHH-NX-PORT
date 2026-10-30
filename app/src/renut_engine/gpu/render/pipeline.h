@@ -82,6 +82,15 @@ struct PipelineKey {
   // alpha_test_func; 8 = always, the test off), the pixel shader's specialization constant 903 (tools/deko3d_glsl_opt.py,
   // pass alpha); 0 = read at run time. Like the bools: a key with it not built yet draws with the generic one (0).
   uint32_t alpha_func;
+  // shh-nx (2026-10-29): the game's polygon offset (D3DRS_DEPTHBIAS / SLOPESCALEDEPTHBIAS, device +0x2A50..+0x2A5C,
+  // PA_SU_SC_MODE_CNTL bits 11-12), as the host's: the constant in units of 2^-24 and the slope, as float bits; 0 = none.
+  // Without it the shadow maps were drawn with no bias, and the surfaces in shadow striped themselves (acne).
+  uint32_t depth_bias_constant;
+  uint32_t depth_bias_slope;
+  // shh-nx (2026-10-30, shh_deko3d_bound_spec): per vertex input i fetched by another index (vfetchBound), its
+  // SharedConstants.bound_fetch[i].w + 1, the vertex shader's specialization constant 920 + i (tools/deko3d_glsl_opt.py,
+  // pass boundtype); 0 = read at run time. Like the bools: a key with them not built yet draws with the generic one.
+  uint32_t bound_types[16];
   uint32_t reserved;  // 0 (the key is compared and hashed as bytes)
 };
 
@@ -93,6 +102,11 @@ uint32_t BlendSkipMode(const PipelineKey &key);
 // pixel shader may leave 0: unwritten (write mask, a target's format, no target), and the alpha only when no written
 // colour channel blends with it and alpha to coverage is off (shader_common.h, banjoTrim).
 uint32_t OutputTrimMask(const PipelineKey &key);
+
+// shh-nx (2026-10-30): shh_deko3d_bound_spec, once (the keys' bound_types).
+bool BoundSpecOn();
+// shh-nx (2026-10-30): shh_deko3d_light_gate, once (constant 914 in every pixel shader's pipeline).
+bool LightGateOn();
 
 struct HostVertexLayout;
 

@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <chrono>
 #include <algorithm>
 #include <string>
 
@@ -460,7 +461,12 @@ static void xeEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cur_thre
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
     // Create a full waiter.
     REX_SYS_COUNT(rex::syscount::kCritSecWait, 1);
+    const bool profiled = GuestWaitProfileActive();  // shh-nx (SHH-13)
+    const auto waiting = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     xeKeWaitForSingleObject(reinterpret_cast<void*>(cs), 8, 0, 0, nullptr);
+    if (profiled)
+      ProfileGuestWait(7, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - waiting).count()));
   }
 
   assert_true(cs->owning_thread == 0);

@@ -1071,7 +1071,7 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
   args->dest_slice = dest_slice;
   args->depth = clear_depth;
   args->stencil = clear_stencil;
-  render_thread::Queue([args] {
+  render_thread::QueueResolveWork([args] {
     ResolveStateLocked(args->state.data(), args->flags, args->has_rect ? &args->rect : nullptr,
                        args->dest_texture_va, args->has_dest_format ? &args->dest_format : nullptr,
                        args->dest_x, args->dest_y, args->dest_level, args->dest_slice,

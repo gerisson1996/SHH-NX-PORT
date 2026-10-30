@@ -1,0 +1,43 @@
+# Publishes release/shh.nro as the v1.0 release: the NRO, and a zip with the SD card's layout (the NRO and, when
+# release/deko3d_shaders.bin is there, the prebuilt shader cache), with the notes in .github/release-v1.0.md. Runs when
+# one of them or this file is pushed to main; an existing release gets its files and notes replaced.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - release/shh.nro
+      - release/deko3d_shaders.bin
+      - .github/release-v1.0.md
+      - .github/workflows/release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish v1.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f release/shh.nro ]; then
+            echo "release/shh.nro is not in the repository: nothing to publish"
+            exit 0
+          fi
+          mkdir -p pkg/switch/shh-nx
+          cp release/shh.nro pkg/switch/shh-nx/shh.nro
+          if [ -f release/deko3d_shaders.bin ]; then
+            cp release/deko3d_shaders.bin pkg/switch/shh-nx/deko3d_shaders.bin
+          fi
+          (cd pkg && zip -9 -r ../SHH-NX-V1.0.zip switch)
+          if gh release view v1.0 >/dev/null 2>&1; then
+            gh release upload v1.0 release/shh.nro SHH-NX-V1.0.zip --clobber
+            gh release edit v1.0 --title "Silent Hill Homecoming NX — V1.0" --notes-file .github/release-v1.0.md
+          else
+            gh release create v1.0 release/shh.nro SHH-NX-V1.0.zip --target "$GITHUB_SHA" \
+              --title "Silent Hill Homecoming NX — V1.0" --notes-file .github/release-v1.0.md
+          fi

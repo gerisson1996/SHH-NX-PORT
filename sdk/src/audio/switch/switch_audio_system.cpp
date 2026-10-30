@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -38,20 +39,28 @@ REXCVAR_DEFINE_INT32(audio_switch_frames_in_queue, 10, "Audio",
                      "(cushion; 10 = 53 ms, 6 up to build 105). A longer queue lets the game wait without cutting the "
                      "output, at the cost of latency: sa2_audio_wait_server_ms waits up to 30 ms; read "
                      "when the audio is opened");
+REXCVAR_DEFINE_INT32(audio_switch_buffer_frames, 4, "Audio",
+                     "Frames per audout buffer (1-4, default 4 = 1024 samples = 21.3 ms). "
+                     "Lower values reduce output latency at the cost of more frequent buffer completions; "
+                     "read when the audio is opened");
+REXCVAR_DEFINE_INT32(audio_switch_buffers, 3, "Audio",
+                     "Number of audout buffers kept in rotation (2-4, default 3). "
+                     "With 2 buffers, latency is lower than 3 buffers; "
+                     "read when the audio is opened");
 
 namespace rex::audio::nx {
 
 namespace {
 
-// Guest frames per audout buffer, and buffers kept queued in the device.
-// 4 frames are 1024 samples (21.3 ms), the block size MarathonRecomp-NX found
-// to be safe on the shared cores; three buffers cap the latency at ~64 ms.
-constexpr uint32_t kFramesPerBuffer = 4;
-constexpr uint32_t kBufferCount = 3;
-constexpr uint32_t kBufferSamples = kFramesPerBuffer * SwitchAudioDriver::kChannelSamples;
-constexpr uint32_t kBufferBytes = kBufferSamples * 2 * sizeof(s16);
+// Maximum guest frames per audout buffer, and buffers kept queued in the device.
+// Arrays are sized for the maximum (4 frames = 1024 samples = 21.3 ms, 4 buffers).
+// Runtime values are governed by audio_switch_buffer_frames and audio_switch_buffers.
+constexpr uint32_t kMaxFramesPerBuffer = 4;
+constexpr uint32_t kMaxBufferCount = 4;
+constexpr uint32_t kMaxBufferSamples = kMaxFramesPerBuffer * SwitchAudioDriver::kChannelSamples;
+constexpr uint32_t kMaxBufferBytes = kMaxBufferSamples * 2 * sizeof(s16);
 // audout wants page-aligned sample memory.
-constexpr uint32_t kBufferAllocBytes = (kBufferBytes + 0xFFF) & ~0xFFFu;
+constexpr uint32_t kBufferAllocBytes = (kMaxBufferBytes + 0xFFF) & ~0xFFFu;
 
 // Above guest threads (0x3B) so the device is never starved, like the audio
 // pump of MarathonRecomp-NX (0x2B).
@@ -152,11 +161,14 @@ struct SwitchAudioSystem::Output {
   std::atomic<bool> running{false};
   bool pump = false;  // audio_switch_pump, read when audio is opened
   size_t frames_in_queue = kTargetQueuedFrames;  // audio_switch_frames_in_queue, read when audio is opened
+  uint32_t buffer_frames = kMaxFramesPerBuffer;
+  uint32_t buffer_count = 3;
+  uint32_t buffer_bytes = kMaxBufferBytes;
   bool audout_initialized = false;
   bool audout_started = false;
-  std::array<AudioOutBuffer, kBufferCount> buffers{};
-  std::array<s16*, kBufferCount> samples{};
-  std::array<float, kBufferSamples * 2> mix{};
+  std::array<AudioOutBuffer, kMaxBufferCount> buffers{};
+  std::array<s16*, kMaxBufferCount> samples{};
+  std::array<float, kMaxBufferSamples * 2> mix{};
 };
 
 std::unique_ptr<AudioSystem> SwitchAudioSystem::Create(
@@ -203,8 +215,12 @@ bool SwitchAudioSystem::StartOutput() {
   auto output = std::make_unique<Output>();
   output->pump = REXCVAR_GET(audio_switch_pump);
   output->frames_in_queue = static_cast<size_t>(std::clamp(REXCVAR_GET(audio_switch_frames_in_queue), 2, 32));
-  REXLOG_INFO("SwitchAudioSystem: 187.5 Hz pump {}, {} frames queued", output->pump ? "active" : "off",
-              output->frames_in_queue);
+  output->buffer_frames = static_cast<uint32_t>(std::clamp(REXCVAR_GET(audio_switch_buffer_frames), 1, 4));
+  output->buffer_count = static_cast<uint32_t>(std::clamp(REXCVAR_GET(audio_switch_buffers), 2, 4));
+  output->buffer_bytes = output->buffer_frames * SwitchAudioDriver::kChannelSamples * 2 * sizeof(s16);
+  REXLOG_INFO("SwitchAudioSystem: 187.5 Hz pump {}, {} frames queued, {} buffers of {} frames ({:.1f} ms each)",
+              output->pump ? "active" : "off", output->frames_in_queue, output->buffer_count,
+              output->buffer_frames, output->buffer_frames * 256.0 / 48.0);
 
   Result rc = audoutInitialize();
   if (R_FAILED(rc)) {
@@ -221,7 +237,7 @@ bool SwitchAudioSystem::StartOutput() {
     return false;
   }
 
-  for (size_t i = 0; i < kBufferCount; ++i) {
+  for (size_t i = 0; i < output->buffer_count; ++i) {
     output->samples[i] = static_cast<s16*>(std::aligned_alloc(0x1000, kBufferAllocBytes));
     if (!output->samples[i]) {
       REXLOG_ERROR("SwitchAudioSystem: out of memory for audio buffers");
@@ -234,7 +250,7 @@ bool SwitchAudioSystem::StartOutput() {
     buffer.next = nullptr;
     buffer.buffer = output->samples[i];
     buffer.buffer_size = kBufferAllocBytes;
-    buffer.data_size = kBufferBytes;
+    buffer.data_size = output->buffer_bytes;
     buffer.data_offset = 0;
   }
 
@@ -286,7 +302,9 @@ void SwitchAudioSystem::StopOutput() {
     audoutExit();
   }
   for (s16* samples : output_->samples) {
-    std::free(samples);
+    if (samples) {
+      std::free(samples);
+    }
   }
   output_.reset();
 }
@@ -299,11 +317,15 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
   const float gain = GetOutputGain();
   uint32_t frames_mixed = 0;
   uint32_t frames_missing = 0;
+  uint32_t queued_samples = 0;
+  uint32_t samples_count = 0;
   {
     std::lock_guard<std::mutex> guard(drivers_mutex_);
-    for (uint32_t frame = 0; frame < kFramesPerBuffer; ++frame) {
+    for (uint32_t frame = 0; frame < output.buffer_frames; ++frame) {
       float* out = output.mix.data() + frame * SwitchAudioDriver::kChannelSamples * 2;
       for (SwitchAudioDriver* driver : drivers_) {
+        queued_samples += static_cast<uint32_t>(driver->QueuedFrames());
+        ++samples_count;
         // A client with nothing queued contributes silence and gets no
         // release, exactly as the SDL driver does on underrun.
         if (driver->MixFrameInto(out, fold, gain, !output.pump)) {
@@ -314,16 +336,23 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
       }
     }
   }
+  RexSwitchPerfAdd(28, queued_samples);
+  RexSwitchPerfAdd(29, samples_count);
+
   s16* samples = output.samples[buffer_index];
   bool pcm_nonzero = false;
   // How much the mix saturates before it is clipped (the crackling in handheld mode). Counting only.
   float pico = 0.0f;
   uint32_t saturated = 0;
+  uint32_t non_finite = 0;  // fork (shh-nx, 2026-10-29): NaN or infinite samples, played as silence
+  const uint32_t mix_samples = output.buffer_frames * SwitchAudioDriver::kChannelSamples * 2;
   if (REXCVAR_GET(audio_mute)) {
-    std::memset(samples, 0, kBufferBytes);
+    std::memset(samples, 0, output.buffer_bytes);
   } else {
-    for (size_t i = 0; i < output.mix.size(); ++i) {
-      const float value = std::isfinite(output.mix[i]) ? output.mix[i] : 0.0f;
+    for (size_t i = 0; i < mix_samples; ++i) {
+      const bool finite = std::isfinite(output.mix[i]);
+      non_finite += finite ? 0 : 1;
+      const float value = finite ? output.mix[i] : 0.0f;
       const float magnitude = std::fabs(value);
       pico = std::max(pico, magnitude);
       saturated += magnitude > 1.0f ? 1 : 0;
@@ -332,9 +361,27 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
     }
   }
   RexSwitchPerfAdd(21, saturated);
+  RexSwitchPerfAdd(30, non_finite);
+  // Fork (shh-nx, 2026-10-29, SHH-12): a line every 2 s of whether the output had sound, next to the log's file
+  // opens (the 10 s profile is too coarse to place a video).
+  {
+    static uint32_t buffers = 0, with_sound = 0;
+    static float peak = 0.0f;
+    static auto since = std::chrono::steady_clock::now();
+    ++buffers;
+    with_sound += pcm_nonzero ? 1 : 0;
+    peak = std::max(peak, pico);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds(2)) {
+      REXLOG_INFO("[audio] 2 s: {}/{} buffers with sound, peak {:.3f}", with_sound, buffers, peak);
+      buffers = with_sound = 0;
+      peak = 0.0f;
+      since = now;
+    }
+  }
   RexSwitchPerfAdd(22, pico >= 0.98f ? 1 : 0);
   RexSwitchPerfMax(23, static_cast<u64>(std::min(pico, 100.0f) * 10000.0f));
-  output.buffers[buffer_index].data_size = kBufferBytes;
+  output.buffers[buffer_index].data_size = output.buffer_bytes;
   output.buffers[buffer_index].data_offset = 0;
   Result rc = audoutAppendAudioOutBuffer(&output.buffers[buffer_index]);
   RexSwitchPerfAdd(24, frames_mixed);
@@ -363,7 +410,7 @@ void SwitchAudioSystem::PumpTick() {
 
 void SwitchAudioSystem::OutputThreadMain() {
   Output& output = *output_;
-  for (size_t i = 0; i < kBufferCount; ++i) {
+  for (size_t i = 0; i < output.buffer_count; ++i) {
     FillAndAppend(i);
   }
   const u64 interval = armNsToTicks(kPumpIntervalNs);
@@ -389,7 +436,7 @@ void SwitchAudioSystem::OutputThreadMain() {
     // left out of the rotation.
     while (R_SUCCEEDED(rc) && released && released_count) {
       const ptrdiff_t index = released - output.buffers.data();
-      if (index >= 0 && index < ptrdiff_t(kBufferCount)) {
+      if (index >= 0 && index < ptrdiff_t(output.buffer_count)) {
         FillAndAppend(size_t(index));
       }
       released = nullptr;

@@ -8,8 +8,9 @@
 
 namespace sa2::render {
 
-// The current mode: the PC is the game's own 720p, so never docked.
-inline bool Docked() { return false; }
+// The current mode. shh-nx (2026-10-29, shh_resolution): the console's (docked / handheld, Reverse-NX respected,
+// sa2_render_mode.cpp); the PC is never docked.
+bool Docked();
 
 // The render height set for a mode: the game's 720.
 inline int32_t RenderHeightOf(bool /*docked*/) { return 720; }

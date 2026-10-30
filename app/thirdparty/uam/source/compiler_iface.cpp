@@ -678,13 +678,27 @@ std::unique_ptr<DekoCompiler> DekoCompiler::CompileBest(pipeline_stage stage, co
 {
 	// banjo-nx (2026-10-19, banjo_deko3d_gpr32): a variant with constant 910 = 1 (plume writes its define ahead of the
 	// text) is compiled with 32 GPRs at most: every warp slot of the SM, spilling what does not fit.
+	// shh-nx (2026-10-29, shh_deko3d_gpr_cap): a value of 16-64 is the cap itself (1 stays 32).
 	struct Cap {
-		explicit Cap(const char* text) { nv50_ir_set_banjo_gpr_cap(strstr(text, "SPIRV_CROSS_CONSTANT_ID_910 1u") ? 32 : 0); }
+		static int Of(const char* text) {
+			const char* d = strstr(text, "#define SPIRV_CROSS_CONSTANT_ID_910 ");
+			const int v = d ? atoi(d + 36) : 0;
+			return v == 1 ? 32 : (v >= 16 && v <= 64 ? v : 0);
+		}
+		explicit Cap(const char* text) { nv50_ir_set_banjo_gpr_cap(Of(text)); }
 		~Cap() { nv50_ir_set_banjo_gpr_cap(0); }
 	} cap(glsl);
 	std::unique_ptr<DekoCompiler> best(new DekoCompiler(stage, optLevel));
 	if (!best->CompileGlsl(glsl))
-		return nullptr;
+	{
+		// shh-nx (2026-10-29): a cap the register allocator cannot meet fails the compile; then without it.
+		if (!Cap::Of(glsl))
+			return nullptr;
+		nv50_ir_set_banjo_gpr_cap(0);
+		best.reset(new DekoCompiler(stage, optLevel));
+		if (!best->CompileGlsl(glsl))
+			return nullptr;
+	}
 	const unsigned flags = nv50_ir_get_banjo_flags();
 	if (stage != pipeline_stage_fragment || !(flags & 16))
 		return best;

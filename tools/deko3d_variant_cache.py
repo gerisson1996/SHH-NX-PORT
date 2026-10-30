@@ -109,8 +109,10 @@ def read_cache(path):
 # ...). PipelineKey: two shader hashes (u64), layout hash, topology, 4 colour formats, depth format, colour count,
 # samples, 4 blend controls, 9 more u32 fields (offset 108 on), bool_mask[8], bool_values[8], blend_skip, output_trim;
 # version 4 (2026-10-18) adds alpha_func at 180 (constant 903 + 1, banjo_deko3d_alpha_spec; version 3 had padding there)
-# and a reserved word.
-LIST_KEY_SIZES = {3: 184, 4: 192}
+# and a reserved word. shh-nx: version 5 (2026-10-30) has depth_bias_constant / slope at 184 / 188, bound_types[16] at
+# 192 (constant 920 + i of the vertex shader, shh_deko3d_bound_spec) and the reserved word at 256.
+LIST_KEY_SIZES = {3: 184, 4: 192, 5: 264}
+OFF_BOUND_TYPES = 192
 LIST_KEY_SIZE = 184
 OFF_BOOL_MASK, OFF_BOOL_VALUES, OFF_BLEND_SKIP, OFF_OUTPUT_TRIM, OFF_ALPHA_FUNC = 108, 140, 172, 176, 180
 OFF_PER_INSTANCE, OFF_RECT_LIST, OFF_POINT_SPRITE = 96, 100, 104
@@ -211,7 +213,7 @@ def read_list(path, blend_skip_on, alpha_guess=ALPHA_GUESS):
     data = open(path, 'rb').read()
     magic, version, key_size, streams = struct.unpack_from('<4sIII', data, 0)
     if magic != b'RNPL' or LIST_KEY_SIZES.get(version) != key_size:
-        sys.exit(f'deko3d_variant_cache: {path}: not a version 3 or 4 pipeline list ({magic}, {version}, {key_size})')
+        sys.exit(f'deko3d_variant_cache: {path}: not a version 3, 4 or 5 pipeline list ({magic}, {version}, {key_size})')
     at = 16
     out = []
     while at + 4 <= len(data):
@@ -226,6 +228,7 @@ def read_list(path, blend_skip_on, alpha_guess=ALPHA_GUESS):
         alpha_func = struct.unpack_from('<I', data, at + OFF_ALPHA_FUNC)[0] if version >= 4 else 0
         per_instance, rect_list, point_sprite = struct.unpack_from('<III', data, at + OFF_PER_INSTANCE)
         depth_control, stencil_ref_mask = struct.unpack_from('<II', data, at + OFF_DEPTH_CONTROL)
+        bound = struct.unpack_from('<16I', data, at + OFF_BOUND_TYPES) if version >= 5 else (0,) * 16
         at += size
         tail = {FLAG_TESS: per_instance, FLAG_GS: rect_list | point_sprite,
                 FLAG_DEPTH_WRITES: depth_writes(depth_control, stencil_ref_mask)}
@@ -240,9 +243,12 @@ def read_list(path, blend_skip_on, alpha_guess=ALPHA_GUESS):
             for b in range(32):
                 if mask[w] >> b & 1:
                     spec[1000 + w * 32 + b] = values[w] >> b & 1
+        for i, t in enumerate(bound):
+            if t:
+                spec[920 + i] = t
         hashes = (f'{vs:016X}', f'{ps:016X}')
         out.append((hashes, spec))
-        if any(mask) or alpha_func:
+        if any(mask) or alpha_func or any(bound):
             out.append((hashes, tail))  # the generic pipeline a specialised key draws with until it is built
         if not alpha_func and ps:
             for guess in alpha_guess:
@@ -351,6 +357,9 @@ def main():
             # banjo_deko3d_light_branch on (constant 911 = 1, 2026-10-20, an A/B) too, for the pixel shaders that have it
             if prefix == 'ps' and any(cid == 911 for cid, _ in shader[1]):
                 sspecs += [{**s, 911: 1} for s in list(sspecs) if 908 not in s and 910 not in s]
+            # shh-nx: shh_deko3d_light_gate (constant 914 = 1 in every pixel pipeline, 2026-10-30) and its A/B's off half
+            if prefix == 'ps' and any(cid == 914 for cid, _ in shader[1]):
+                sspecs += [{**s, 914: 1} for s in list(sspecs)]
             for sspec in sspecs:
                 defines = variant_defines(shader[1], sspec)
                 if (prefix, h, defines) in seen:

@@ -16,9 +16,14 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
+#include <rex/memory/utils.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -39,9 +44,145 @@
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
 
+// shh-nx (2026-10-29, docs/perfil-shh.md SHH-13): where the guest's threads wait. The boot takes ~38 s on the Switch
+// against ~2 s on the PC, with the main thread mostly idle and the files read in well under a second, so something
+// is waited on. Each kernel wait (delays included) adds its wall time to its thread and call site (the import's
+// return address and two frames above it, from the guest stack's back chain); the worst sites go to the log.
+REXCVAR_DEFINE_DOUBLE(kernel_wait_profile_s, 60.0, "Kernel",
+                      "Log where guest threads wait, every 5 s, for this many host seconds after launch (0: off)");
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 using rex::runtime::current_ppc_context;
+
+namespace {
+
+struct WaitSite {
+  uint32_t thread_id;
+  uint32_t lr[3];
+  uint32_t kind;
+  bool operator==(const WaitSite&) const = default;
+};
+struct WaitSiteHash {
+  size_t operator()(const WaitSite& s) const {
+    uint64_t h = s.thread_id * 0x9E3779B97F4A7C15ull;
+    for (uint32_t v : s.lr) h = (h ^ v) * 0x100000001B3ull;
+    return size_t(h ^ s.kind);
+  }
+};
+struct WaitTotals {
+  uint64_t count = 0;
+  uint64_t ns = 0;
+  std::string thread;
+};
+
+const char* const kWaitKinds[] = {"delay",          "wait one",          "wait one (handle)", "wait several",
+                                   "wait several (handle)", "D3D fence", "frame queue", "critical section"};
+
+class WaitProfile {
+ public:
+  WaitProfile() {
+    const double s = REXCVAR_GET(kernel_wait_profile_s);
+    if (s <= 0.0)
+      return;
+    start_ = std::chrono::steady_clock::now();
+    stop_ = start_ + std::chrono::microseconds(int64_t(s * 1e6));
+    active_ = true;
+  }
+  bool active() const { return active_; }
+
+  void Add(uint32_t kind, uint64_t ns) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now > stop_)
+      return;
+    WaitSite site{};
+    site.kind = kind;
+    std::string name;
+    if (XThread* t = XThread::GetCurrentThread()) {
+      site.thread_id = t->thread_id();
+      name = t->name();
+    }
+    if (auto* ctx = current_ppc_context()) {
+      site.lr[0] = uint32_t(ctx->lr);
+      // The back chain: [sp] is the caller's sp, and the recompiled prologues keep LR at [caller sp - 8].
+      auto* mem = REX_KERNEL_MEMORY();
+      uint32_t sp = uint32_t(ctx->r1.u64);
+      for (int k = 1; k < 3; ++k) {
+        if (sp < 0x70000000u || sp >= 0x80000000u || (sp & 3))
+          break;
+        const uint32_t back = rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(sp));
+        if (back <= sp || back >= 0x80000000u)
+          break;
+        const uint32_t lr = rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(back - 8));
+        if (lr < 0x82000000u || lr >= 0x84000000u)
+          break;
+        site.lr[k] = lr;
+        sp = back;
+      }
+    }
+    std::lock_guard lock(mutex_);
+    WaitTotals& w = sites_[site];
+    ++w.count;
+    w.ns += ns;
+    if (w.thread.empty())
+      w.thread = std::move(name);
+    if (now - last_report_ >= std::chrono::seconds(5))
+      ReportLocked(now);
+  }
+
+ private:
+  void ReportLocked(std::chrono::steady_clock::time_point now) {
+    last_report_ = now;
+    std::vector<std::pair<WaitSite, WaitTotals>> top(sites_.begin(), sites_.end());
+    sites_.clear();
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    const double t = std::chrono::duration<double>(now - start_).count();
+    REXKRNL_INFO("[waits] {:.0f} s: {} sites in the last 5 s; the worst:", t, top.size());
+    for (size_t i = 0; i < top.size() && i < 12; ++i) {
+      const auto& [s, w] = top[i];
+      REXKRNL_INFO("[waits]   {:7.1f} ms in {:6} {} by thread {:X} '{}' from {:08X} < {:08X} < {:08X}",
+                   w.ns / 1e6, w.count, kWaitKinds[s.kind], s.thread_id, w.thread, s.lr[0], s.lr[1], s.lr[2]);
+    }
+  }
+
+  bool active_ = false;
+  std::chrono::steady_clock::time_point start_, stop_, last_report_;
+  std::mutex mutex_;
+  std::unordered_map<WaitSite, WaitTotals, WaitSiteHash> sites_;
+};
+
+WaitProfile& GetWaitProfile() {
+  static WaitProfile profile;
+  return profile;
+}
+
+// Times one kernel wait for the profile above; a no-op with it off.
+class ScopedWaitTimer {
+ public:
+  explicit ScopedWaitTimer(uint32_t kind) : kind_(kind) {
+    if (GetWaitProfile().active())
+      start_ = std::chrono::steady_clock::now();
+  }
+  ~ScopedWaitTimer() {
+    if (start_ != std::chrono::steady_clock::time_point{})
+      GetWaitProfile().Add(kind_, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - start_)
+                                               .count()));
+  }
+
+ private:
+  uint32_t kind_;
+  std::chrono::steady_clock::time_point start_{};
+};
+
+}  // namespace
+
+bool GuestWaitProfileActive() { return GetWaitProfile().active(); }
+
+void ProfileGuestWait(uint32_t kind, uint64_t ns) {
+  if (GetWaitProfile().active())
+    GetWaitProfile().Add(kind, ns);
+}
 
 // r13 + 0x100: pointer to thread local state
 // Thread local state:
@@ -374,6 +515,7 @@ u32 KeQueryPerformanceFrequency_entry() {
 }
 
 u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
+  ScopedWaitTimer wait_timer(0);
   XThread* thread = XThread::GetCurrentThread();
 
   if (alertable) {
@@ -838,6 +980,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
 
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
+  ScopedWaitTimer wait_timer(1);
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
   // timeout={}",
@@ -852,6 +995,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  ScopedWaitTimer wait_timer(2);
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
@@ -871,6 +1015,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
 u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
+  ScopedWaitTimer wait_timer(3);
   assert_true(wait_type <= 1);
 
   std::vector<object_ref<XObject>> objects;
@@ -919,6 +1064,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
 
 u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
                                      u32 alertable, mapped_u64 timeout_ptr) {
+  ScopedWaitTimer wait_timer(4);
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                       timeout_ptr ? &timeout : nullptr);

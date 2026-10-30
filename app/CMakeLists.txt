@@ -77,7 +77,7 @@ if(REXGLUE_PLATFORM_SWITCH)
     endif()
     rexglue_switch_add_nro(shh
         NAME "Silent Hill Homecoming"
-        AUTHOR "shh-nx"
-        VERSION "0.1.0"
+        AUTHOR "RECOMP-GUTO"
+        VERSION "1.0"
         ${SHH_ICON_ARG})
 endif()

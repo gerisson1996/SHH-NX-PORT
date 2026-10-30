@@ -1007,6 +1007,7 @@ uint64_t g_texture_epoch = 1;  // banjo-nx (2026-10-19, CPU proposal 2)
 uint64_t g_depth_epoch = 1;    // banjo-nx (2026-10-19, render-thread proposal 3)
 
 void AdvanceTextureFrameLocked() {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   ++g_frame;
   g_texture_frame = g_frame;
   ApplyUnlocksLocked();
@@ -1018,6 +1019,7 @@ void AdvanceTextureFrameLocked() {
 }
 
 void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   if (!size)
     return;
   const u32 first_page = (physical & 0x1FFFFFFFu) >> 12;
@@ -1055,6 +1057,7 @@ HostTexture *FindHostTextureLocked(u32 texture_va) {
 }
 
 void ReleaseHostTextureLocked(u32 texture_va) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   auto it = g_textures.find(texture_va);
   if (it == g_textures.end())
     return;

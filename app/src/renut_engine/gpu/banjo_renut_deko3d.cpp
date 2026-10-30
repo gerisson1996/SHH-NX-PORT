@@ -234,9 +234,13 @@ bool PackageScales() {
   // installer page) has every texture's scale code folded to 0: drawn above 1x, its shaders would take host texel
   // sizes for guest ones. The passes leave the code's read, "(... >> 26u) & 7u", in every shader that has one (SA2:
   // 5 pixel shaders without scale1, none with it), so a package scales when each package in use has it somewhere.
+  // shh-nx (2026-10-29): Silent Hill's shaders never read a texture's scale code (none of the 893 has it), so that
+  // test always failed. What they do read is SharedConstants.resolution_scale (127 shaders, gl_FragCoord / scale),
+  // which the pass fragscale folds to 1: a package with that word left scales too.
   static const bool scales = [] {
     Packages &all = Open();
     static constexpr char kScaleCode[] = ">> 26u) & 7u";
+    static constexpr char kResolutionScale[] = "uintBitsToFloat(g_UboShared.v[83u].z)";
     bool any = false;
     for (Package &p : all.source) {
       if (!p.ok)
@@ -253,7 +257,9 @@ bool PackageScales() {
                                 : ZSTD_decompressDCtx(p.dctx, text.data(), e.size, p.data + e.offset, e.compressedSize);
         if (ZSTD_isError(n) || n != e.size)
           continue;
-        found = std::search(text.begin(), text.end(), kScaleCode, kScaleCode + sizeof(kScaleCode) - 1) != text.end();
+        found = std::search(text.begin(), text.end(), kScaleCode, kScaleCode + sizeof(kScaleCode) - 1) != text.end() ||
+                std::search(text.begin(), text.end(), kResolutionScale,
+                            kResolutionScale + sizeof(kResolutionScale) - 1) != text.end();
       }
       if (!found) {
         REXLOG_WARN("[deko3d] the {} GLSL package was made for 1280x720 only (pass scale1): the game draws at "

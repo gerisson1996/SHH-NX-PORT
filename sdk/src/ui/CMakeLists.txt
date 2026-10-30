@@ -39,6 +39,8 @@ set(REXUI_OVERLAY_SOURCES
     overlay/console_overlay.cpp
     overlay/console_commands.cpp
     overlay/settings_overlay.cpp
+    overlay/quick_settings.cpp
+    overlay/boot_screen.cpp
 )
 
 # Vulkan UI backend

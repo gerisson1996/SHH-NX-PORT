@@ -11,6 +11,9 @@
 #include <utility>
 #include <fmt/format.h>
 #include <string>
+#include <rex/kernel/xboxkrnl/threading.h>
+
+#include "renut_engine/gpu/render/draw.h"
 #include <rex/frame_latency.h>
 #include <rex/input/read_hook.h>  // sa2-nx (2026-10-20): late input on SA2's reads
 #include <vector>
@@ -70,6 +73,7 @@ using Clock = std::chrono::steady_clock;
 struct Item {
   std::function<void()> work;
   bool locked = true;  // run with State().mutex held
+  bool resolve = false;  // shh-nx (shh_renut_resolve_halves): a resolve's (a waiting first half stays for it)
   const void *prefetch[2] = {};  // sa2-nx (2026-10-20, sa2_renut_prefetch_next): fetched while the item before runs
 };
 
@@ -191,8 +195,14 @@ thread_local bool t_render_thread = false;
 void Execute(Item &item) {
   if (item.locked) {
     std::lock_guard lock(State().mutex);
+    if (!item.resolve)
+      FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves): before any other work
     item.work();
   } else {
+    if (DeferredResolvePending()) {
+      std::lock_guard lock(State().mutex);
+      FlushDeferredResolveLocked();
+    }
     item.work();
   }
 }
@@ -450,10 +460,10 @@ bool PushRing(Item &&item, bool draw) {
 }
 
 void Push(std::function<void()> work, bool locked, const void *prefetch0 = nullptr,
-          const void *prefetch1 = nullptr, bool draw = false) {
+          const void *prefetch1 = nullptr, bool draw = false, bool resolve = false) {
   Start();
   if (LockfreeOn()) {  // sa2-nx (sa2_renut_lockfree_queue)
-    Item item{std::move(work), locked, {prefetch0, prefetch1}};
+    Item item{std::move(work), locked, resolve, {prefetch0, prefetch1}};
     if (g_accepting.load(std::memory_order_acquire) && PushRing(std::move(item), draw))
       return;
     // Stopping, or the render thread's own item in a full ring: run here, as a push while stopping did.
@@ -464,7 +474,7 @@ void Push(std::function<void()> work, bool locked, const void *prefetch0 = nullp
     std::unique_lock lock(g_mutex);
     // (Work queued by the render thread's own work runs after it.)
     if (g_running && !g_stopping) {
-      g_queue.push_back({std::move(work), locked, {prefetch0, prefetch1}});
+      g_queue.push_back({std::move(work), locked, resolve, {prefetch0, prefetch1}});
       ++g_items_queued;
       // sa2-nx (sa2_renut_wake_batch): a draw wakes a sleeping render thread once enough are queued.
       const bool wake = (g_render_waiting && (!draw || g_queue.size() >= WakeBatch())) ||
@@ -476,7 +486,7 @@ void Push(std::function<void()> work, bool locked, const void *prefetch0 = nullp
     }
   }
   // Shutting down: nothing takes work any more, so run it here.
-  Item item{std::move(work), locked, {}};
+  Item item{std::move(work), locked, resolve, {}};
   Execute(item);
 }
 
@@ -488,6 +498,10 @@ void Queue(std::function<void()> work) {
 
 void QueueUnlocked(std::function<void()> work) {
   Push(std::move(work), false);
+}
+
+void QueueResolveWork(std::function<void()> work) {
+  Push(std::move(work), true, nullptr, nullptr, false, true);
 }
 
 void QueuePrefetched(const void *prefetch0, const void *prefetch1, std::function<void()> work) {
@@ -661,6 +675,8 @@ uint64_t QueueFrame(std::function<void()> work) {
   lock.unlock();
   const auto waited = std::chrono::steady_clock::now() - waiting;
   frame_stats::OnGameThreadWait(std::chrono::duration<double, std::milli>(waited).count());
+  rex::kernel::xboxkrnl::ProfileGuestWait(  // shh-nx (SHH-13)
+      6, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()));
   // banjo-nx (2026-10-19, banjo_late_input): this frame's slack (the game thread only: one Swap at a time).
   {
     // The game's frame interval (the game thread only), averaged over about 16 frames.

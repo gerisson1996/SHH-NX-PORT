@@ -29,6 +29,8 @@ namespace renut::gpu::render_thread {
 // Runs 'work' on the render thread after everything queued before it, with
 // State().mutex held.
 void Queue(std::function<void()> work);
+// shh-nx (2026-10-30): Queue for a resolve (a first half waiting for its second stays: shh_renut_resolve_halves).
+void QueueResolveWork(std::function<void()> work);
 
 // The same without taking State().mutex, for work that takes it itself
 // (Video::Present, record destruction).

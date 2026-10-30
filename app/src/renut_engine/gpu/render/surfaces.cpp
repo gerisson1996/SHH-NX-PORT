@@ -13,6 +13,7 @@
 #include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"
 #include "renut_engine/gpu/d3d/d3d.h"
+#include "renut_engine/gpu/render/draw.h"
 #include "renut_engine/gpu/render/format.h"
 #include "renut_engine/gpu/render/graphics_options.h"
 #include "renut_engine/gpu/render/textures.h"
@@ -40,6 +41,18 @@ REXCVAR_DEFINE_STRING(renut_resolution, "720p", "Nuts&Bolts/Graphics",
                       "Internal render resolution, by its height: 480p, 720p (the game's own), "
                       "1080p, 1440p or 4K (2160 lines). Applies from the next frame.")
     .allowed({"480p", "720p", "1080p", "1440p", "4K"});
+// shh-nx (2026-10-29, docs/perfil-shh.md SHH-10, the user's request): the render resolution of the game's menu (shh_menu.h):
+// 480p, 600p and 720p in both modes; 1080p docked only (handheld, where the GPU clock is lower, it draws at 720p).
+REXCVAR_DEFINE_STRING(shh_resolution, "720p", "Silent Hill/Renut",
+                      "Render resolution: 480p, 600p, 720p (the game's own) or 1080p (docked only; 720p in handheld "
+                      "mode). Applies from the next frame")
+    .allowed({"480p", "600p", "720p", "1080p"});
+// shh-nx (2026-10-29, the user's request): docked, the console draws at its own resolution, 1080p by default: the dock
+// raises it on its own and the handheld mode gets shh_resolution back. shh_resolution = "1080p" (the older setting)
+// still means 1080p docked and 720p in handheld mode.
+REXCVAR_DEFINE_STRING(shh_resolution_docked, "1080p", "Silent Hill/Renut",
+                      "Render resolution docked: 480p, 600p, 720p or 1080p. Applies from the next frame")
+    .allowed({"480p", "600p", "720p", "1080p"});
 // sa2-nx (2026-10-20, the user's request: MSAA for the final build, 2x): SA2 makes every render target single-sample,
 // so Renut's multisampling (N&B's targets are multisampled: banjo-nx's resolves, depth resolves and readbacks of them)
 // never ran. The game's single-sample targets get this many samples on the host, as the native renderer's sa2_msaa did;
@@ -51,6 +64,14 @@ REXCVAR_DEFINE_INT32(sa2_renut_msaa, 0, "SA2/Renderer",
                      "CPU time and memory (8x: about 30 MB more for each 1280x720 target). Read at start")
     .range(0, 8)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// shh-nx (2026-10-29, docs/perfil-shh.md SHH-07): SHH draws its scene into 2x multisampled targets (the reason for its
+// two tiles on the 360), which on the Switch doubles the scene's depth and colour traffic and makes its depth and
+// colour resolves multisample ones. With this the game's 2x targets are single-sample on the host: the same pixels
+// shaded, without the edge smoothing; the resolves become copies (and the scene's depth one a hand-over).
+REXCVAR_DEFINE_BOOL(shh_renut_single_sample, false, "Silent Hill/Renut",
+                    "Renut's renderer: the game's 2x multisampled render targets are single-sample on the host (less "
+                    "GPU time, no edge smoothing). Read at start")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);  // the menu sets it for the next start
 
 namespace renut::gpu {
 
@@ -208,7 +229,11 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
   const uint32_t host_height = surface.scale.Size(surface.height);
   surface.depth = d3d::IsDepthFormat(surface.format_word);
   surface.samples = SampleCount(surface.info_word);
-  if (surface.samples == plume::RenderSampleCount::COUNT_1) {
+  // shh-nx (shh_renut_single_sample): only 2x; the 4x surfaces are Direct3D's fast Clear aliases.
+  static const bool single_sample = REXCVAR_GET(shh_renut_single_sample);
+  if (single_sample && surface.samples == plume::RenderSampleCount::COUNT_2)
+    surface.samples = plume::RenderSampleCount::COUNT_1;
+  else if (surface.samples == plume::RenderSampleCount::COUNT_1) {
     // sa2-nx (2026-10-20, sa2_renut_msaa): the game's single-sample targets multisampled on the host.
     static const plume::RenderSampleCounts forced = [] {
       const int32_t n = REXCVAR_GET(sa2_renut_msaa);
@@ -258,9 +283,9 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
     return false;
   }
   surface.texture->setName(surface.depth ? "renut depth surface" : "renut color surface");
-  RGPU_DEBUG("Surface {:08X}: {}x{} (x{:.3g} scale) {} format {} x{} samples", surface.guest_va,
+  RGPU_DEBUG("Surface {:08X}: {}x{} (x{:.3g} scale) {} format {} (guest {}) x{} samples", surface.guest_va,
              surface.width, surface.height, surface.scale.Factor(), surface.depth ? "depth" : "color",
-             u32(surface.format), u32(surface.samples));
+             u32(surface.format), (u32(desc.ColorInfo) >> 16) & 0xF, u32(surface.samples));
   return true;
 }
 
@@ -299,6 +324,26 @@ void LatchResolutionScaleLocked() {
       mode = {};
     }
     scale = mode;
+  }
+  // shh-nx (shh_resolution): over the mode's height; 1080p only docked.
+  {
+#if defined(__SWITCH__)
+    const bool shh_docked = sa2::render::Docked();
+#else
+    const bool shh_docked = true;  // the PC has no handheld mode: shh_resolution, with 1080p
+#endif
+    // Docked: shh_resolution_docked, unless shh_resolution asks 1080p (the older way to say it).
+    const std::string &shh = shh_docked && REXCVAR_GET(shh_resolution) != "1080p"
+#if defined(__SWITCH__)
+                                 ? REXCVAR_GET(shh_resolution_docked)
+#else
+                                 ? REXCVAR_GET(shh_resolution)
+#endif
+                                 : REXCVAR_GET(shh_resolution);
+    scale = RenderScale{shh == "480p"                  ? 1u
+                        : shh == "600p"                ? 6u
+                        : shh == "1080p" && shh_docked ? 2u
+                                                       : 0u};
   }
   // banjo-nx (2026-10-18): the deko3d renderer drew at the console's resolution only; its shaders were made for it
   // (tools/deko3d_glsl_opt.py, pass scale1: no per-texture scale divisor, resolution_scale 1). sa2-nx (1.0.3.1): the
@@ -512,6 +557,7 @@ void SurfaceMemoryLocked(size_t &targets, uint64_t &bytes) {
 }
 
 void ReleaseHostSurfaceLocked(u32 surface_va) {
+  FlushDeferredResolveLocked();  // shh-nx (shh_renut_resolve_halves)
   auto it = g_surface_keys.find(surface_va);
   if (it == g_surface_keys.end())
     return;

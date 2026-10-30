@@ -43,6 +43,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -491,14 +492,33 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
   const auto delta = [&](unsigned id) { return double(counters_now[id] - counters_last[id]); };
   const double frames = delta(0);
   // Mix clipping before conversion to 16 bits (21 samples above 1.0, 22 buffers with a peak of 0.98 or
-  // more, 23 maximum peak of the interval in ten-thousandths) and the console mode, for the crackling
-  // in handheld mode.
+  // more, 23 maximum peak of the interval in ten-thousandths), audio latency estimate (28 queued frames at mix
+  // time, 29 mix query samples), and the console mode, for the crackling in handheld mode.
   const u64 audio_peak = g_counters[23].exchange(0, std::memory_order_relaxed);
+  const double q_sum = delta(28);
+  const double q_count = delta(29);
+  const double avg_queue = q_count > 0.0 ? (q_sum / q_count) : 0.0;
+  const double queue_ms = avg_queue * (256.0 / 48.0);
+  int buf_frames = 4;
+  int bufs = 3;
+  const std::string s_bf = rex::cvar::GetFlagByName("audio_switch_buffer_frames");
+  if (!s_bf.empty()) {
+    buf_frames = std::clamp(static_cast<int>(std::strtol(s_bf.c_str(), nullptr, 10)), 1, 4);
+  }
+  const std::string s_b = rex::cvar::GetFlagByName("audio_switch_buffers");
+  if (!s_b.empty()) {
+    bufs = std::clamp(static_cast<int>(std::strtol(s_b.c_str(), nullptr, 10)), 2, 4);
+  }
+  const double audout_ms = (bufs - 1) * buf_frames * (256.0 / 48.0);
+  const double total_lat_ms = queue_ms + audout_ms;
   std::fprintf(f,
                "     audio: %.0f client blocks mixed, %.0f requests without data, "
-               "%.0f/%.0f audout buffers with non-zero PCM, %.0f saturated samples (above 1.0 before clipping), "
-               "%.0f buffers with a peak of 0.98 or more, maximum peak %.3f | console in %s mode\n",
-               delta(24), delta(25), delta(26), delta(27), delta(21), delta(22), double(audio_peak) / 10000.0,
+               "%.0f/%.0f audout buffers with non-zero PCM, %.0f NaN/infinite samples (played as silence), "
+               "%.0f saturated samples (above 1.0 before clipping), "
+               "%.0f buffers with a peak of 0.98 or more, maximum peak %.3f, "
+               "latency ~%.1f ms (queue %.1f f / %.1f ms + audout %d buffers / %.1f ms) | console in %s mode\n",
+               delta(24), delta(25), delta(26), delta(27), delta(30), delta(21), delta(22), double(audio_peak) / 10000.0,
+               total_lat_ms, avg_queue, queue_ms, bufs - 1, audout_ms,
                rex::ui::switch_saltynx::BaseMode(appletGetOperationMode() == AppletOperationMode_Console)
                    ? "docked"
                    : "handheld");
@@ -1268,7 +1288,9 @@ void RexSwitchPerfCount(unsigned id) {
  * 12 render targets transferred, 13 transfer draws, 14 textures loaded,
  * 15 shared memory bytes uploaded, 16 pipelines created, 17 physical memory
  * chunks committed on touch, 18 chunks mapped into a view on touch,
- * 21 clipped audio samples, 22 audio buffers with a peak of 0.98 or more.
+ * 21 clipped audio samples, 22 audio buffers with a peak of 0.98 or more,
+ * 23 max peak, 24 mixed frames, 25 missing frames, 26 non-zero pcm buffers, 27 appended buffers,
+ * 28 queued frames at mix time, 29 mix query count.
  */
 void RexSwitchPerfAdd(unsigned id, u64 value) {
   if (id < kCounterCount) {

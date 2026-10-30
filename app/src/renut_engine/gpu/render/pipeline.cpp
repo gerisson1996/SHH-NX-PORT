@@ -59,8 +59,45 @@ REXCVAR_DEFINE_BOOL(banjo_deko3d_variant_log, false, "Banjo/Renut",
 REXCVAR_DEFINE_STRING(renut_pipeline_list, "pipeline_list.bin", "Nuts&Bolts/Graphics",
                       "The pipelines the renderer has built, which it builds ahead of use at the "
                       "next start (delete it to start over)");
+// shh-nx (2026-10-30): the deko3d GLSL's bound-fetch types (tools/deko3d_glsl_opt.py, pass boundtype) only; the PC's
+// SPIR-V has no constants 920-935, so there the keys would only multiply.
+REXCVAR_DEFINE_BOOL(shh_deko3d_bound_spec,
+#if defined(__SWITCH__)
+                    true,
+#else
+                    false,
+#endif
+                    "Silent Hill/Renut",
+                    "deko3d renderer: the element types of the vertex inputs a vertex shader fetches by another index "
+                    "(vfetchBound: SHH's bone rows) as specialization constants 920-935, so the shader's run-time format "
+                    "switches go (the skinned vertex shaders from ~90 KB of code to ~22 KB). Pipelines per type, built "
+                    "while the draws use the generic one. Read at start")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// shh-nx (2026-10-30): the deko3d GLSL's light gate (tools/deko3d_glsl_opt.py, pass lightgate, constant 914).
+REXCVAR_DEFINE_BOOL(shh_deko3d_light_gate,
+#if defined(__SWITCH__)
+                    true,
+#else
+                    false,
+#endif
+                    "Silent Hill/Renut",
+                    "deko3d renderer: in SHH's lit pixel shaders each point light's work runs only where a pixel of "
+                    "the warp is in its range (constant 914); out of it the light adds exactly 0, so the same pixels. "
+                    "In-run A/B: banjo_renut_ab_target 19. Read at start")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace renut::gpu {
+
+bool BoundSpecOn() {
+  static const bool on = REXCVAR_GET(shh_deko3d_bound_spec);
+  return on;
+}
+
+bool LightGateOn() {
+  static const bool on = REXCVAR_GET(shh_deko3d_light_gate);
+  return on;
+}
 
 namespace {
 
@@ -302,6 +339,9 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   desc.frontFace = (key.mode_control & 4) ? plume::RenderFrontFace::CLOCKWISE
                                           : plume::RenderFrontFace::COUNTER_CLOCKWISE;
   desc.depthClipEnabled = true;
+  // shh-nx (2026-10-29): the game's polygon offset (PipelineKey::depth_bias_constant).
+  desc.depthBias = i32(key.depth_bias_constant);
+  desc.slopeScaledDepthBias = std::bit_cast<float>(key.depth_bias_slope);
 
   // RB_DEPTHCONTROL.
   const u32 dc = key.depth_control;
@@ -346,7 +386,7 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
 
   // banjo-nx (banjo_gpu_bool_spec): the key's bools as the shaders' specialization constants (banjo_bool_spec.h). One
   // list for every stage: a stage takes the ids it declares (vertex and pixel shader bools have distinct ones).
-  plume::RenderSpecConstant spec[272];  // 256 bools and 900-908
+  plume::RenderSpecConstant spec[304];  // 256 bools, 900-914 and 920-935
   uint32_t spec_count = 0;
   for (uint32_t w = 0; w < 8; ++w) {
     for (uint32_t m = key.bool_mask[w]; m; m &= m - 1) {
@@ -391,7 +431,7 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   // banjo-nx (2026-10-19, GPU, A/B): the listed pixel shaders compiled with 32 GPRs at most (constant 910).
   // (key.reserved bit 1: the off half of the in-run A/B, banjo_renut_ab_target 16.)
   if (key.pixel_shader && banjo::renut_gpu::Gpr32On() && !(key.reserved & 2u))
-    spec[spec_count++] = plume::RenderSpecConstant(910, 1);
+    spec[spec_count++] = plume::RenderSpecConstant(910, banjo::renut_gpu::GprCap());  // shh-nx: the cap itself
   // banjo-nx (2026-10-20, GPU A/B): the listed lit shaders' lights in branches (constant 911, pass lightbranch).
   // (key.reserved bit 0: the off half of the in-run A/B, banjo_renut_ab_target 15.)
   if (key.pixel_shader && banjo::renut_gpu::LightBranchOn() && !(key.reserved & 1u))
@@ -399,6 +439,15 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   // banjo-nx (2026-10-20, diagnostic): the fur family without its pixel work (constant 912, pass nullps).
   if (key.pixel_shader && banjo::renut_gpu::NullPsOn())
     spec[spec_count++] = plume::RenderSpecConstant(912, 1);
+  // shh-nx (2026-10-30, shh_deko3d_light_gate): point lights skipped by warps out of their range (constant 914).
+  // (key.reserved bit 2: the off half of the in-run A/B, banjo_renut_ab_target 19.)
+  if (key.pixel_shader && LightGateOn() && !(key.reserved & 4u))
+    spec[spec_count++] = plume::RenderSpecConstant(914, 1);
+  // shh-nx (2026-10-30, shh_deko3d_bound_spec): the bound fetches' element types (+1), the vertex shader's 920 + i.
+  for (uint32_t i = 0; i < 16; ++i) {
+    if (key.bound_types[i])
+      spec[spec_count++] = plume::RenderSpecConstant(920 + i, key.bound_types[i]);
+  }
   desc.specConstants = spec_count ? spec : nullptr;
   desc.specConstantsCount = spec_count;
   if (REXCVAR_GET(banjo_deko3d_variant_log)) {
@@ -462,8 +511,8 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
 
 constexpr char kListMagic[4] = {'R', 'N', 'P', 'L'};
 // banjo-nx: 2, the key's bool words (banjo_gpu_bool_spec); 3, output_trim; 4, alpha_func (a version 3 list is kept,
-// LoadList).
-constexpr u32 kListVersion = 4;
+// LoadList). shh-nx: 5, bound_types (shh_deko3d_bound_spec; a version 4 list is started over).
+constexpr u32 kListVersion = 5;
 constexpr u32 kListV3KeySize = 184;  // the key up to output_trim
 
 struct ListHeader {
@@ -588,6 +637,8 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
     std::memset(job.key.bool_mask, 0, sizeof(job.key.bool_mask));
     std::memset(job.key.bool_values, 0, sizeof(job.key.bool_values));
   }
+  if (!BoundSpecOn())
+    std::memset(job.key.bound_types, 0, sizeof(job.key.bound_types));
   job.key.reserved = 0;
   job.hash = HashKey(job.key);
   for (u32 s = 0; s < kMaxVertexStreams; ++s) {
@@ -913,6 +964,10 @@ bool Specialised(const PipelineKey &key) {
     if (w)
       return true;
   }
+  for (const uint32_t t : key.bound_types) {  // shh-nx (2026-10-30, shh_deko3d_bound_spec)
+    if (t)
+      return true;
+  }
   return false;
 }
 
@@ -1088,6 +1143,7 @@ static plume::RenderPipeline *GetPipelineSlow(const PipelineKey &key, const Pipe
     std::memset(generic.bool_mask, 0, sizeof(generic.bool_mask));
     std::memset(generic.bool_values, 0, sizeof(generic.bool_values));
     generic.alpha_func = 0;  // banjo-nx (banjo_deko3d_alpha_spec): the function read at run time
+    std::memset(generic.bound_types, 0, sizeof(generic.bound_types));  // shh-nx: the types read at run time
     plume::RenderPipeline *pipeline = GetPipelineLocked(generic, inputs);
     if (state == SpecState::Pending) {
       SpecPending &p = g_spec_pending[hash];

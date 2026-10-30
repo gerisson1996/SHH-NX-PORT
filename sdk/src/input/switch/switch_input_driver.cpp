@@ -27,11 +27,12 @@
 
 #include <switch.h>
 
-// Face buttons. By position (the default since 2026-10-07, the user's choice): as on the Xbox 360 pad the game was
-// made for, the bottom button (B on Switch controllers) acts as A, the right one (A) as B, the left one (Y) as X and
-// the top one (X) as Y. false = by letter (the Switch's A acts as A), as in other Switch games. It applies at once;
-// the settings menu reads it too (window_switch.cpp). input_p1_* / input_p2_* below override single buttons.
-REXCVAR_DEFINE_BOOL(input_xbox_layout, true, "Input",
+// Face buttons. By letter (shh-nx, 2026-10-29, the user's choice: the default again): the Switch's A acts as A, B as
+// B, X as X and Y as Y, as in other Switch games. true = by position, as on the Xbox 360 pad the game was made for: the
+// bottom button (B on Switch controllers) acts as A, the right one (A) as B, the left one (Y) as X and the top one (X)
+// as Y. It applies at once; the settings menu reads it too (window_switch.cpp). input_p1_* / input_p2_* below override
+// single buttons.
+REXCVAR_DEFINE_BOOL(input_xbox_layout, false, "Input",
                     "Face buttons by position, as on an Xbox 360 pad (the bottom button, B, acts as A). "
                     "false = by letter: the Switch's A acts as A");
 
@@ -628,15 +629,17 @@ void SwitchInputDriver::Poll(size_t index) {
   /*
    * With the debug overlay open, L+R and the right stick move it (debug_overlay.cpp,
    * on the UI thread). While L and R are held, the game sees neither those two
-   * buttons nor the right stick.
+   * buttons nor the right stick; Start is also masked so combinations don't pause.
    */
   constexpr uint64_t kMoveOverlay = HidNpadButton_L | HidNpadButton_R;
-  if ((held & kMoveOverlay) == kMoveOverlay && rex::ui::DebugOverlayOpen()) {
-    // The XInput state fields are stored big-endian: they are rewritten whole.
-    gamepad.buttons = static_cast<uint16_t>(
-        buttons & ~(X_INPUT_GAMEPAD_LEFT_SHOULDER | X_INPUT_GAMEPAD_RIGHT_SHOULDER));
-    gamepad.thumb_rx = static_cast<int16_t>(0);
-    gamepad.thumb_ry = static_cast<int16_t>(0);
+  if ((held & kMoveOverlay) == kMoveOverlay) {
+    buttons &= ~X_INPUT_GAMEPAD_START;
+    if (rex::ui::DebugOverlayOpen()) {
+      buttons &= ~(X_INPUT_GAMEPAD_LEFT_SHOULDER | X_INPUT_GAMEPAD_RIGHT_SHOULDER);
+      gamepad.thumb_rx = static_cast<int16_t>(0);
+      gamepad.thumb_ry = static_cast<int16_t>(0);
+    }
+    gamepad.buttons = buttons;
   }
 
   if (std::memcmp(&gamepad, &slot.state.gamepad, sizeof(gamepad)) != 0) {
@@ -660,6 +663,7 @@ extern "C" void RexSwitchPerfToggleAb(void);
  *   L + R + Right -> settings
  *   L + R + Down  -> log console
  *   L + R + Left  -> achievements
+ *   L + R + Plus  -> the app's own menu (input_system.cpp SetMenuComboCallback; fork addition)
  *   L + R + ZL    -> GPU A/B test lap (for measuring, not for playing)
  *   L + R + right stick -> moves the debug overlay if it is open
  *                          (its position is saved; see Poll and debug_overlay.cpp)
@@ -678,6 +682,7 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
       {HidNpadButton_Right, rex::ui::VirtualKey::kF4},
       {HidNpadButton_Down, rex::ui::VirtualKey::kOem3},
       {HidNpadButton_Left, rex::ui::VirtualKey::kF7},
+      {HidNpadButton_Plus, rex::ui::VirtualKey::kF5},
   };
 
   const bool modifier = (held & kModifier) == kModifier;

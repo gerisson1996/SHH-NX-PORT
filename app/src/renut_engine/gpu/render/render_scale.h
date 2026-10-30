@@ -20,8 +20,10 @@ namespace renut::gpu {
 // (renutTextureScale in shader_common.h).
 struct RenderScale {
   static constexpr uint32_t kCount = 8;
-  static constexpr uint32_t kNumerators[kCount] = {1, 2, 3, 2, 3, 4, 6, 4};
-  static constexpr uint32_t kDenominators[kCount] = {1, 3, 2, 1, 1, 1, 1, 3};
+  // shh-nx (2026-10-29): code 6 is 5/6 (600p, shh_resolution) instead of 6x (only 4K's full-resolution ambient
+  // occlusion reached it, which deko3d does not draw).
+  static constexpr uint32_t kNumerators[kCount] = {1, 2, 3, 2, 3, 4, 5, 4};
+  static constexpr uint32_t kDenominators[kCount] = {1, 3, 2, 1, 1, 1, 6, 3};
 
   uint32_t code = 0;
 

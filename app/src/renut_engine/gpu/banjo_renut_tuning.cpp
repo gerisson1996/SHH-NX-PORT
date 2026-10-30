@@ -194,6 +194,12 @@ REXCVAR_DEFINE_BOOL(banjo_deko3d_gpr32, false, "Banjo/Enhancements",
                     "compiled with 32 at most, so the GPU keeps every warp slot (64 instead of about 48) to hide texture "
                     "latency, at the price of a few spills (the fur shader: 15 loads, 5 stores). The same pixels; "
                     "whether it is faster is the console's to say (configs/banjo_deko3d_gpr32_on.toml)");
+// shh-nx (2026-10-29, docs/perfil-shh.md SHH-09): SHH's heavy lit pixel shaders take 59-80 GPRs (half the SM's warp
+// slots); the cap banjo_deko3d_gpr32 compiles the listed ones (tools/gpr32_shaders.txt) with, 32 to 64.
+REXCVAR_DEFINE_INT32(shh_deko3d_gpr_cap, 48, "Silent Hill/Renut",
+                     "GPU: the GPR cap banjo_deko3d_gpr32 compiles the listed pixel shaders with (32-64; fewer GPRs, "
+                     "more warps to hide texture latency with, more spills). The same pixels")
+    .range(32, 64);
 REXCVAR_DEFINE_BOOL(banjo_deko3d_early_z, true, "Banjo/Enhancements",
                     "GPU (2026-10-19): a pixel shader that discards (alpha test) in a draw that writes neither depth "
                     "nor stencil (the blended fur shells, particles) gets its depth test before it "
@@ -384,11 +390,11 @@ REXCVAR_DEFINE_INT32(banjo_renut_ab_target, 0, "Banjo",
                      "banjo_gpu_tess_grid; 10 none (was banjo_renut_check_worker, removed in package 28b); 11 banjo_gpu_depth_only; 12 banjo_gpu_output_trim; 13 "
                      "banjo_gpu_depth_words_view; 14 banjo_renut_record_worker; 15 banjo_deko3d_light_branch, 16 "
                      "banjo_deko3d_gpr32 and 17 banjo_deko3d_skin_once (2026-10-20: the key on; the off half's "
-                     "pipelines are built without its constant); 18 banjo_deko3d_eager_kicks (19, banjo_late_input_gpu, "
-                     "removed). The part is "
+                     "pipelines are built without its constant); 18 banjo_deko3d_eager_kicks; 19 shh_deko3d_light_gate "
+                     "(shh-nx; was banjo_late_input_gpu, removed). The part is "
                      "switched off and on every banjo_renut_ab_s seconds; the \"[renut A/B]\" line every 10 s gives "
                      "both halves' frame rate, render thread and GPU time")
-    .range(0, 18);
+    .range(0, 19);
 REXCVAR_DEFINE_INT32(banjo_renut_ab_s, 4, "Banjo", "Renut's renderer: the half-period of banjo_renut_ab_target, in seconds")
     .range(1, 60);
 REXCVAR_DEFINE_BOOL(banjo_renut_push_point_only, true, "Banjo/Enhancements",
@@ -625,6 +631,7 @@ const char *AbName(int target) {
   case 16: return "banjo_deko3d_gpr32";
   case 17: return "banjo_deko3d_skin_once";
   case 18: return "banjo_deko3d_eager_kicks";
+  case 19: return "shh_deko3d_light_gate";
   default: return "none";
   }
 }
@@ -920,6 +927,7 @@ bool EarlyHoistOn() { return REXCVAR_GET(banjo_deko3d_early_hoist); }
 bool StallPresentOn() { return REXCVAR_GET(banjo_renut_stall_present); }
 bool EarlyZOn() { return REXCVAR_GET(banjo_deko3d_early_z); }
 bool Gpr32On() { return REXCVAR_GET(banjo_deko3d_gpr32); }
+uint32_t GprCap() { return uint32_t(REXCVAR_GET(shh_deko3d_gpr_cap)); }
 bool LightBranchOn() { return REXCVAR_GET(banjo_deko3d_light_branch); }
 bool SkinOnceOn() { return REXCVAR_GET(banjo_deko3d_skin_once); }
 bool EagerKicksOn() {

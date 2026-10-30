@@ -56,6 +56,14 @@ REXCVAR_DEFINE_BOOL(sa2_renut_gamma_ramp, true, "SA2/Renderer",
                     "Renut's renderer: apply the game's display gamma ramp at scan-out, as the Xbox 360's display "
                     "controller, the emulated GPU and the native renderer do (off: the frame as rendered, lighter)");
 
+// shh-nx (2026-10-29, docs/perfil-shh.md SHH-05): Silent Hill is dark by design (the emulated GPU is darker still), and
+// handheld screens show it darker than a TV. An extra exponent at scan-out, after the game's ramp: below 1 lifts the
+// midtones and keeps black black and white white. 1 = the game's picture.
+REXCVAR_DEFINE_DOUBLE(shh_output_gamma, 1.0, "Silent Hill/Renut",
+                      "Brightness at scan-out, after the game's own setting: 1 = the game's picture, 0.8 brighter, "
+                      "0.6 much brighter, above 1 darker")
+    .range(0.3, 2.0);
+
 REXCVAR_DEFINE_BOOL(renut_vsync, true, "Nuts&Bolts/Graphics",
                     "Show each frame at the display's refresh: no tearing, and the game runs at "
                     "the refresh rate (frame_cap then only limits below it). Off shows frames at "
@@ -256,7 +264,7 @@ void RecordScanOut(VideoState &s, const PresentImage &image, uint32_t out_w, uin
   push.translate[1] = frame_v * (1.0f - fit.visible[1]) * 0.5f;
   push.texture_index = image.descriptor;
   push.sampler_index = kLinearClampSamplerSlot;
-  push.param0 = image.gamma > 0.0f ? image.gamma : s.output_gamma;
+  push.param0 = image.gamma > 0.0f ? image.gamma : s.output_gamma * float(REXCVAR_GET(shh_output_gamma));
   // sa2-nx: the game's gamma ramp (not on banjo_renut_diag_show_texture's texture): its slot as param1's bits, 0 =
   // none (slots 0-2 are the null textures, never the ramp's).
   const uint32_t ramp_slot = image.gamma <= 0.0f && g_gamma.uploaded && g_gamma.slot != kInvalidDescriptor &&

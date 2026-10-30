@@ -9,6 +9,29 @@
 #  first [table], or TOML puts them inside it and the codegen ignores them.
 # ============================================================================
 
+# CPU, stage 1 (2026-10-30, from sh3-nx, where it took gameplay from 20 to 30 fps at the stock clock). None of these
+# were set: every register lived in the ctx struct, a load and a store around each use. The set sa2-nx and nfsmw-nx
+# run with (sa2-nx's perf_overrides.toml explains each one). Our hooks read only the argument registers, and no
+# function shares its parent's registers. Left for later: non_argument_as_local (__savevmx_N takes r12 as a base),
+# the FP-mode options (fp_*), elide_lr_stores and skip_lr.
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+non_volatile_as_local = false
+skip_msr = true
+dform_disp_split = true
+div_inline = true
+fcti_inline = true
+fctiwz_inline = true
+rotate_word_shifts = true
+dcbt_prefetch = true
+
+# The CRT's setjmp/longjmp, so a setjmp site saves and restores the locals above (ppc_setjmp) and longjmp goes back
+# to it instead of returning to its own caller.
+setjmp_address = 0x8292CE20
+longjmp_address = 0x8292CB00
+
 # ----------------------------------------------------------------------------
 #  FUNCTIONS DECLARED BY HAND
 #

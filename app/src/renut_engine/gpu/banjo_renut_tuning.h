@@ -241,6 +241,7 @@ bool StallPresentOn();
 bool EarlyZOn();
 // banjo_deko3d_gpr32 (2026-10-19, GPU A/B): constant 910 (the fur family compiled with 32 GPRs at most).
 bool Gpr32On();
+uint32_t GprCap();  // shh-nx: shh_deko3d_gpr_cap
 // banjo_deko3d_light_branch (2026-10-20, GPU A/B): constant 911 (the listed lit shaders' lights in branches on their
 // attenuation test, tools/deko3d_glsl_opt.py lightbranch).
 bool LightBranchOn();

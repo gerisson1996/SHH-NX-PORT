@@ -539,7 +539,9 @@ std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.getter() != entry.default_value) {
+    // Fork (shh-nx, 2026-10-29): a value set from the file or at run time is kept even when it is the default, so an
+    // app's own default (set at start where the file has none) does not take its place on the next start.
+    if (entry.getter() != entry.default_value || entry.source == Source::kConfig || entry.source == Source::kRuntime) {
       if (entry.type == FlagType::String) {
         result += entry.name + " = \"" + entry.getter() + "\"\n";
       } else {

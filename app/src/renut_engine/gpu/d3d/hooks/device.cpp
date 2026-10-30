@@ -13,6 +13,7 @@
  * render thread has read the batch's data; D3D's fence waits wait for that
  * (BlockOnFence_hook), and Swap waits when the game gets a frame too far ahead.
  */
+#include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/frame_latency.h>  // banjo-nx (2026-10-19)
 #include "renut_engine/display_sync.h"
 #include "renut_engine/gpu/render/pipeline.h"  // banjo-nx (2026-10-20): SyncPipelineListLocked
@@ -610,6 +611,9 @@ u32 BlockOnFence_hook(u32 device_va, u32 fence, u32 /*type*/, u32 /*no_kick*/) {
   }
   renut::frame_stats::OnGameThreadWait(
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waiting).count());
+  rex::kernel::xboxkrnl::ProfileGuestWait(  // shh-nx (SHH-13)
+      5, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waiting)
+                      .count()));
   return 0;
 }
 

@@ -347,7 +347,51 @@ extern "C" void RexSwitchApmWatch(void) {
   }
 }
 
+/*
+ * shh-nx (2026-10-29, the user's request): Nintendo's own profiles, one per mode, registered once; Horizon switches
+ * between them by itself when the console is docked or undocked (each apm configuration belongs to a mode).
+ *
+ *   docked (Boost)     0x00010001  CPU 1020  GPU 768    EMC 1600    the docked profile commercial games run at
+ *   handheld (Normal)  0x92220008  CPU 1020  GPU 460.8  EMC 1331.2  the sibling above; 0x00020004 (GPU 384) if absent
+ *
+ * The session stays open: the configurations belong to it. A clock tool (sys-clk and the like) still wins over these,
+ * and the log says what the console ends up at.
+ */
+extern "C" void RexSwitchApmOfficialClocks(void (*log)(const char* line)) {
+  if (g_done.exchange(true)) {
+    return;
+  }
+  if (R_FAILED(apmInitialize())) {
+    if (log) log("[apm] apm is not available: the clocks are left as they are");
+    return;
+  }
+  u32 gpu0 = 0, emc0 = 0;
+  ReadClocks(gpu0, emc0);
+  const Result docked = apmSetPerformanceConfiguration(ApmPerformanceMode_Boost, 0x00010001u);
+  Result handheld = apmSetPerformanceConfiguration(ApmPerformanceMode_Normal, 0x92220008u);
+  const bool handheld_460 = R_SUCCEEDED(handheld);
+  if (!handheld_460) {
+    handheld = apmSetPerformanceConfiguration(ApmPerformanceMode_Normal, 0x00020004u);
+  }
+  ApmPerformanceMode mode = ApmPerformanceMode_Invalid;
+  apmGetPerformanceMode(&mode);
+  svcSleepThread(1500000000ULL);  // pcv applies the clocks some time after apm takes the request
+  u32 gpu1 = 0, emc1 = 0;
+  ReadClocks(gpu1, emc1);
+  char line[512];
+  std::snprintf(line, sizeof(line),
+               "[apm] official profiles: docked 0x00010001 (GPU 768, memory 1600) %s; handheld %s %s. Now %s: GPU "
+               "%.1f MHz (was %.1f), memory %.1f MHz (was %.1f)",
+               R_SUCCEEDED(docked) ? "set" : "REFUSED", handheld_460 ? "0x92220008 (GPU 460.8, memory 1331.2)"
+                                                                     : "0x00020004 (GPU 384, memory 1331.2)",
+               R_SUCCEEDED(handheld) ? "set" : "REFUSED", mode == ApmPerformanceMode_Boost ? "docked" : "handheld",
+               double(gpu1) / 1e6, double(gpu0) / 1e6, double(emc1) / 1e6, double(emc0) / 1e6);
+  std::fprintf(stderr, "%s\n", line);
+  if (log) log(line);
+}
+
 #else   // !REX_PLATFORM_SWITCH
+extern "C" void RexSwitchApmOfficialClocks(void (*)(const char*)) {}
 extern "C" void RexSwitchApmRequestGpuMhz(int) {}
 extern "C" void RexSwitchApmAllowRam1600(int) {}
 extern "C" void RexSwitchApmApply(void) {}

@@ -32,6 +32,9 @@ std::unique_ptr<rex::ui::ImmediateDrawer> CreateOverlayDrawer();
 bool StartRenderer(rex::ui::WindowedAppContext &app_context,
                    std::function<rex::ui::ImGuiDrawer *()> imgui_drawer);
 
+// shh-nx (2026-10-29, the boot screen, rex/ui/overlay/boot_screen.h): whether the game has presented a frame yet.
+bool GuestHasPresented();
+
 // OnWindowPixelSizeChanged.
 void OnWindowResized();
 

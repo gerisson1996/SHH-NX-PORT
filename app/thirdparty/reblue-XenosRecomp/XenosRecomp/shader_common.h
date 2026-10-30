@@ -254,7 +254,7 @@ uint renutDescriptor(uint resourceDescriptorIndex)
 }
 
 // Host texels per guest texel, by the host's RenderScale code (render_scale.h): 1x, 2/3 (480p),
-// 1.5 (1080p), 2 (1440p), 3 (4K), 4, 6 and 4/3 (shadow maps and ambient occlusion rendered finer).
+// 1.5 (1080p), 2 (1440p), 3 (4K), 4, 5/6 (shh-nx: 600p) and 4/3 (shadow maps and ambient occlusion rendered finer).
 float renutTextureScale(uint resourceDescriptorIndex)
 {
     const uint code = (resourceDescriptorIndex >> RENUT_RESOLUTION_SCALE_SHIFT) & 7u;
@@ -264,7 +264,7 @@ float renutTextureScale(uint resourceDescriptorIndex)
            select(code == 3u, 2.0,
            select(code == 4u, 3.0,
            select(code == 5u, 4.0,
-           select(code == 6u, 6.0,
+           select(code == 6u, 5.0 / 6.0,  // shh-nx: 600p (render_scale.h)
            select(code == 7u, 4.0 / 3.0, 1.0)))))));
 }
 

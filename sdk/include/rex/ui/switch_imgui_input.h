@@ -149,7 +149,7 @@ inline void ApplyEntry(ImGuiIO& io, const UiEntry& e, StateUiEntry& state) {
   // They stay excluded even if L or R is released before them.
   constexpr uint64_t kModifier = kButtonL | kButtonR;
   constexpr uint64_t kOfShortcut =
-      kButtonTop | kButtonBottom | kButtonLeft | kButtonRight | kButtonZL;
+      kButtonTop | kButtonBottom | kButtonLeft | kButtonRight | kButtonZL | kButtonPlus;
   if ((read & kModifier) == kModifier) {
     state.of_shortcut |= read & kOfShortcut;
   }

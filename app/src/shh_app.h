@@ -10,9 +10,14 @@
 #include <rex/input/read_hook.h>
 #include <rex/rex_app.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/overlay/boot_screen.h>
 #include <rex/ui/overlay/quick_settings.h>
+#if REX_PLATFORM_SWITCH
+#include <rex/ui/switch_apm.h>
+#endif
 
 #include <cstdlib>
+#include <thread>
 #include <filesystem>
 #include <system_error>
 
@@ -69,6 +74,17 @@ class ShhApp : public rex::ReXApp {
     SetIfNotRequested("shh_renut_single_sample", "true");
     // shh-nx (2026-10-29, docs/perfil-shh.md SHH-08): the shadow maps at 2/3 (a menu choice later).
     SetIfNotRequested("shh_shadow_quality", "Medium");
+    // shh-nx (2026-10-29, docs/perfil-shh.md SHH-06): audio latency. Default 10 frames queue + 3x4 audout buffers
+    // gave ~100 ms latency (desync with video). 6 frames queue + 3x2 audout buffers lowers latency to ~53 ms.
+    SetIfNotRequested("audio_switch_frames_in_queue", "6");
+    SetIfNotRequested("audio_switch_buffer_frames", "2");
+    SetIfNotRequested("audio_switch_buffers", "3");
+    // shh-nx (2026-10-29, the user's request): Nintendo's official clock profiles, docked GPU 768 and handheld GPU
+    // 460.8 (switch_apm.h); Horizon changes between them on docking. Its own thread: it waits to log the clocks.
+    // Not detached: libnx has no pthread_detach, and std::thread::detach throws ENOSYS there (std::terminate at
+    // boot, NRO 6acda60f); the thread object is left alive instead, never joined or destroyed.
+    if (rex::cvar::GetFlagByName("shh_official_clocks") != "false")
+      new std::thread([] { RexSwitchApmOfficialClocks([](const char* line) { REXLOG_INFO("{}", line); }); });
 #endif
   }
 
@@ -154,6 +170,12 @@ class ShhApp : public rex::ReXApp {
       if (ShhApp* app = menu_app_)
         app->app_context().CallInUIThread([app] { app->ToggleMenu(); });
     });
+#if SHH_RENUT_RENDERER
+    // shh-nx (2026-10-29, the user's request): a loading screen for the black seconds before the Konami logo, until
+    // the game's first frame.
+    if (banjo::renut_gpu::Active())
+      rex::ui::ShowBootScreen(drawer, "SILENT HILL: HOMECOMING", [] { return renut::gpu::GuestHasPresented(); });
+#endif
     // A measurement aid: the menu open from the start (PC screenshots, shot_run.ps1).
     if (rex::cvar::GetFlagByName("shh_diag_open_menu") == "true")
       ToggleMenu();
@@ -171,14 +193,23 @@ class ShhApp : public rex::ReXApp {
 #if SHH_RENUT_RENDERER
     rex::ui::QuickSetting resolution;
     resolution.cvar = "shh_resolution";
+#if REX_PLATFORM_SWITCH
+    // shh-nx (2026-10-29): one resolution per mode; docked defaults to 1080p (shh_resolution_docked).
+    resolution.label = "Resolucao no portatil";
+    resolution.choices = {{"480p", "480p"}, {"600p", "600p"}, {"720p", "720p"}};
+    settings.push_back(std::move(resolution));
+
+    rex::ui::QuickSetting docked;
+    docked.cvar = "shh_resolution_docked";
+    docked.label = "Resolucao na dock";
+    docked.choices = {{"600p", "600p"}, {"720p", "720p"}, {"1080p", "1080p"}};
+    docked.note = "muda sozinha ao encaixar ou tirar da dock";
+    settings.push_back(std::move(docked));
+#else
     resolution.label = "Resolucao";
     resolution.choices = {{"480p", "480p"}, {"600p", "600p"}, {"720p", "720p"}, {"1080p", "1080p"}};
-#if REX_PLATFORM_SWITCH
-    // 1080p only docked, where the GPU runs faster; in handheld mode the renderer draws it at 720p.
-    resolution.available = [](const std::string& value) { return value != "1080p" || sa2::render::Docked(); };
-    resolution.note = "1080p so no modo dock";
-#endif
     settings.push_back(std::move(resolution));
+#endif
 
     rex::ui::QuickSetting shadows;
     shadows.cvar = "shh_shadow_quality";
@@ -201,6 +232,14 @@ class ShhApp : public rex::ReXApp {
     msaa.note = "vale ao reiniciar o jogo";
     settings.push_back(std::move(msaa));
 #endif
+#if REX_PLATFORM_SWITCH
+    rex::ui::QuickSetting buttons;
+    buttons.cvar = "input_xbox_layout";
+    buttons.label = "Botoes A/B/X/Y";
+    buttons.choices = {{"false", "Pela letra (Switch)"}, {"true", "Pela posicao (Xbox)"}};
+    buttons.note = "pela letra: o A do Switch e o A do jogo";
+    settings.push_back(std::move(buttons));
+#endif
     return settings;
   }
 
@@ -209,8 +248,8 @@ class ShhApp : public rex::ReXApp {
       REXLOG_DEBUG("Setting '{}' not registered yet; left alone.", name);
       return;
     }
-    if (rex::cvar::HasNonDefaultValue(name)) {
-      return;  // set explicitly: do not override it.
+    if (rex::cvar::HasNonDefaultValue(name) || rex::cvar::GetFlagSource(name) != rex::cvar::Source::kDefault) {
+      return;  // set explicitly (the default itself, too, from the menu's Save): do not override it.
     }
     if (rex::cvar::SetFlagByName(name, value)) {
       REXLOG_DEBUG("Default setting: {} = {}", name, value);

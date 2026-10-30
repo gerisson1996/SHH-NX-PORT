@@ -36,6 +36,13 @@ void RexSwitchApmAllowRam1600(int allow);
 void RexSwitchApmApply(void);
 
 /*
+ * shh-nx (2026-10-29): Nintendo's own profiles, one per mode (docked: GPU 768 with memory 1600; handheld: GPU 460.8
+ * with memory 1331.2), which Horizon then switches between by itself. Waits 1.5 s to log the clocks: call it from a
+ * thread of its own. Instead of RexSwitchApmApply, not with it. 'log' (may be null) gets the result line.
+ */
+void RexSwitchApmOfficialClocks(void (*log)(const char* line));
+
+/*
  * One tick per second from the profile thread. If the memory clock went up on its own after the
  * configuration was applied (the clock change takes time, so an immediate check read the old
  * value), it is set back with clkrst to what the console had originally. It does nothing, and does

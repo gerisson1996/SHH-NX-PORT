@@ -16,8 +16,10 @@ plume::RenderFormat ColorTargetFormat(GpuColorFormat format) {
   case GpuColorFormat::Fmt8_8_8_8_Gamma:
     return plume::RenderFormat::R8G8B8A8_UNORM;
   case GpuColorFormat::Fmt2_10_10_10:
+  case GpuColorFormat::Fmt2_10_10_10_As10_10_10_10:
     return plume::RenderFormat::R16G16B16A16_UNORM;
   case GpuColorFormat::Fmt2_10_10_10_Float:
+  case GpuColorFormat::Fmt2_10_10_10_Float_As16_16_16_16:
   case GpuColorFormat::Fmt16_16_16_16_Float:
     return plume::RenderFormat::R16G16B16A16_FLOAT;
   case GpuColorFormat::Fmt16_16:

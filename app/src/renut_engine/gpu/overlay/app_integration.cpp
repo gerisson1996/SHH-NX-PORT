@@ -119,6 +119,10 @@ bool StartRenderer(rex::ui::WindowedAppContext &app_context,
   return true;
 }
 
+bool GuestHasPresented() {
+  return Video::PresentCount() > 0;
+}
+
 void OnWindowResized() {
   Video::RequestResize();
 }

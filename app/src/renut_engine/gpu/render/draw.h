@@ -143,6 +143,12 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
                         i32 dest_x, i32 dest_y, u32 dest_level, u32 dest_slice,
                         const float clear_color[4], float clear_depth, u32 clear_stencil);
 
+// shh-nx (2026-10-30, shh_renut_resolve_halves): the first half of a resolve in two halves waits for the second;
+// this does it now (before any other renderer work: render_thread runs it ahead of every item but a resolve's).
+void FlushDeferredResolveLocked();
+// Whether a first half waits (any thread; it is done under State().mutex).
+bool DeferredResolvePending();
+
 // Reads render target 'source' (0-3) of the device state back for the CPU:
 // what a color resolve of its rect (0, 0, width, height) into an X8R8G8B8
 // texture would write, untiled, as width x height guest words (bytes

@@ -358,6 +358,12 @@ namespace {
 std::atomic<uint32_t> g_injected{0};  // the buttons, and the change count above them
 }  // namespace
 
+namespace {
+std::atomic<void (*)()> g_menu_combo{nullptr};
+}  // namespace
+
+void SetMenuComboCallback(void (*callback)()) { g_menu_combo.store(callback, std::memory_order_release); }
+
 void SetInjectedButtons(uint16_t buttons) {
   uint32_t old = g_injected.load(std::memory_order_relaxed);
   while (uint16_t(old) != buttons &&
@@ -427,6 +433,18 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     const uint32_t injected = g_injected.load(std::memory_order_acquire);
     merged.gamepad.buttons = uint16_t(uint16_t(merged.gamepad.buttons) | uint16_t(injected));
     merged.packet_number = uint32_t(merged.packet_number) + (injected >> 16);
+    // shh-nx (SetMenuComboCallback): LB+RB+Start, on its press; the game never sees that Start.
+    if (void (*const combo)() = g_menu_combo.load(std::memory_order_acquire)) {
+      constexpr uint16_t kShoulders = 0x0100 | 0x0200, kStart = 0x0010;  // XINPUT_GAMEPAD_LEFT/RIGHT_SHOULDER, START
+      static bool held = false;
+      const uint16_t b = uint16_t(merged.gamepad.buttons);
+      const bool now = (b & kShoulders) == kShoulders && (b & kStart);
+      if (now && !held)
+        combo();
+      held = now;
+      if ((b & kShoulders) == kShoulders)
+        merged.gamepad.buttons = uint16_t(b & ~kStart);
+    }
   }
   if (out_state) {
     *out_state = merged;

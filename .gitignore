@@ -35,3 +35,9 @@ __pycache__/
 
 # --- Local secrets ------------------------------------------------------------
 analysis/
+
+# --- Homebrew menu icons, cut from the dashboard art on the user's own disc (not distributed) ---
+tools/switch/icon/*.jpg
+
+# --- The published release (the workflow in .github publishes it) ------------------
+!release/shh.nro

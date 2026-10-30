@@ -49,6 +49,15 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+// shh-nx (2026-10-29, docs/perfil-shh.md SHH-13): every thread starts with preferred core -1, which on Horizon is the
+// process's default core, the same for all of them: SHH's boot load ran on a third of a core for 30 s (its main thread
+// never waited; with the audio engine and the loader's helpers it filled one core while the console used 60-84 % of
+// 400 %). Each guest thread now prefers the next core in turn (the main thread core 1, the next core 2, then 0, ...),
+// with the process's three cores in its mask, so Horizon can still move it.
+REXCVAR_DEFINE_BOOL(switch_guest_thread_spread, true, "Kernel",
+                    "Switch: each guest thread prefers the next core in turn instead of all the process's default one")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 #if REX_PLATFORM_SWITCH
 namespace {
 // sa2-nx (2026-10-20, RexSetGuestThreadCoreLayout): the guest threads' cores besides the main thread's (0: the
@@ -512,6 +521,15 @@ X_STATUS XThread::Create() {
       const uint32_t mask = g_guest_core_mask.load(std::memory_order_acquire);
       if (mask)
         RexSwitchSetCurrentThreadMask(g_guest_core_preferred.load(std::memory_order_relaxed), mask);
+    }
+    // shh-nx (SHH-13): spread over the cores, unless a layout set this thread's cores above.
+    if (guest_thread_ && REXCVAR_GET(switch_guest_thread_spread) &&
+        (main_thread_ || g_guest_core_mask.load(std::memory_order_acquire) == 0)) {
+      static std::atomic<uint32_t> next_core{1};
+      const int core = int(next_core.fetch_add(1, std::memory_order_relaxed) % 3);
+      const bool ok = RexSwitchSetCurrentThreadMask(core, 0x7);
+      REXSYS_INFO("[threads] guest thread {} '{}' prefers core {}{}", thread_id_, thread_name_, core,
+                  ok ? "" : " (refused)");
     }
     t_guest_kind = guest_thread_ ? (main_thread_ ? 1 : 2) : 0;  // sa2-nx: ApplyGuestCoreLayoutAtWait
 #endif

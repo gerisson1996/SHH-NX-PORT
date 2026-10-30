@@ -42,4 +42,9 @@ void xeKeInitializeApc(rex::system::XAPC* apc, uint32_t thread_ptr, uint32_t ker
 uint32_t xeKeInsertQueueApc(rex::system::XAPC* apc, uint32_t arg1, uint32_t arg2,
                             uint32_t priority_increment, PPCContext* ctx);
 
+// shh-nx (2026-10-29, docs/perfil-shh.md SHH-13): the wait profile (kernel_wait_profile_s) for waits outside the
+// kernel's imports: kind 5 a D3D fence, 6 the frame queue at a Swap, 7 a critical section. Calling thread only.
+bool GuestWaitProfileActive();
+void ProfileGuestWait(uint32_t kind, uint64_t ns);
+
 }  // namespace rex::kernel::xboxkrnl
