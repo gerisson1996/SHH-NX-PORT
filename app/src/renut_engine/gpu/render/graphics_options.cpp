@@ -145,8 +145,12 @@ RenderScale SurfaceRenderScale(const d3d::SurfaceDesc &desc, RenderScale resolut
       RGPU_INFO("Shadow map target {}x{} format {:08X}: scale {}", width, height, u32(desc.Format),
                 (g_latched.shadow_follows_resolution ? resolution : g_latched.shadow_scale).Factor());
   }
+  // shh-nx (2026-11-11, the PC's picture on the Switch): High never goes below the console's 1024 a light. Following a
+  // 600p or 480p resolution it did (0.83x, 0.67x: blurrier, blockier shadows than the PC's); at 1080p docked it still
+  // follows up to 1.5x.
   if (IsShadowMap(desc, width, height))
-    return g_latched.shadow_follows_resolution ? resolution : g_latched.shadow_scale;
+    return g_latched.shadow_follows_resolution ? (resolution.Factor() < 1.0f ? RenderScale{} : resolution)
+                                               : g_latched.shadow_scale;
   if (g_latched.full_ambient_occlusion && IsAmbientOcclusion(desc, width, height))
     return resolution.Times(2);
   if (IsPostProcessBuffer(desc, width, height))

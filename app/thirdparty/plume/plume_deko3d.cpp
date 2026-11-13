@@ -765,12 +765,13 @@ namespace plume {
 
     // ---- Deko3DQueryPool
 
-    Deko3DQueryPool::Deko3DQueryPool(Deko3DDevice *device, uint32_t count) : device(device) {
+    Deko3DQueryPool::Deko3DQueryPool(Deko3DDevice *device, uint32_t count, bool occlusion) : device(device), occlusion(occlusion) {
         results.resize(count);
-        // A counter report is 16 bytes: the counter, then the GPU timestamp.
-        block = device->makeBlock(alignUp(std::max<uint32_t>(count, 1) * 16, DK_MEMBLOCK_ALIGNMENT), DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "query pool");
+        // A counter report is 16 bytes: the counter, then the GPU timestamp. An occlusion query has two.
+        const uint32_t bytes = std::max<uint32_t>(count, 1) * (occlusion ? 32 : 16);
+        block = device->makeBlock(alignUp(bytes, DK_MEMBLOCK_ALIGNMENT), DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "query pool");
         if (block)
-            memset(dkMemBlockGetCpuAddr(block), 0, count * 16);
+            memset(dkMemBlockGetCpuAddr(block), 0, bytes);
     }
 
     Deko3DQueryPool::~Deko3DQueryPool() {
@@ -785,8 +786,12 @@ namespace plume {
         if (!block)
             return true;
         const volatile uint64_t *reports = static_cast<const volatile uint64_t *>(dkMemBlockGetCpuAddr(block));
-        for (uint32_t i = 0; i < count; i++)
-            results[i] = dkTimestampToNs(reports[i * 2 + 1]);
+        for (uint32_t i = 0; i < count; i++) {
+            if (occlusion)  // the samples counter at the end less the one at the begin
+                results[i] = reports[i * 4 + 2] - reports[i * 4];
+            else
+                results[i] = dkTimestampToNs(reports[i * 2 + 1]);
+        }
         return true;
     }
 
@@ -1885,6 +1890,10 @@ namespace plume {
 
     std::unique_ptr<RenderQueryPool> Deko3DDevice::createQueryPool(uint32_t queryCount) {
         return std::make_unique<Deko3DQueryPool>(this, queryCount);
+    }
+
+    std::unique_ptr<RenderQueryPool> Deko3DDevice::createOcclusionQueryPool(uint32_t queryCount) {
+        return std::make_unique<Deko3DQueryPool>(this, queryCount, true);
     }
 
     void Deko3DDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &, const RenderBottomLevelASMesh *, uint32_t, bool, bool) {}

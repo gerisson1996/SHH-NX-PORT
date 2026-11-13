@@ -7,15 +7,19 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <plume_render_interface.h>
 
 #include <rex/cvar.h>
+
+#include "me/sa2_render_mode.h"  // shh-nx (2026-11-11): OledScreen, shh_oled_black's auto
 
 #include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/backend/gpu_profile.h"
@@ -63,6 +67,20 @@ REXCVAR_DEFINE_DOUBLE(shh_output_gamma, 1.0, "Silent Hill/Renut",
                       "Brightness at scan-out, after the game's own setting: 1 = the game's picture, 0.8 brighter, "
                       "0.6 much brighter, above 1 darker")
     .range(0.3, 2.0);
+
+// shh-nx (2026-11-11, the user's request): deeper black for the Switch OLED's screen (scan_out.hlsli, param2).
+REXCVAR_DEFINE_INT32(shh_oled_black, -1, "Silent Hill/Renut",
+                     "Black for OLED screens: -1 = auto (light on the OLED model's own screen, off otherwise), "
+                     "0 = off, 1 = light, 2 = medium, 3 = strong")
+    .range(-1, 3);
+
+// shh-nx (2026-10-31): AMD FSR 1 (EASU + RCAS) at scan-out, in place of the bilinear scaling, when the render resolution
+// is below the screen's (600p or 480p handheld, 720p docked on a 1080p TV). At the screen's resolution it does nothing.
+REXCVAR_DEFINE_BOOL(shh_fsr, true, "Silent Hill/Renut",
+                    "AMD FSR 1 upscaling when the render resolution is below the screen's (off: bilinear, softer)");
+REXCVAR_DEFINE_DOUBLE(shh_fsr_sharpness, 0.25, "Silent Hill/Renut",
+                      "FSR 1 sharpening, in stops: 0 the sharpest, 1 soft, 2 the softest")
+    .range(0.0, 2.0);
 
 REXCVAR_DEFINE_BOOL(renut_vsync, true, "Nuts&Bolts/Graphics",
                     "Show each frame at the display's refresh: no tearing, and the game runs at "
@@ -233,27 +251,29 @@ void UpdateGammaRampLocked(VideoState &s) {
   g.uploaded = version;
 }
 
-void RecordScanOut(VideoState &s, const PresentImage &image, uint32_t out_w, uint32_t out_h) {
+FrameFit FitImage(const PresentImage &image, uint32_t out_w, uint32_t out_h) {
+  return FitFrame(out_w, out_h, image.source_width ? image.source_width : image.width,
+                  image.source_height ? image.source_height : image.height);
+}
+
+void BindUtilityPipeline(VideoState &s, plume::RenderPipeline *pipeline) {
+  plume::RenderCommandList *cmd = s.command_list;
+  cmd->setGraphicsPipelineLayout(s.utility_layout.get());
+  cmd->setPipeline(pipeline);
+  cmd->setGraphicsDescriptorSet(s.texture_set.get(), 0);
+  cmd->setGraphicsDescriptorSet(s.sampler_set.get(), 1);
+}
+
+// The frame texture readable, and present_vs's uv over the part of it the fit shows.
+UtilityPush FrameSourcePush(VideoState &s, const PresentImage &image, const FrameFit &fit) {
   plume::RenderCommandList *cmd = s.command_list;
   if (image.layout && *image.layout != plume::RenderTextureLayout::SHADER_READ) {
     cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
                   plume::RenderTextureBarrier(image.texture, plume::RenderTextureLayout::SHADER_READ));
     *image.layout = plume::RenderTextureLayout::SHADER_READ;
   }
-
   const uint32_t src_w = image.source_width ? image.source_width : image.width;
   const uint32_t src_h = image.source_height ? image.source_height : image.height;
-  const FrameFit fit = FitFrame(out_w, out_h, src_w, src_h);
-  const plume::RenderViewport &vp = fit.viewport;
-  cmd->setViewports(vp);
-  cmd->setScissors(plume::RenderRect(int32_t(vp.x), int32_t(vp.y), int32_t(vp.x + vp.width),
-                                     int32_t(vp.y + vp.height)));
-
-  cmd->setGraphicsPipelineLayout(s.utility_layout.get());
-  cmd->setPipeline(s.present_pipeline.get());
-  cmd->setGraphicsDescriptorSet(s.texture_set.get(), 0);
-  cmd->setGraphicsDescriptorSet(s.sampler_set.get(), 1);
-
   UtilityPush push{};
   // The frame's share of the texture, less what the fit trims from its edges.
   const float frame_u = image.width ? float(src_w) / float(image.width) : 1.0f;
@@ -264,6 +284,11 @@ void RecordScanOut(VideoState &s, const PresentImage &image, uint32_t out_w, uin
   push.translate[1] = frame_v * (1.0f - fit.visible[1]) * 0.5f;
   push.texture_index = image.descriptor;
   push.sampler_index = kLinearClampSamplerSlot;
+  return push;
+}
+
+// The scan-out's colour steps (scan_out.hlsli) into param0 / param1.
+void SetScanOutColor(VideoState &s, const PresentImage &image, UtilityPush &push) {
   push.param0 = image.gamma > 0.0f ? image.gamma : s.output_gamma * float(REXCVAR_GET(shh_output_gamma));
   // sa2-nx: the game's gamma ramp (not on banjo_renut_diag_show_texture's texture): its slot as param1's bits, 0 =
   // none (slots 0-2 are the null textures, never the ramp's).
@@ -272,6 +297,129 @@ void RecordScanOut(VideoState &s, const PresentImage &image, uint32_t out_w, uin
                                  ? g_gamma.slot
                                  : 0u;
   push.param1 = std::bit_cast<float>(ramp_slot);
+  // shh-nx (2026-11-11): the OLED black threshold, in display values (after the ramp and the brightness exponent).
+  int32_t black = REXCVAR_GET(shh_oled_black);
+  if (black < 0)
+    black = sa2::render::OledScreen() ? 1 : 0;
+  // shh-nx (2026-11-12, the user: too dark): now the threshold under which values ease to black (scan_out.hlsli);
+  // nothing above it changes. In 8-bit display steps: light 4, medium 8, strong 14. Auto is light.
+  static constexpr float kBlackFloor[] = {0.0f, 4.0f / 255.0f, 8.0f / 255.0f, 14.0f / 255.0f};
+  push.param2 = image.gamma > 0.0f ? 0.0f : kBlackFloor[std::clamp(black, 0, 3)];
+  push.param3 = 0.0f;
+}
+
+void SetFitViewport(plume::RenderCommandList *cmd, const plume::RenderViewport &vp) {
+  cmd->setViewports(vp);
+  cmd->setScissors(plume::RenderRect(int32_t(vp.x), int32_t(vp.y), int32_t(vp.x + vp.width),
+                                     int32_t(vp.y + vp.height)));
+}
+
+void RecordScanOut(VideoState &s, const PresentImage &image, uint32_t out_w, uint32_t out_h) {
+  plume::RenderCommandList *cmd = s.command_list;
+  const FrameFit fit = FitImage(image, out_w, out_h);
+  UtilityPush push = FrameSourcePush(s, image, fit);
+  SetScanOutColor(s, image, push);
+  SetFitViewport(cmd, fit.viewport);
+  BindUtilityPipeline(s, s.present_pipeline.get());
+  cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
+  cmd->drawInstanced(3, 1, 0, 0);
+}
+
+// shh-nx (2026-10-31, shh_fsr): AMD FSR 1 at scan-out, when the game draws at fewer pixels than its frame fills on
+// screen (600p or 480p on the 720p screen, 720p on a 1080p TV). EASU upscales the frame into this target, of the
+// viewport's size, before the back buffer's pass; RCAS then takes the plain scan-out's place, with its colour steps.
+// The SDK's menus and reNut's overlay are drawn after, at the screen's resolution, as before.
+struct FsrTarget {
+  std::unique_ptr<plume::RenderTexture> texture;
+  std::unique_ptr<plume::RenderTextureView> view;
+  std::unique_ptr<plume::RenderFramebuffer> framebuffer;
+  uint32_t slot = kInvalidDescriptor;
+  uint32_t width = 0, height = 0;
+};
+FsrTarget g_fsr;
+
+bool EnsureFsrTargetLocked(VideoState &s, uint32_t w, uint32_t h) {
+  FsrTarget &t = g_fsr;
+  if (t.texture && t.width == w && t.height == h)
+    return true;
+  // A new size (the dock, the window): the frames in flight are done with the old target first. Rare.
+  if (t.texture)
+    detail::WaitAllSubmitted(s);
+  t.framebuffer.reset();
+  t.view.reset();
+  t.texture.reset();
+  t.width = t.height = 0;
+  plume::RenderTextureDesc desc = plume::RenderTextureDesc::Texture2D(w, h, 1, kFsrTargetFormat);
+  desc.flags |= plume::RenderTextureFlag::RENDER_TARGET;
+  t.texture = s.device->createTexture(desc);
+  if (!t.texture)
+    return false;
+  t.texture->setName("shh-nx FSR 1 target");
+  t.view = t.texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(kFsrTargetFormat));
+  const plume::RenderTexture *attachment = t.texture.get();
+  t.framebuffer = s.device->createFramebuffer(plume::RenderFramebufferDesc(&attachment, 1));
+  if (t.slot == kInvalidDescriptor)
+    t.slot = Video::AllocateTextureSlotLocked();
+  if (!t.view || !t.framebuffer || t.slot == kInvalidDescriptor) {
+    t.framebuffer.reset();
+    t.view.reset();
+    t.texture.reset();
+    return false;
+  }
+  Video::SetTextureSlotLocked(t.slot, t.texture.get(), t.view.get());
+  t.width = w;
+  t.height = h;
+  RGPU_INFO("shh_fsr: FSR 1 to {}x{}", w, h);
+  return true;
+}
+
+// Before the back buffer's pass: EASU into g_fsr, when FSR applies to this frame.
+bool RecordFsrUpscaleLocked(VideoState &s, const PresentImage &image, uint32_t out_w, uint32_t out_h) {
+  if (!REXCVAR_GET(shh_fsr) || !s.fsr_easu_pipeline || image.gamma > 0.0f || !image.width || !image.height)
+    return false;
+  const FrameFit fit = FitImage(image, out_w, out_h);
+  const plume::RenderViewport &vp = fit.viewport;
+  const float shown_w = float(image.source_width ? image.source_width : image.width) * fit.visible[0];
+  const float shown_h = float(image.source_height ? image.source_height : image.height) * fit.visible[1];
+  // Upscaling only: at the screen's resolution or above, the plain scan-out.
+  if (shown_w >= vp.width - 0.5f && shown_h >= vp.height - 0.5f)
+    return false;
+  const uint32_t w = uint32_t(vp.width + 0.5f), h = uint32_t(vp.height + 0.5f);
+  if (!w || !h || !EnsureFsrTargetLocked(s, w, h))
+    return false;
+  plume::RenderCommandList *cmd = s.command_list;
+  UtilityPush push = FrameSourcePush(s, image, fit);
+  push.param0 = 1.0f / float(image.width);
+  push.param1 = 1.0f / float(image.height);
+  cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
+                plume::RenderTextureBarrier(g_fsr.texture.get(), plume::RenderTextureLayout::COLOR_WRITE));
+  cmd->setFramebuffer(g_fsr.framebuffer.get());
+  SetFitViewport(cmd, plume::RenderViewport(0.0f, 0.0f, float(w), float(h)));
+  BindUtilityPipeline(s, s.fsr_easu_pipeline.get());
+  cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
+  cmd->drawInstanced(3, 1, 0, 0);
+  cmd->setFramebuffer(nullptr);
+  cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
+                plume::RenderTextureBarrier(g_fsr.texture.get(), plume::RenderTextureLayout::SHADER_READ));
+  return true;
+}
+
+// In the back buffer's pass, in place of RecordScanOut: RCAS from g_fsr, with the scan-out's colour steps.
+void RecordFsrSharpenLocked(VideoState &s, const PresentImage &image, uint32_t out_w, uint32_t out_h) {
+  plume::RenderCommandList *cmd = s.command_list;
+  const FrameFit fit = FitImage(image, out_w, out_h);
+  const plume::RenderViewport &vp = fit.viewport;
+  UtilityPush push{};
+  push.scale[0] = float(g_fsr.width - 1);
+  push.scale[1] = float(g_fsr.height - 1);
+  push.translate[0] = -float(int32_t(vp.x));
+  push.translate[1] = -float(int32_t(vp.y));
+  push.texture_index = g_fsr.slot;
+  // RCAS's con.x: 2^-stops.
+  push.sampler_index = std::bit_cast<uint32_t>(std::exp2(-float(REXCVAR_GET(shh_fsr_sharpness))));
+  SetScanOutColor(s, image, push);
+  SetFitViewport(cmd, vp);
+  BindUtilityPipeline(s, s.fsr_rcas_pipeline.get());
   cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
   cmd->drawInstanced(3, 1, 0, 0);
 }
@@ -418,10 +566,30 @@ void ServeCaptureLocked(VideoState &s, const PresentImage *image) {
 
 // banjo_renut_diag_show_texture: the texture to show instead of the frame, when it has a 2D host texture and slot.
 bool DiagTextureImageLocked(PresentImage &out) {
-  static const u32 va = [] {
+  // shh-nx (2026-11-13, the black cutscene): a comma-separated list is shown in turn, 4 s each (logged as it changes),
+  // so one run looks at every pass of a chain.
+  static const std::vector<u32> vas = [] {
+    std::vector<u32> list;
     const std::string v = REXCVAR_GET(banjo_renut_diag_show_texture);
-    return v.empty() ? 0u : u32(std::strtoul(v.c_str(), nullptr, 16));
+    for (size_t at = 0; at < v.size();) {
+      const size_t end = std::min(v.find(',', at), v.size());
+      if (end > at)
+        list.push_back(u32(std::strtoul(v.substr(at, end - at).c_str(), nullptr, 16)));
+      at = end + 1;
+    }
+    return list;
   }();
+  if (vas.empty())
+    return false;
+  static const auto start = std::chrono::steady_clock::now();
+  const size_t turn =
+      size_t(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() / 4);
+  const u32 va = vas[turn % vas.size()];
+  static u32 logged_va = 0;
+  if (va != logged_va) {
+    logged_va = va;
+    RGPU_INFO("[show] texture {:08X} on screen", va);
+  }
   if (!va)
     return false;
   HostTexture *t = FindHostTextureLocked(va);
@@ -482,10 +650,12 @@ void PresentLocked(VideoState &s, const PresentImage *image) {
   const uint32_t out_w = s.swap_chain->getWidth();
   const uint32_t out_h = s.swap_chain->getHeight();
 
+  const bool scan_out = image && image->texture && image->descriptor != kInvalidDescriptor;
+  // shh-nx (shh_fsr): EASU before the back buffer's pass; RCAS then takes the plain scan-out's place.
+  const bool fsr = scan_out && RecordFsrUpscaleLocked(s, *image, out_w, out_h);
   cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
                 plume::RenderTextureBarrier(back, plume::RenderTextureLayout::COLOR_WRITE));
   cmd->setFramebuffer(back_fb);
-  const bool scan_out = image && image->texture && image->descriptor != kInvalidDescriptor;
   // Letterbox bars (and the whole output when there is no guest image). banjo-nx (2026-10-19, GPU): not when the
   // frame covers the whole output, where the scan-out writes every pixel the clear would.
   bool covers = false;
@@ -498,7 +668,9 @@ void PresentLocked(VideoState &s, const PresentImage *image) {
   if (!covers)
     cmd->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
 
-  if (scan_out)
+  if (fsr)
+    RecordFsrSharpenLocked(s, *image, out_w, out_h);
+  else if (scan_out)
     RecordScanOut(s, *image, out_w, out_h);
 
   cmd->setViewports(plume::RenderViewport(0.0f, 0.0f, float(out_w), float(out_h)));

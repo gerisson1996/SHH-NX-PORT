@@ -23,6 +23,20 @@ if /i "%~2"=="nonvk" (
   set BUILD=%ROOT%\out\switch-deko
   set NO_NVK=ON
 )
+rem shh-nx (2026-11-11, PGO, from mgsv-nx): deko3d builds in folders of their own.
+rem   pgo-generate  out\switch-pgo-gen\shh.nro, instrumented: play it, it writes pgo\shh_pgo_<N>.stream beside it
+rem   pgo-use       out\switch-pgo-use\shh.nro, optimised with pgo\ (tools\pgo_merge.ps1 makes it)
+set PGO=
+if /i "%~2"=="pgo-generate" (
+  set BUILD=%ROOT%\out\switch-pgo-gen
+  set NO_NVK=ON
+  set PGO=generate
+)
+if /i "%~2"=="pgo-use" (
+  set BUILD=%ROOT%\out\switch-pgo-use
+  set NO_NVK=ON
+  set PGO=use
+)
 set VS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools
 if defined VSINSTALL set VS=%VSINSTALL%
 rem devkitPro sets DEVKITPRO=/opt/devkitpro (MSYS form), which CMake on Windows cannot use.
@@ -39,5 +53,8 @@ if not exist "%BUILD%\CMakeCache.txt" (
     -DPython3_EXECUTABLE="%PYTHON%" ^
     -DREXSDK_DIR="%ROOT%\sdk" -DREXGLUE_SWITCH_NVK_SDK="%NVK_SDK%" || exit /b 1
 )
-cmake "%BUILD%" -DREXGLUE_SWITCH_NO_NVK=%NO_NVK% -DSHH_RENUT_RENDERER=ON > nul || exit /b 1
-cmake --build "%BUILD%" --target shh || exit /b 1
+cmake "%BUILD%" -DREXGLUE_SWITCH_NO_NVK=%NO_NVK% -DSHH_RENUT_RENDERER=ON "-DSHH_PGO=%PGO%" > nul || exit /b 1
+rem SHH_BUILD_JOBS limits the parallel compiles (a fresh tree can run out of memory).
+set JOBS_ARG=
+if not "%SHH_BUILD_JOBS%"=="" set JOBS_ARG=-j %SHH_BUILD_JOBS%
+cmake --build "%BUILD%" --target shh %JOBS_ARG% || exit /b 1

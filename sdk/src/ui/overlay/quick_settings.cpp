@@ -45,6 +45,9 @@ class QuickSettingsDialog final : public ImGuiDialog {
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
+    // shh-nx (2026-11-11): with the gyro's settings the menu is taller than a 720p screen: it scrolls past 90 % of the
+    // height (the controller's focus scrolls it).
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(io.DisplaySize.x * 0.95f, io.DisplaySize.y * 0.9f));
     ImGui::SetNextWindowBgAlpha(0.9f);
     // The controller lands in the menu as it opens.
     if (!focused_) {

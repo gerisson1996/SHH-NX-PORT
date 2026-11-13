@@ -38,6 +38,7 @@ Libraries used by the SDK, the NRO and the code generator, fetched from the subm
 | [utfcpp](https://github.com/nemtrif/utfcpp) | BSL-1.0 |
 | [CLI11](https://github.com/CLIUtils/CLI11) | BSD-3-Clause |
 | AES-128 by LuoPeng (`thirdparty/aes_128`) | MIT |
+| [AMD FidelityFX Super Resolution 1.0](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (EASU and RCAS, rewritten in `fsr_easu_ps.hlsl` and `fsr_rcas_ps.hlsl`), Copyright (c) 2021 Advanced Micro Devices, Inc. | MIT |
 | [libnx](https://github.com/switchbrew/libnx) and the devkitA64 runtime (newlib, libstdc++) | ISC; newlib and GCC runtime licenses |
 
 ### FFmpeg and libmspack (LGPL)

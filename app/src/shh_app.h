@@ -26,6 +26,7 @@
 #include "renut_engine/gpu/overlay/app_integration.h"
 #include "renut_engine/shh_compat/fast_boot.h"
 #include "me/sa2_render_mode.h"
+#include "shh_pgo.h"  // shh-nx (2026-11-11): the PGO-instrumented build's counts (nothing in other builds)
 #endif
 
 class ShhApp : public rex::ReXApp {
@@ -34,6 +35,21 @@ class ShhApp : public rex::ReXApp {
 
   static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
     return std::unique_ptr<ShhApp>(new ShhApp(ctx, "shh", PPCImageConfig));
+  }
+
+  // shh-nx (2026-11-11, from mgsv-nx): the PGO-instrumented build (SHH_PGO=generate) saves its counts to pgo/ every
+  // 2 minutes, when the game loses focus (HOME menu: it may be closed from there) and at exit. Nothing otherwise.
+  void OnPostSetup() override {
+    rex::ReXApp::OnPostSetup();
+    shh::pgo::Start();
+  }
+  void OnWindowFocusChanged(bool focused) override {
+    rex::ReXApp::OnWindowFocusChanged(focused);
+    if (!focused) shh::pgo::DumpNow();
+  }
+  void OnShutdown() override {
+    shh::pgo::Stop();
+    rex::ReXApp::OnShutdown();
   }
 
   // Settings the game needs, so that a plain "shh.exe" starts like the long command line.
@@ -73,7 +89,9 @@ class ShhApp : public rex::ReXApp {
     // depth and colour traffic; single-sample on the Switch (the PC keeps the game's 2x).
     SetIfNotRequested("shh_renut_single_sample", "true");
     // shh-nx (2026-10-29, docs/perfil-shh.md SHH-08): the shadow maps at 2/3 (a menu choice later).
-    SetIfNotRequested("shh_shadow_quality", "Medium");
+    // shh-nx (2026-11-11, the user's request: the PC's shadows): High again, now never below the console's map size
+    // (graphics_options.cpp); Medium stays in the menu for more fps.
+    SetIfNotRequested("shh_shadow_quality", "High");
     // shh-nx (2026-10-29, docs/perfil-shh.md SHH-06): audio latency. Default 10 frames queue + 3x4 audout buffers
     // gave ~100 ms latency (desync with video). 6 frames queue + 3x2 audout buffers lowers latency to ~53 ms.
     SetIfNotRequested("audio_switch_frames_in_queue", "6");
@@ -211,6 +229,37 @@ class ShhApp : public rex::ReXApp {
     settings.push_back(std::move(resolution));
 #endif
 
+    // shh-nx (2026-10-31): FSR 1 at scan-out (present.cpp, shh_fsr).
+    rex::ui::QuickSetting fsr;
+    fsr.cvar = "shh_fsr";
+    fsr.label = "AMD FSR 1 (upscale)";
+    fsr.choices = {{"true", "Ligado"}, {"false", "Desligado"}};
+    fsr.note = "abaixo de 720p (ou de 1080p na dock): imagem mais nitida";
+    settings.push_back(std::move(fsr));
+
+    rex::ui::QuickSetting sharpness;
+    sharpness.cvar = "shh_fsr_sharpness";
+    sharpness.label = "Nitidez do FSR (menor = mais nitido)";
+    sharpness.min = 0.0f;
+    sharpness.max = 2.0f;
+    sharpness.note = "0.25 padrao";
+    settings.push_back(std::move(sharpness));
+
+    // shh-nx (2026-10-31): the game's film grain and bloom (draw.cpp, FrameEffectConstants).
+    rex::ui::QuickSetting grain;
+    grain.cvar = "shh_film_grain";
+    grain.label = "Granulado de filme";
+    grain.min = 0.0f;
+    grain.max = 1.0f;
+    grain.note = "1 e o original do jogo, 0 sem granulado";
+    settings.push_back(std::move(grain));
+
+    rex::ui::QuickSetting bloom;
+    bloom.cvar = "shh_bloom";
+    bloom.label = "Bloom (brilho em volta das luzes)";
+    bloom.choices = {{"true", "Ligado"}, {"false", "Desligado"}};
+    settings.push_back(std::move(bloom));
+
     rex::ui::QuickSetting shadows;
     shadows.cvar = "shh_shadow_quality";
     shadows.label = "Sombras";
@@ -232,7 +281,65 @@ class ShhApp : public rex::ReXApp {
     msaa.note = "vale ao reiniciar o jogo";
     settings.push_back(std::move(msaa));
 #endif
+#if SHH_RENUT_RENDERER
+    // shh-nx (2026-11-11): deeper black for OLED screens (present.cpp, shh_oled_black).
+    rex::ui::QuickSetting oled;
+    oled.cvar = "shh_oled_black";
+    oled.label = "Preto para tela OLED";
+    oled.choices = {{"-1", "Auto"}, {"0", "Desligado"}, {"1", "Leve"}, {"2", "Medio"}, {"3", "Forte"}};
+    oled.note = "auto: leve no Switch OLED fora da dock";
+    settings.push_back(std::move(oled));
+#endif
 #if REX_PLATFORM_SWITCH
+    // shh-nx (2026-11-11): gyro aiming (switch_input_driver.cpp).
+    rex::ui::QuickSetting gyro;
+    gyro.cvar = "input_gyro_mode";
+    gyro.label = "Giroscopio";
+    gyro.choices = {{"0", "Desligado"}, {"1", "Segurando ZL"}, {"3", "Segurando ZR"}, {"2", "Sempre"}};
+    settings.push_back(std::move(gyro));
+
+    rex::ui::QuickSetting gyro_speed;
+    gyro_speed.cvar = "input_gyro_speed";
+    gyro_speed.label = "Sensibilidade do giroscopio";
+    gyro_speed.min = 0.5f;
+    gyro_speed.max = 10.0f;
+    gyro_speed.note = "4 padrao";
+    settings.push_back(std::move(gyro_speed));
+
+    rex::ui::QuickSetting gyro_y;
+    gyro_y.cvar = "input_gyro_speed_y";
+    gyro_y.label = "Sensibilidade vertical (x horizontal)";
+    gyro_y.min = 0.25f;
+    gyro_y.max = 2.0f;
+    settings.push_back(std::move(gyro_y));
+
+    rex::ui::QuickSetting gyro_smooth;
+    gyro_smooth.cvar = "input_gyro_smoothing";
+    gyro_smooth.label = "Suavizacao do giroscopio";
+    gyro_smooth.min = 0.0f;
+    gyro_smooth.max = 1.0f;
+    gyro_smooth.note = "so nos movimentos lentos; 0.5 padrao";
+    settings.push_back(std::move(gyro_smooth));
+
+    rex::ui::QuickSetting gyro_dead;
+    gyro_dead.cvar = "input_gyro_deadzone";
+    gyro_dead.label = "Zona morta do giroscopio (graus/s)";
+    gyro_dead.min = 0.0f;
+    gyro_dead.max = 8.0f;
+    settings.push_back(std::move(gyro_dead));
+
+    rex::ui::QuickSetting gyro_inv_y;
+    gyro_inv_y.cvar = "input_gyro_invert_y";
+    gyro_inv_y.label = "Giroscopio: inverter vertical";
+    gyro_inv_y.choices = {{"false", "Normal"}, {"true", "Invertido"}};
+    settings.push_back(std::move(gyro_inv_y));
+
+    rex::ui::QuickSetting gyro_inv_x;
+    gyro_inv_x.cvar = "input_gyro_invert_x";
+    gyro_inv_x.label = "Giroscopio: inverter horizontal";
+    gyro_inv_x.choices = {{"false", "Normal"}, {"true", "Invertido"}};
+    settings.push_back(std::move(gyro_inv_x));
+
     rex::ui::QuickSetting buttons;
     buttons.cvar = "input_xbox_layout";
     buttons.label = "Botoes A/B/X/Y";

@@ -12,6 +12,8 @@ struct UtilityPush
     uint samplerIndex;
     float param0;
     float param1;
+    float param2;  // shh-nx (2026-11-11): present / fsr_rcas: the OLED black floor (scan_out.hlsli)
+    float param3;
 };
 
 #ifdef __spirv__

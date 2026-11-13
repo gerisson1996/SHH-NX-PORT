@@ -75,6 +75,23 @@ REXCVAR_DEFINE_BOOL(shh_renut_diag_2d_opaque, false, "Silent Hill/Renut",
                     "Diagnostic: draws of the 2D quad shader forced opaque, all channels written, no depth test");
 REXCVAR_DEFINE_BOOL(shh_renut_diag_2d_constants, false, "Silent Hill/Renut",
                     "Diagnostic: log the 2D quad shader's first pixel shader float constants (registers 0-15)");
+// shh-nx (2026-10-31): the game's user clip planes (SharedConstants::clip_planes), which Renut never applied: the
+// mirror's reflection drew the whole scene behind the mirror. Off: the shader package's vertex shaders do not read them
+// (tools/deko3d_glsl_opt.py, pass clipplane, left out: gl_ClipDistance cut triangles at random on the console).
+REXCVAR_DEFINE_BOOL(shh_renut_clip_planes, false, "Silent Hill/Renut",
+                    "Apply the game's user clip planes (the mirror's reflection; off: the scene behind it shows)");
+// The device words they come from (N&B's layout, SHH's).
+constexpr uint32_t kDeviceOffsetClipPlanes = 0x2820;   // m_ClipPlanes[6][4], big-endian floats (D3DDevice_SetClipPlane)
+constexpr uint32_t kDeviceOffsetClipControl = 0x2944;  // PA_CL_CLIP_CNTL: UCP_ENA 0-5, CLIP_DISABLE 16 (d3d_native.h)
+// shh-nx (2026-10-31, the port menu): the game's film grain and bloom, through the constants of their pixel shaders
+// (FrameEffectConstants). The grain is the final composite's: colour + colour * noise * c14.z, in the 8 composite
+// shaders; the bloom's bright pass keeps the pixels whose luma reaches c2.x, and the blur chain and the scene's
+// composite (0393542D884BDEDE: scene * c3.x + bloom * c3.y) add what it keeps.
+REXCVAR_DEFINE_DOUBLE(shh_film_grain, 1.0, "Silent Hill/Renut",
+                      "The game's film grain: 1 = as the game draws it, 0.5 half, 0 none")
+    .range(0.0, 1.0);
+REXCVAR_DEFINE_BOOL(shh_bloom, true, "Silent Hill/Renut",
+                    "The game's bloom (the glow around bright lights); off: no glow");
 // shh-nx (2026-10-29, 30 fps at stock clocks): a buffer the vertex shader reads by another index (vfetchBound: the
 // skinning's bone rows, the particles' inputs) was copied whole from the fetch constant's address to its end (~560 KB a
 // draw, ~116 MB a frame through the upload ring and its cache clean). Copied up to this many rows instead, or the draw's
@@ -295,6 +312,12 @@ struct SharedConstants {
   // to one tile has the tile's corner (ViewportState::pixel_origin).
   float pixel_origin[2];
   float pad_1352[2];
+  // 1360, shh-nx (2026-10-31, shh_renut_clip_planes): the game's user clip planes, in clip space (device m_ClipPlanes,
+  // D3DDevice_SetClipPlane), and those on (bit i = plane i: PA_CL_CLIP_CNTL's UCP_ENA bits, 0 with the clipping off).
+  // Only the vertex shaders read them (tools/deko3d_glsl_opt.py, pass clipplane: gl_ClipDistance).
+  float clip_planes[6][4];
+  u32 clip_planes_on;
+  u32 pad_1460[3];
 };
 static_assert(offsetof(SharedConstants, sampler_indices) == 384);
 static_assert(offsetof(SharedConstants, booleans) == 512);
@@ -312,7 +335,9 @@ static_assert(offsetof(SharedConstants, point_state) == 1312);
 static_assert(offsetof(SharedConstants, viewport_size) == 1328);
 static_assert(offsetof(SharedConstants, resolution_scale) == 1336);
 static_assert(offsetof(SharedConstants, pixel_origin) == 1344);
-static_assert(sizeof(SharedConstants) == 1360);
+static_assert(offsetof(SharedConstants, clip_planes) == 1360);
+static_assert(offsetof(SharedConstants, clip_planes_on) == 1456);
+static_assert(sizeof(SharedConstants) == 1472);
 static_assert(sizeof(SharedConstants) == kSharedConstantsUboBytes);
 
 // The guest D3DDevice a draw reads its state from: the live device, or a
@@ -1595,6 +1620,47 @@ FloatConstants DrawFloatConstants(const u8 *state, const ReplayConstants *replay
   return c;
 }
 
+// shh-nx (2026-10-31, shh_film_grain / shh_bloom): the pixel shader constants of a frame effect the menu changes, a
+// copy with the effect's register changed, for the grain's and the bloom's shaders when they are not as the game draws
+// them. The copy is untracked (no replay): the push and the upload compare it byte by byte, and the next draw, untracked
+// too, compares its own against what this one left.
+FloatConstants FrameEffectConstants(const FloatConstants &constants, uint64_t ps_hash) {
+  static constexpr uint64_t kGrainShaders[] = {0x0482BA20241CF441ull, 0x1811ACAC2F4CA142ull, 0x231AA94C5CD3C6A5ull,
+                                               0x42968E403581669Dull, 0x6F1B854A3673196Bull, 0xCDD7445072F3EC9Bull,
+                                               0xD7F4BD64CFD04639ull, 0xFA5D3498F2EAEFF5ull};
+  constexpr uint64_t kBloomBrightPass = 0x22FDD665E9AC4407ull;
+  u32 reg = 0, component = 0;
+  float value = 0.0f;
+  bool scale = false;  // value multiplies the game's (else replaces it)
+  if (ps_hash == kBloomBrightPass) {
+    if (REXCVAR_GET(shh_bloom))
+      return constants;
+    reg = 2;  // c2.x: the luma threshold, past any colour
+    value = 3.0e38f;
+  } else if (std::find(std::begin(kGrainShaders), std::end(kGrainShaders), ps_hash) != std::end(kGrainShaders)) {
+    const float grain = float(REXCVAR_GET(shh_film_grain));
+    if (grain >= 1.0f)
+      return constants;
+    reg = 14;  // c14.z: the grain's strength
+    component = 2;
+    value = grain;
+    scale = true;
+  } else {
+    return constants;
+  }
+  constexpr u32 kRegisters = 256;
+  static std::vector<u8> copy;
+  copy.resize(constants.offset + kRegisters * 16);
+  for (u32 r = 0; r < kRegisters; ++r)
+    std::memcpy(copy.data() + constants.offset + r * 16, constants.Register(r), 16);
+  auto *target = reinterpret_cast<be_f32 *>(copy.data() + constants.offset + reg * 16) + component;
+  *target = scale ? float(*target) * value : value;
+  FloatConstants out;
+  out.state = copy.data();
+  out.offset = constants.offset;
+  return out;
+}
+
 // Float constants go by groups of four registers (64 bytes): the unit m_Pending
 // marks dirty, and the one a replayed draw takes from its snapshot or from the
 // running device (FloatConstants::Register), so a group's bytes are contiguous.
@@ -2040,8 +2106,15 @@ TextureSlotMemo g_texture_slot_memo[kTextureMemoEntries];
 // sa2-nx (2026-10-20, sa2_renut_chain_reuse): 'slot_fx' (32 entries, or null) receives each bound slot's effects (its
 // memo entry's on a hit, the bind's otherwise) and 'all_memo' whether every bound slot went through the memo (a
 // texture header to key it), for the chain's reuse of the next draw.
+// shh-nx (2026-11-13, the black cutscene): the texture each fetch slot of the last filled draw holds, for DrawLog.
+u32 g_drawlog_textures[32] = {};
+u32 g_drawlog_fetch_mask = 0;
+
 void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc, BindEffects *slot_fx = nullptr,
                   bool *all_memo = nullptr) {
+  g_drawlog_fetch_mask = fetch_mask;
+  for (u32 r = 0; r < 32; ++r)
+    g_drawlog_textures[r] = (fetch_mask & (1u << r)) ? device.U32(d3d::kDeviceOffsetTextures + r * 4) : 0;
   if (all_memo)
     *all_memo = banjo::renut_gpu::CpuMemosOn();
   // sa2-nx (2026-10-20, sa2_renut_texture_defaults_copy): the null words as one copy of a block made once (160 stores a
@@ -4116,6 +4189,26 @@ void DrawLog(const DrawCall &call, const Geometry &geometry, const ShaderRecord 
   static uint32_t ordinal = 0;
   static uint64_t ordinal_frame = 0;
   const uint64_t frame = TextureFrameLocked();
+  // shh-nx (2026-11-13, the black cutscene): the depth-of-field composite (ps ADFC6EA65B18E5EC) every 5 s, with its
+  // textures, targets and alpha test words, wherever it runs.
+  if (ps && ps->hash == 0xADFC6EA65B18E5ECull) {
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last >= std::chrono::seconds(5)) {
+      last = now;
+      std::string tex;
+      for (u32 r = 0; r < 32; ++r)
+        if (g_drawlog_fetch_mask & (1u << r))
+          tex += fmt::format(" t{}={:08X}", r, g_drawlog_textures[r]);
+      const u32 *w = reinterpret_cast<const u32 *>(&sc);
+      const HostSurface *c = targets.color_count ? targets.colors[0] : nullptr;
+      RGPU_INFO("[composite] frame {}: fetch mask {:08X}{}; target {:08X} {}x{} fmt {}, depth {:08X}; dc {:08X} "
+                "blend {:08X} mask {:X}; alpha words {:08X} {:08X}",
+                frame, g_drawlog_fetch_mask, tex, c ? c->guest_va : 0, c ? c->width : 0, c ? c->height : 0,
+                c ? int(c->format) : -1, targets.depth ? targets.depth->guest_va : 0, key.depth_control,
+                key.blend_control[0], key.color_mask, w[34 * 4 + 2], w[34 * 4 + 3]);
+    }
+  }
   if (!first_frame) {
     if (std::chrono::steady_clock::now() - start < std::chrono::seconds(at))
       return;
@@ -4237,7 +4330,10 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   // Earlier memexport results reach guest memory before this draw reads them
   // (WaitForExportsLocked may submit the list: before anything is recorded).
   const FloatConstants vs_constants = DrawFloatConstants(device_state, replay, false);
-  const FloatConstants ps_constants = DrawFloatConstants(device_state, replay, true);
+  // shh-nx (shh_film_grain / shh_bloom): the frame effects' constants as the menu sets them.
+  const FloatConstants ps_constants =
+      ps ? FrameEffectConstants(DrawFloatConstants(device_state, replay, true), ps->hash)
+         : DrawFloatConstants(device_state, replay, true);
   // shh-nx (2026-10-29, shh_renut_diag_2d_constants): the 2D quad shader's first float constants, which its colour and
   // alpha are made from (mFinalTint, mFinalAdd, mDiffuseMultiplier, the fog's), for a 2D layer that draws nothing.
   {
@@ -4580,6 +4676,23 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   sc.viewport_size[1] = viewport.guest_size[1];
   sc.resolution_scale = targets.scale.Factor();
   std::memcpy(sc.pixel_origin, viewport.pixel_origin, sizeof(sc.pixel_origin));  // Renut upstream 574b488
+  // shh-nx (2026-10-31, shh_renut_clip_planes): the user clip planes, as the console's rasterizer cuts with them.
+  {
+    static const bool clip_planes = REXCVAR_GET(shh_renut_clip_planes);
+    const u32 clip_control = device.U32(kDeviceOffsetClipControl);
+    const u32 on = clip_planes && !((clip_control >> 16) & 1) ? clip_control & 0x3Fu : 0u;
+    sc.clip_planes_on = on;
+    for (u32 i = 0; i < 6; ++i)
+      for (u32 c = 0; c < 4; ++c)
+        sc.clip_planes[i][c] = (on >> i) & 1 ? device.F32(kDeviceOffsetClipPlanes + i * 16 + c * 4) : 0.0f;
+    static bool logged = false;
+    if (on && !logged) {
+      logged = true;
+      RGPU_INFO("[clip] user clip planes in use: on {:02X}, plane 0 ({:.3g}, {:.3g}, {:.3g}, {:.3g}) (PS {:016X})", on,
+                sc.clip_planes[0][0], sc.clip_planes[0][1], sc.clip_planes[0][2], sc.clip_planes[0][3],
+                ps ? ps->hash : 0);
+    }
+  }
   if (call.primitive == kPointList) {
     // PA_SU_POINT_SIZE: height 0-15, width 16-31, half the size in 12.4 fixed
     // point (SetRenderState_PointSize 0x8264C6C0 stores the size * 8);

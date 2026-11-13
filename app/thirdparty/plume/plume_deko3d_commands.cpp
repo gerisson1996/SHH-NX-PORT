@@ -1034,6 +1034,23 @@ namespace plume {
         dkCmdBufReportCounter(cmd, DkCounter_Timestamp, dkMemBlockGetGpuAddr(pool->block) + uint64_t(queryIndex) * 16);
     }
 
+    // shh-nx (2026-10-31): the samples counter before and after the query's draws; the pool reads the difference.
+    void Deko3DCommandList::beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+        const Deko3DQueryPool *pool = static_cast<const Deko3DQueryPool *>(queryPool);
+        if (!pool || !pool->block || !pool->occlusion || queryIndex >= pool->results.size())
+            return;
+        flushBarriers();
+        dkCmdBufReportCounter(cmd, DkCounter_SamplesPassed, dkMemBlockGetGpuAddr(pool->block) + uint64_t(queryIndex) * 32);
+    }
+
+    void Deko3DCommandList::endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+        const Deko3DQueryPool *pool = static_cast<const Deko3DQueryPool *>(queryPool);
+        if (!pool || !pool->block || !pool->occlusion || queryIndex >= pool->results.size())
+            return;
+        flushBarriers();
+        dkCmdBufReportCounter(cmd, DkCounter_SamplesPassed, dkMemBlockGetGpuAddr(pool->block) + uint64_t(queryIndex) * 32 + 16);
+    }
+
     void Deko3DCommandList::setBlendConstant(const float rgba[4]) {
         if (memcmp(blendConstant, rgba, sizeof(blendConstant)) == 0)
             return;

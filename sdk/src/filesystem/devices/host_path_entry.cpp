@@ -167,6 +167,11 @@ X_STATUS HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>&
 }
 
 void HostPathEntry::update() {
+  // shh-nx (2026-11-11, the console's slow start): NtQueryInformationFile (FileNetworkOpenInformation) calls this on every
+  // query, and the game asks thousands of times while it loads SHADERS.PAK: each a stat() on the SD card, 62 % of the
+  // main thread in the 7.4 s between the render thread's start and the first frame (0.15 s on PC). On a read-only
+  // device (the game folder) a file cannot change, and its size came with the entry (Create, from the mount's index).
+  if (device_->is_read_only()) return;
   rex::filesystem::FileInfo file_info;
   if (!rex::filesystem::GetInfo(host_path_, &file_info)) {
     return;

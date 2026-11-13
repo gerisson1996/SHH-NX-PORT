@@ -968,7 +968,24 @@ unsigned Deko3DUamFlags() {
     flags &= ~256u;
   return flags;
 }
-int Deko3DCompileCore() { return REXCVAR_GET(banjo_background_compile_core); }
+// shh-nx (2026-11-11, from mgsv-nx): the uam thread on the system core when the process has one (four-core mode;
+// banjo_system_core_uam), at its low priority, so the audio threads there go first.
+REXCVAR_DEFINE_BOOL(banjo_system_core_uam, true, "Banjo/Threads",
+                    "When the process has the system core (four cores): the uam shader compile thread runs there "
+                    "instead of on banjo_background_compile_core. No effect with the usual three cores")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(shh_render_thread_system_core, true, "Banjo/Threads",
+                    "Four cores with banjo_system_core = 2: the render thread prefers the system core (core 3), "
+                    "keeping its whole mask, so the game's threads keep cores 0-2")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+int Deko3DCompileCore() {
+  if (REXCVAR_GET(banjo_system_core_uam)) {
+    const int system_core = RexSwitchSystemCore();
+    if (system_core >= 0)
+      return system_core;
+  }
+  return REXCVAR_GET(banjo_background_compile_core);
+}
 int Deko3DCompilePriority() { return REXCVAR_GET(banjo_deko3d_compile_priority); }
 
 
@@ -1342,17 +1359,47 @@ void OnRenderThreadStart() {
   const bool priority_ok = RexSwitchSetCurrentThreadPriorityOk(kRenderThreadPriority);
   const int32_t core = REXCVAR_GET(banjo_ring_core);
   const bool core_ok = core < 0 || RexSwitchPinCurrentThreadToCore(int(core));
-  REXLOG_INFO("[renut] render thread at priority 0x{:X}{}, {} (banjo_ring_core), now on core {}",
+  // shh-nx (2026-11-11, from mgsv-nx, shh_render_thread_system_core): in four-core mode with banjo_system_core 2 the
+  // render thread's ideal core is the system core, with its whole mask kept (the kernel may still move it).
+  bool ideal_ok = false;
+  const int system_core = RexSwitchSystemCore();
+  if (core < 0 && system_core >= 0 && RexSwitchSystemCoreMode() >= 2 && REXCVAR_GET(shh_render_thread_system_core))
+    ideal_ok = RexSwitchSetCurrentThreadCore(system_core);
+  REXLOG_INFO("[renut] render thread at priority 0x{:X}{}, {} (banjo_ring_core), ideal core {}, now on core {}",
               kRenderThreadPriority, priority_ok ? "" : " (NOT accepted)",
               core < 0 ? std::string("not pinned")
                        : fmt::format("pinned to core {}{}", core, core_ok ? "" : " (NOT accepted)"),
+              ideal_ok ? fmt::format("{} (the system core)", system_core) : std::string("none"),
               RexSwitchCurrentCore());
+  {  // shh-nx (2026-11-11, from mgsv-nx): the four-core mode's state.
+    char cores[384];
+    RexSwitchSystemCoreDescribe(cores, sizeof(cores));
+    REXLOG_INFO("[banjo] system core: {}", cores);
+  }
 #endif
 }
+
+// shh-nx (2026-11-11, the user's request: the console's slow start): in four-core mode the background threads
+// (pipeline prebuild workers, ring cleaner, content verifier) go to the system core. With banjo_system_core 2 they
+// prefer it and keep every core (the boot's prebuild still spills onto 0-2 when core 3 is busy); with 1, core 3 alone.
+REXCVAR_DEFINE_BOOL(shh_system_core_background, true, "Banjo/Threads",
+                    "Four cores: the Renut background threads (pipeline prebuild, ring cleaner) on the system core "
+                    "instead of banjo_background_compile_core. No effect with the usual three cores")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 void OnBackgroundThreadStart(const char *what) {
 #if REX_PLATFORM_SWITCH
   const bool priority_ok = RexSwitchSetCurrentThreadPriorityOk(kBackgroundPriority);
+  if (const int system_core = RexSwitchSystemCore();
+      system_core >= 0 && REXCVAR_GET(shh_system_core_background)) {
+    const bool spill = RexSwitchSystemCoreMode() >= 2;
+    const bool ok = spill ? RexSwitchUnpinCurrentThread(system_core) : RexSwitchMoveCurrentThreadToSystemCore(-1);
+    REXLOG_INFO("[renut] {} at priority 0x{:X}{}, {} {}{} (shh_system_core_background), now on core {}", what,
+                kBackgroundPriority, priority_ok ? "" : " (NOT accepted)",
+                spill ? "every core, preferring the system core" : "pinned to the system core", system_core,
+                ok ? "" : " (NOT accepted)", RexSwitchCurrentCore());
+    return;
+  }
   const int32_t core = REXCVAR_GET(banjo_background_compile_core);
   const bool core_ok = core < 0 || RexSwitchPinCurrentThreadToCore(int(core));
   REXLOG_INFO("[renut] {} at priority 0x{:X}{}, {} (banjo_background_compile_core)", what, kBackgroundPriority,

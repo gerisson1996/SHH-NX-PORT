@@ -2412,6 +2412,35 @@ def pass_lightgate(text):
     return insert_before_main(text[:a] + '\n'.join(lines) + text[b:], decl)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# pass: clipplane — the game's user clip planes (shh-nx, 2026-10-31)
+
+# SharedConstants (render/draw.cpp) grows past the 85 vectors every shader declares: 85-90 the six planes (clip space),
+# 91.x the planes on (bit i = plane i, PA_CL_CLIP_CNTL's UCP_ENA bits; 0 when the clipping is off). Only the vertex
+# shaders declare the longer block, so the pixel shaders and their compiled variants stay as they are.
+CLIP_SHARED_VECTORS = 92
+CLIP_POS_RE = re.compile(r'else\s*\{\s*(_\w+) = ([^;]+);\s*\}\s*gl_Position = \1;')
+
+
+def pass_clipplane(text):
+    """The game's user clip planes (D3DDevice_SetClipPlane, D3DRS_CLIPPLANEENABLE), which Renut never applied: each
+    enabled plane's distance, dot(guest clip-space position, plane), to gl_ClipDistance (1 for a plane off), so the
+    rasterizer cuts what the plane removes on the console: the mirror's reflected scene, behind the mirror, was drawn
+    whole. The guest position is the value the screen-space branch's else gives gl_Position."""
+    if 'gl_ClipDistance' in text or not CLIP_POS_RE.search(text):
+        return text
+    decl = re.search(r'(uniform type_ConstantBuffer_RenutUboShared\s*\{\s*uvec4 v\[)85(\];)', text)
+    if not decl:
+        return text
+    text = text[:decl.start()] + decl.group(1) + str(CLIP_SHARED_VECTORS) + decl.group(2) + text[decl.end():]
+    m = CLIP_POS_RE.search(text)
+    lines = [f'    vec4 dk_ucpPos = {m.group(2)};', '    uint dk_ucpOn = g_UboShared.v[91u].x;']
+    for i in range(6):
+        lines.append(f'    gl_ClipDistance[{i}] = ((dk_ucpOn & {1 << i}u) != 0u) ? '
+                     f'dot(dk_ucpPos, uintBitsToFloat(g_UboShared.v[{85 + i}u])) : 1.0;')
+    return text[:m.end()] + '\n' + '\n'.join(lines) + text[m.end():]
+
+
 PASSES = [
     ('scale1', pass_scale1),
     ('fragscale', pass_fragscale),
@@ -2442,12 +2471,15 @@ PASSES = [
     ('aw4', pass_aw4),
     ('boundtype', pass_boundtype),
     ('lightgate', pass_lightgate),
+    ('clipplane', pass_clipplane),
 ]
-DEFAULT = ','.join(name for name, _ in PASSES)
+# clipplane is left out: on the console every vertex shader that wrote gl_ClipDistance lost triangles at random, with
+# all planes off (NRO 05D3CD49, shh_006.log: holes in the characters, floors gone). Only by name, for a new attempt.
+DEFAULT = ','.join(name for name, _ in PASSES if name != 'clipplane')
 
 
 # The passes for one stage only.
-STAGE_OF = {'lightgate': 'frag', 'boundtype': 'vert', 'bonesel': 'vert', 'aw4': 'vert', 'lightbranch': 'frag', 'nullps': 'frag', 'gpr32': 'frag', 'earlyz': 'frag', 'txq': 'frag', 'alpha': 'frag', 'alphamask': 'frag', 'earlyhoist': 'frag', 'tess': 'vert', 'vsout': 'vert', 'vszero': 'vert', 'pszero': 'frag'}
+STAGE_OF = {'clipplane': 'vert', 'lightgate': 'frag', 'boundtype': 'vert', 'bonesel': 'vert', 'aw4': 'vert', 'lightbranch': 'frag', 'nullps': 'frag', 'gpr32': 'frag', 'earlyz': 'frag', 'txq': 'frag', 'alpha': 'frag', 'alphamask': 'frag', 'earlyhoist': 'frag', 'tess': 'vert', 'vsout': 'vert', 'vszero': 'vert', 'pszero': 'frag'}
 
 
 def optimise(text, passes=DEFAULT, stage=None, name=None):

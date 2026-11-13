@@ -27,6 +27,9 @@
 #include <rex/cvar.h>
 
 REXCVAR_DECLARE(bool, sa2_renut_direct_resolve_mips);  // sa2-nx (2026-10-28): render/draw.cpp
+REXCVAR_DEFINE_BOOL(shh_renut_null_texture_fetch, true, "SHH/Renderer",
+                    "A fetch slot the game set to no texture still samples the texture its fetch constant describes, "
+                    "as the GPU does (the black cutscene after the room 301 door: the depth-of-field composite)");
 
 namespace renut::gpu {
 
@@ -1097,6 +1100,34 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
   TextureBinding binding;
   binding.dimension = HostDimension(device_fetch);
   binding.slot = NullSlot(binding.dimension);
+  // shh-nx (2026-11-13, the black cutscene after the room 301 door): SetTexture(NULL) leaves the device's fetch
+  // constant as it was and the GPU samples what it describes. The game unsets the depth-of-field composite's blur and
+  // depth textures there (shh_185.log: t1=00000000 t2=00000000) and the null texture made the frame black. The last
+  // texture bound over the same base page stands in, while the fetch constant still describes that texture.
+  static std::unordered_map<u32, u32> va_by_base_page;
+  static const bool null_fetch = REXCVAR_GET(shh_renut_null_texture_fetch);
+  if (!texture_va && null_fetch && device_fetch.IsTexture()) {
+    // Its header may describe other data by now (the blur's does, shh_187.log): the device's fetch constant is what is
+    // sampled, and the code below takes it whenever the header's base page differs.
+    if (const auto it = va_by_base_page.find(device_fetch.BasePage()); it != va_by_base_page.end()) {
+      if (GuestPtr<const d3d::BaseTexture>(it->second)) {
+        texture_va = it->second;
+        static uint32_t logged = 0;
+        if (logged++ < 8)
+          RGPU_INFO("[null fetch] frame {}: a slot set to no texture samples {:08X}, as its fetch constant describes",
+                    g_frame, texture_va);
+      }
+    }
+  }
+  if (!texture_va && null_fetch) {
+    static uint32_t logged = 0;
+    if (logged++ < 16)
+      RGPU_INFO("[null fetch] frame {}: a slot set to no texture stays null: fetch {:08X} {:08X} {:08X} {:08X} {:08X} "
+                "{:08X} (texture {}, base page {:05X} {})",
+                g_frame, device_fetch.dword[0], device_fetch.dword[1], device_fetch.dword[2], device_fetch.dword[3],
+                device_fetch.dword[4], device_fetch.dword[5], device_fetch.IsTexture(), device_fetch.BasePage(),
+                va_by_base_page.count(device_fetch.BasePage()) ? "known" : "unknown");
+  }
   if (!texture_va)
     return binding;
   const auto *header = GuestPtr<const d3d::BaseTexture>(texture_va);
@@ -1111,6 +1142,8 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
     fetch = device_fetch;
   if (!fetch.IsTexture())
     return binding;
+  if (null_fetch)
+    va_by_base_page[fetch.BasePage()] = texture_va;
 
   u32 desc[6];
   MaskedDesc(fetch, desc);

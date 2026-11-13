@@ -17,12 +17,15 @@
 #endif
 
 #if REX_PLATFORM_SWITCH
-#include <threading_switch.h>
-inline bool RexSwitchUnpinCurrentThread(int) { return false; }
+#include <threading_switch.h>  // shh-nx (2026-11-11): RexSwitchUnpinCurrentThread and the system core are there now
 #else
 inline bool RexSwitchSetCurrentThreadPriorityOk(int) { return true; }
 inline int RexSwitchCurrentCore() { return -1; }
 inline bool RexSwitchSetCurrentThreadCore(int) { return true; }
 inline bool RexSwitchPinCurrentThreadToCore(int) { return true; }
 inline bool RexSwitchUnpinCurrentThread(int) { return true; }
+// shh-nx (2026-11-11, from mgsv-nx): the system core (four-core mode): never there off the Switch.
+inline int RexSwitchSystemCore() { return -1; }
+inline int RexSwitchSystemCoreMode() { return 0; }
+inline bool RexSwitchMoveCurrentThreadToSystemCore(int) { return false; }
 #endif

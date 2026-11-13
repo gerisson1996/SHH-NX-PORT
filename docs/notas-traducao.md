@@ -12,6 +12,9 @@
 - The emulated Xenos GPU was too slow on the Switch; the game draws through Renut (Direct3D 9 on deko3d), from the
   sa2-nx and banjo-nx ports.
 - CPU: the code generator's register-as-local options (`app/overrides.toml`, top) and `setjmp`/`longjmp`
-  (`0x8292CE20` / `0x8292CB00`). `non_volatile_as_local` stays off: with it the game crashed in `sub_8240AAD0`.
+  (`0x8292CE20` / `0x8292CB00`). Stage 2 (2026-11-11): `non_volatile_as_local` and `elide_lr_stores` on. The old crash in
+  `sub_8240AAD0` came from gap code reading its owner's live registers: `tools/lee_antes.py` found 299 such fragments,
+  listed in `tools/comparten_registros.txt` and marked `share_registers` in `app/huecos.toml` (4 more functions in
+  `app/overrides.toml`). PC boots to gameplay with it; stage 1 code in `out/gen_backup_stage1`, NRO in `out/nro_stage1`.
 - GPU at 720p handheld: see `docs/perfil-shh.md` (single sample, shadows at 2/3, bound-fetch types and point-light
   gating as specialization constants, the scene's two-half resolve joined).

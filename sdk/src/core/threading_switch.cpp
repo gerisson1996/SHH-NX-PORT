@@ -26,9 +26,56 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include <cstring>
+#include <atomic>   // banjo-nx (2026-10-27): the system core
+#include <cstring>  // banjo-nx (2026-10-20, from sa2-nx): RexSwitchSetThreadMaskOf
 #include <mutex>
 #include <unordered_map>
+
+#include <rex/cvar.h>  // banjo-nx (2026-10-27): banjo_system_core
+#include <sys/stat.h>   // banjo-nx (2026-10-27): mkdir (RexSwitchEnsureForwarderNpdm)
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+// banjo-nx (2026-10-27, the user's request; NetherSX2_nx's 4-core mode, MIT, NaGaa95). See threading_switch.h.
+// mgsv-nx (2026-11-09): 2 by default. On the console (MGSV, heavy open world) the render thread, a libnx thread whose
+// mask stays 0xF, went from 52 % to 71 % of a core and the heavy scenes from 18-24 to 21-28 fps; audio stayed right
+// (its threads outrank the game's on core 3). The game's XThreads keep 0x7 (their affinity is set apart).
+REXCVAR_DEFINE_INT32(banjo_system_core, 2, "Banjo/Threads",
+                     "When the process is granted all four cores (a forwarder whose NPDM allows CPU 0-3, as "
+                     "NetherSX2_nx's): 0 = leave core 3 to the system, 1 = audio, the XMA decoder, the XAudio mixer "
+                     "thread and shader compiles each pinned to core 3, every other thread on cores 0-2 "
+                     "(NetherSX2_nx's layout), 2 = as 1 and the other threads allowed on core 3 too. No effect with "
+                     "the usual three cores")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-10-27, after the first four-core console run: audio stutters with core 3 at 1-2 % idle; the system
+// takes about half of it, our tenants took 41-55 %): the XMA Decoder off core 3 by default (it decodes ahead into
+// buffers), and the XAudio mixer above the game threads' priority there.
+REXCVAR_DEFINE_BOOL(banjo_system_core_xma, false, "Banjo/Threads",
+                    "Four-core mode: the XMA Decoder thread on the system core too (it took 5-13 % of it in the city; "
+                    "off: it runs with the game threads on cores 0-2)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(banjo_system_core_mixer_priority, 0x2D, "Banjo/Threads",
+                     "Four-core mode: the XAudio mixer threads' priority on the system core (0x2D: below the audio "
+                     "output (0x2A) and the Audio Worker (0x2B), above anything at the game threads' 0x3B; -1 keeps the "
+                     "guest priority)")
+    .range(-1, 0x3B)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-10-27, the user's request): the forwarder whose NPDM Banjo writes (RexSwitchEnsureForwarderNpdm).
+// mgsv-nx (2026-11-09): "auto" by default: only a forwarder Sphaira made for this NRO (SphairaForwarderOfThisNro).
+REXCVAR_DEFINE_STRING(banjo_forwarder_program_id, "auto", "Banjo/Threads",
+                      "Program id (16 hex digits) of the forwarder that launches Banjo. Running under that id, Banjo "
+                      "writes sdmc:/atmosphere/contents/<id>/exefs/main.npdm (an NPDM granting CPU 0-3, Atmosphere's "
+                      "ExeFS file replacement) when it is missing or different; the next launch of the forwarder gets "
+                      "all four cores (banjo_system_core). Under any other id (a game's, through title takeover) "
+                      "nothing is written. \"auto\": only a forwarder Sphaira made for this NRO. Empty: never")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_system_core_test, false, "Banjo/Debug",
+                    "Test of banjo_system_core's layout without a four-core launch: the process's highest core (2 with "
+                    "the usual three) is treated as the system core, so the moves, the hooks and the mask wrap run in "
+                    "an emulator. Slower on a console (the game keeps two cores)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace {
 
@@ -301,6 +348,17 @@ bool RexSwitchSetCurrentThreadCore(int core) {
   return R_SUCCEEDED(svcSetThreadCoreMask(h, core, mask));
 }
 
+/*
+ * The real pin, with the mask reduced to a single core.
+ *
+ * Measured: a preferred core is not enough. Horizon accepts it and moves the thread anyway (0.24
+ * migrations per loop, wherever it is set). This takes the other cores away from the thread.
+ *
+ * Different from RexSwitchSetCurrentThreadCore and more dangerous: if that core saturates, the
+ * thread does not get to run. That is why it sits behind a cvar that is off by default and is
+ * checked in the log. See docs/platform-notes.md (Threads).
+ */
+// banjo-nx (2026-10-20, from sa2-nx): the core layout's mask setters (RexSetGuestThreadCoreLayout, xthread.cpp).
 bool RexSwitchSetThreadMaskOf(void* native_handle, int preferred, unsigned long long mask) {
   pthread_t thread;
   static_assert(sizeof(thread) == sizeof(native_handle));
@@ -344,6 +402,11 @@ bool RexSwitchPinCurrentThreadToCore(int core) {
   if (core < 0) {
     return false;
   }
+  // banjo-nx (2026-10-27): the system core is not in a thread's mask (__wrap_svcSetThreadCoreMask takes it out), so
+  // the check below would refuse it; when the process has it, the pin goes there.
+  if (core == RexSwitchSystemCore()) {
+    return RexSwitchMoveCurrentThreadToSystemCore(-1);
+  }
   Thread* yo = threadGetSelf();
   Handle h = (yo != nullptr) ? yo->handle : CUR_THREAD_HANDLE;
   s32 preferred = 0;
@@ -360,6 +423,23 @@ bool RexSwitchPinCurrentThreadToCore(int core) {
     return false;  // that core is not this process's
   }
   return R_SUCCEEDED(svcSetThreadCoreMask(h, core, that_only));
+}
+
+bool RexSwitchUnpinCurrentThread(int core) {
+  // banjo-nx (2026-10-27): the app cores (the process's without the system core: RexSwitchAppCoreMask).
+  const u64 process_mask = RexSwitchAppCoreMask();
+  if (process_mask == 0) {
+    return false;
+  }
+  Thread* yo = threadGetSelf();
+  const Handle h = (yo != nullptr) ? yo->handle : CUR_THREAD_HANDLE;
+  // -1 is the kernel's "don't care" (what an unpinned thread shows); -2 would take the process's ideal core AND reduce
+  // the mask to it.
+  const s32 preferred = (core >= 0 && (process_mask & (u64(1) << core)) != 0) ? s32(core) : s32(-1);
+  if (R_SUCCEEDED(svcSetThreadCoreMask(h, preferred, process_mask))) {
+    return true;
+  }
+  return h != CUR_THREAD_HANDLE && R_SUCCEEDED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, preferred, process_mask));
 }
 
 /*
@@ -400,6 +480,234 @@ void RexSwitchDescribeThreadFailure(size_t stack_size, char* out, size_t out_len
            heap_ok ? "has" : "has NO", block >> 10, heap_total >> 20, size_t(mi.arena) >> 20,
            size_t(mi.uordblks) >> 20, size_t(mi.fordblks) >> 20, size_t(mi.ordblks),
            mirror != nullptr ? "has room" : "is FULL", (long long)threads_now, (long long)threads_cap);
+}
+
+/*
+ * --- the system core (banjo-nx, 2026-10-27; NetherSX2_nx's 4-core mode, MIT, NaGaa95) ------------------------
+ *
+ * NetherSX2_nx (source/pthr.c, core_init_once): with four cores granted the top one is kept for background
+ * threads, each pinned there alone (pthr_pin_bg_core: svcSetThreadCoreMask(CUR_THREAD_HANDLE, bg, 1 << bg)),
+ * and the heavy threads keep the first three; with three or fewer, nothing changes. Its forwarder widens the main
+ * thread to the whole grant before the NRO starts (launcher/fwd/main.c, restoreMainThreadAffinity), and libnx's
+ * pthread_create gives every new thread the whole grant too (newlib.o, __syscall_thread_create:
+ * svcSetThreadCoreMask(handle, -1, InfoType_CoreMask)). The game's threads would then land on core 3 at random,
+ * sharing it with the system's threads and with ours; __wrap_svcSetThreadCoreMask (--wrap, like threadCreate's)
+ * takes core 3 out of every mask of more than one core, unless banjo_system_core is 2.
+ */
+namespace {
+std::atomic<int> g_sys_state{0};  // 0: not read yet, 1: read
+std::atomic<unsigned> g_process_mask{0x7};
+std::atomic<int> g_system_core{-1};     // 3 when granted and banjo_system_core >= 1
+std::atomic<int> g_system_mode{0};
+std::atomic<unsigned> g_strip_mask{0};  // bits taken out of multi-core masks
+std::mutex g_sys_mutex;
+
+void ReadSystemCore(bool with_cvar) {
+  u64 mask = 0;
+  if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) || mask == 0) {
+    mask = 0x7;  // NetherSX2_nx's fallback: an application's usual three cores
+  }
+  mask &= 0xF;
+  // The top core, when four are granted (NetherSX2_nx: core_count >= 4 -> bg_core = the last of the list); with
+  // banjo_system_core_test, the highest of any two or more.
+  const bool test = with_cvar && REXCVAR_GET(banjo_system_core_test) && __builtin_popcountll(mask) >= 2;
+  const int top = (__builtin_popcountll(mask) >= 4 || test) ? 63 - __builtin_clzll(mask) : -1;
+  // Before the cvars are parsed (a thread made before main): the default layout.
+  const int mode = top < 0 ? 0 : (with_cvar ? int(REXCVAR_GET(banjo_system_core)) : 1);
+  g_process_mask.store(unsigned(mask), std::memory_order_relaxed);
+  g_system_mode.store(mode, std::memory_order_relaxed);
+  g_system_core.store(mode >= 1 ? top : -1, std::memory_order_relaxed);
+  g_strip_mask.store((top >= 0 && mode <= 1) ? (1u << top) : 0u, std::memory_order_relaxed);
+  g_sys_state.store(1, std::memory_order_release);
+}
+
+inline void EnsureSystemCore() {
+  if (g_sys_state.load(std::memory_order_acquire) == 0) {
+    std::lock_guard<std::mutex> lock(g_sys_mutex);
+    if (g_sys_state.load(std::memory_order_relaxed) == 0) ReadSystemCore(false);
+  }
+}
+
+#include "forwarder_npdm.inc"  // kForwarderNpdm (tools/forwarder)
+std::string g_npdm_status = "not checked";
+
+// RexSwitchSampleCoreIdle's last sample of each core (the report takes the difference between two of its reads).
+struct IdleSample {
+  std::atomic<u64> idle{0}, at{0};
+};
+IdleSample g_idle[4];
+}  // namespace
+
+Result __real_svcSetThreadCoreMask(Handle handle, s32 preferred_core, u32 affinity_mask);
+Result __wrap_svcSetThreadCoreMask(Handle handle, s32 preferred_core, u32 affinity_mask) {
+  EnsureSystemCore();
+  const u32 strip = g_strip_mask.load(std::memory_order_relaxed);
+  // A mask of more than one core loses the system core (an app core stays); a request for the system core alone
+  // (our background threads) goes through.
+  if (strip != 0 && (affinity_mask & strip) != 0 && (affinity_mask & ~strip) != 0) {
+    affinity_mask &= ~strip;
+    if (preferred_core >= 0 && (strip & (1u << preferred_core)) != 0) preferred_core = -1;
+  }
+  return __real_svcSetThreadCoreMask(handle, preferred_core, affinity_mask);
+}
+
+int RexSwitchInitSystemCore(void) {
+  {
+    std::lock_guard<std::mutex> lock(g_sys_mutex);
+    ReadSystemCore(true);
+  }
+  // The main thread: NetherSX2_nx's forwarder hands it over with the whole grant (restoreMainThreadAffinity).
+  const u32 strip = g_strip_mask.load(std::memory_order_relaxed);
+  if (strip != 0) {
+    s32 preferred = 0;
+    u64 mask = 0;
+    if (R_SUCCEEDED(svcGetThreadCoreMask(&preferred, &mask, CUR_THREAD_HANDLE)) && (mask & strip) != 0 &&
+        (mask & ~u64(strip)) != 0) {
+      svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, u32(mask));  // (the wrap takes the system core out)
+    }
+  }
+  return g_system_core.load(std::memory_order_relaxed);
+}
+
+unsigned RexSwitchProcessCoreMask(void) {
+  EnsureSystemCore();
+  return g_process_mask.load(std::memory_order_relaxed);
+}
+
+int RexSwitchSystemCore(void) {
+  EnsureSystemCore();
+  return g_system_core.load(std::memory_order_relaxed);
+}
+
+int RexSwitchSystemCoreMode(void) {
+  EnsureSystemCore();
+  return g_system_mode.load(std::memory_order_relaxed);
+}
+
+unsigned RexSwitchAppCoreMask(void) {
+  EnsureSystemCore();
+  return g_process_mask.load(std::memory_order_relaxed) & ~g_strip_mask.load(std::memory_order_relaxed);
+}
+
+bool RexSwitchMoveCurrentThreadToSystemCore(int priority) {
+  const int core = RexSwitchSystemCore();
+  if (core < 0) return false;
+  if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core))) return false;
+  if (priority >= 0) (void)RexSwitchSetCurrentThreadPriorityOk(priority);
+  return true;
+}
+
+void RexSwitchSampleCoreIdle(void) {
+  // banjo-nx (2026-10-27, ARM pass): the 100 ms test first, on the system counter (no system call); the core is asked
+  // only when a sample is due (the caller loops every 5 ms).
+  static std::atomic<u64> last_try{0};
+  const u64 now = armGetSystemTick();
+  if (now - last_try.load(std::memory_order_relaxed) < armNsToTicks(100000000ull)) return;  // 100 ms
+  last_try.store(now, std::memory_order_relaxed);
+  const int core = int(svcGetCurrentProcessorNumber());
+  if (core < 0 || core >= 4) return;
+  IdleSample& s = g_idle[core];
+  u64 idle = 0;
+  // Only the calling thread's own core can be asked (no handle; sub-type: that core).
+  if (R_FAILED(svcGetInfo(&idle, InfoType_IdleTickCount, INVALID_HANDLE, u64(core)))) return;
+  s.idle.store(idle, std::memory_order_relaxed);
+  s.at.store(now, std::memory_order_release);
+}
+
+// renut-nx (2026-11-01, the public build): whether 'program' is the id Sphaira's "Install Forwarder" gives a forwarder
+// of this NRO (sphaira source/owo.cpp, forwarder_path_hash and the tid functions): the first 8 bytes of the SHA-256 of
+// the NRO path written twice (the forwarder's arguments default to the path) as 05xxxxxxxxxxx000, or, in its native-game
+// mode, 01xxxxxxxxxxx000 with bit 12 clear; the path with "sdmc:" and without (its older installs). Checked against the
+// user's forwarder: "sdmc:/switch/banjo-nx/banjo-nx.nro" gives 05D6EA1333487000. A retail game's id (title takeover)
+// never matches, so its NPDM is never replaced.
+extern "C" int __system_argc;      // libnx: the NRO's path in argv[0] (as filesystem_posix.cpp)
+extern "C" char** __system_argv;
+static bool SphairaForwarderOfThisNro(u64 program) {
+  if (__system_argc <= 0 || !__system_argv || !__system_argv[0] || !__system_argv[0][0]) return false;
+  const std::string path = __system_argv[0];
+  const std::string rooted = path.rfind("sdmc:", 0) == 0 ? path.substr(5) : path;
+  for (const std::string& p : {std::string("sdmc:") + rooted, rooted}) {
+    const std::string hashed = p + p;
+    u64 digest[4] = {};
+    sha256CalculateHash(digest, hashed.data(), hashed.size());
+    const u64 h = digest[0];
+    if (program == (0x0500000000000000ull | (h & 0x00FFFFFFFFFFF000ull)) ||
+        program == (0x0100000000000000ull | (h & 0x00FFFFFFFFFFE000ull)))
+      return true;
+  }
+  return false;
+}
+
+int RexSwitchEnsureForwarderNpdm(void) {
+  const std::string want_text = REXCVAR_GET(banjo_forwarder_program_id);
+  if (want_text.empty()) {
+    g_npdm_status = "off (banjo_forwarder_program_id empty)";
+    return 0;
+  }
+  // mgsv-nx (2026-11-09): "auto" names no id of its own; Sphaira's forwarders of this NRO still match.
+  const bool automatic = want_text == "auto";
+  const u64 want = automatic ? 0 : std::strtoull(want_text.c_str(), nullptr, 16);
+  u64 program = 0;
+  // renut-nx (2026-11-01, the public build): also a forwarder Sphaira made for this NRO (SphairaForwarderOfThisNro):
+  // its id depends on the NRO's path, so a player's is not the user's.
+  if (R_FAILED(svcGetInfo(&program, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0)) || (want == 0 && !automatic) ||
+      ((want == 0 || program != want) && !SphairaForwarderOfThisNro(program))) {
+    char text[160];
+    std::snprintf(text, sizeof(text), "not written: running as %016llX, not the forwarder %016llX",
+                  (unsigned long long)program, (unsigned long long)want);
+    g_npdm_status = text;
+    return 0;
+  }
+  // The NPDM with this program id in ACI0 and in ACID's range.
+  unsigned char npdm[sizeof(kForwarderNpdm)];
+  std::memcpy(npdm, kForwarderNpdm, sizeof(npdm));
+  std::memcpy(npdm + kForwarderNpdmAci0 + 0x10, &program, 8);
+  std::memcpy(npdm + kForwarderNpdmAcid + 0x210, &program, 8);
+  std::memcpy(npdm + kForwarderNpdmAcid + 0x218, &program, 8);
+  char dir[96], path[128];
+  std::snprintf(dir, sizeof(dir), "sdmc:/atmosphere/contents/%016llX/exefs", (unsigned long long)program);
+  std::snprintf(path, sizeof(path), "%s/main.npdm", dir);
+  // Already there, the same bytes?
+  if (FILE* f = std::fopen(path, "rb")) {
+    unsigned char have[sizeof(npdm) + 1];
+    const size_t n = std::fread(have, 1, sizeof(have), f);
+    std::fclose(f);
+    if (n == sizeof(npdm) && std::memcmp(have, npdm, sizeof(npdm)) == 0) {
+      g_npdm_status = std::string("in place: ") + path;
+      return 1;
+    }
+  }
+  char part[96];
+  for (const char* sub : {"sdmc:/atmosphere", "sdmc:/atmosphere/contents"}) mkdir(sub, 0777);
+  std::snprintf(part, sizeof(part), "sdmc:/atmosphere/contents/%016llX", (unsigned long long)program);
+  mkdir(part, 0777);
+  mkdir(dir, 0777);
+  FILE* f = std::fopen(path, "wb");
+  const bool ok = f && std::fwrite(npdm, 1, sizeof(npdm), f) == sizeof(npdm);
+  if (f) std::fclose(f);
+  g_npdm_status = std::string(ok ? "written (launch the forwarder again for four cores): " : "could NOT be written: ") + path;
+  return ok ? 2 : -1;
+}
+
+bool RexSwitchSystemCoreXma(void) { return RexSwitchSystemCore() >= 0 && REXCVAR_GET(banjo_system_core_xma); }
+int RexSwitchSystemCoreMixerPriority(void) { return REXCVAR_GET(banjo_system_core_mixer_priority); }
+
+void RexSwitchSystemCoreDescribe(char* out, size_t out_len) {
+  if (!out || !out_len) return;
+  std::snprintf(out, out_len,
+                "process cores 0x%X, system core %d (banjo_system_core %d; game threads on 0x%X); forwarder NPDM %s",
+                RexSwitchProcessCoreMask(), RexSwitchSystemCore(), RexSwitchSystemCoreMode(), RexSwitchAppCoreMask(),
+                g_npdm_status.c_str());
+}
+
+bool RexSwitchCoreIdleSample(int core, unsigned long long* idle_ticks, unsigned long long* at_ticks) {
+  if (core < 0 || core >= 4) return false;
+  const IdleSample& s = g_idle[core];
+  const u64 at = s.at.load(std::memory_order_acquire);
+  if (at == 0) return false;
+  *idle_ticks = s.idle.load(std::memory_order_relaxed);
+  *at_ticks = at;
+  return true;
 }
 
 }  // extern "C"

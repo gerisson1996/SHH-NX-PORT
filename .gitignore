@@ -41,3 +41,6 @@ tools/switch/icon/*.jpg
 
 # --- The published release (the workflow in .github publishes it) ------------------
 !release/shh.nro
+
+# shh-nx (2026-11-11): the PGO profile (tools/pgo_merge.ps1)
+/pgo/

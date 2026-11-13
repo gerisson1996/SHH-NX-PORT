@@ -11,6 +11,8 @@ namespace sa2::render {
 // The current mode. shh-nx (2026-10-29, shh_resolution): the console's (docked / handheld, Reverse-NX respected,
 // sa2_render_mode.cpp); the PC is never docked.
 bool Docked();
+// shh-nx (2026-11-11): the picture is on a Switch OLED's own screen (the OLED model, not docked).
+bool OledScreen();
 
 // The render height set for a mode: the game's 720.
 inline int32_t RenderHeightOf(bool /*docked*/) { return 720; }

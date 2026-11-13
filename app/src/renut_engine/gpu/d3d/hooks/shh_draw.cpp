@@ -133,6 +133,113 @@ void SmallDrawLog(u32 device, const char *kind, u32 primitive, u32 count) {
   }
 }
 
+// shh-nx (2026-10-31): the conditional surveys (the lights' coronas and lens flares). The game counts the pixels of a
+// light's test draws in a survey (82912348 begin, 82912418 end: PA_SC_VIZ_QUERY and the VIZ_QUERY packet, ids 0-63)
+// and then draws its flare inside a conditional rendering block (829124D8 / 82912680: the id in a byte stack at device
+// +12122, its depth at +12187), which the draw packets carry and the Xenos skips when the survey saw nothing. Renut
+// drew them always: flares through walls, through the lamps' housings and through Alex's head.
+//
+// Here each survey is an occlusion query of its own (Video::SurveyLocked), named by its order in the guest frame, and
+// a conditional draw is dropped when the same survey of the last frame whose results are in saw no sample. The GPU is a
+// frame or two behind, so a flare appears and goes that much later; where the backend has no occlusion counts (only
+// deko3d has them) every flare is drawn, as before.
+constexpr u32 kDeviceOffsetConditionalIds = 12122;    // u8[], 1-based
+constexpr u32 kDeviceOffsetConditionalDepth = 12187;  // u8
+
+REXCVAR_DEFINE_STRING(shh_renut_conditional_draws, "survey", "Silent Hill/Renut",
+                      "Draws inside the game's conditional rendering (the lights' flares): survey (drawn when the "
+                      "light's survey saw it, as on the Xbox 360), draw (always), skip (never)")
+    .allowed({"survey", "draw", "skip"});
+REXCVAR_DEFINE_INT32(shh_renut_diag_viz, 0, "Silent Hill/Renut",
+                     "Diagnostic: this many seconds after the first draw, log the surveys and the conditional draws "
+                     "(200 lines); 0 = off");
+
+// The game thread's surveys of the guest frame: the frame (the device's swap count), the next ordinal, each id's last
+// ordinal (-1: none in this frame) and the open survey's.
+struct SurveyFrame {
+  u32 swap = ~0u;
+  u32 next = 0;
+  int ordinal_of[64];
+  int open = -1;
+};
+SurveyFrame g_surveys;
+
+bool VizLogDue() {
+  static const int32_t at = REXCVAR_GET(shh_renut_diag_viz);
+  if (at <= 0)
+    return false;
+  static const auto start = std::chrono::steady_clock::now();
+  static int32_t logged = 0;
+  if (std::chrono::steady_clock::now() - start < std::chrono::seconds(at))
+    return false;
+  return logged++ < 200;
+}
+
+// The frame's survey state, started again at each new guest frame.
+SurveyFrame &Surveys(native::Device d) {
+  const u32 swap = d.W(d3d::kDeviceOffsetSwapCount);
+  if (swap != g_surveys.swap) {
+    g_surveys.swap = swap;
+    g_surveys.next = 0;
+    g_surveys.open = -1;
+    std::fill(std::begin(g_surveys.ordinal_of), std::end(g_surveys.ordinal_of), -1);
+  }
+  return g_surveys;
+}
+
+void BeginSurvey(u32 device, u32 id) {
+  native::Device d = native::DeviceAt(device);
+  if (!d)
+    return;
+  SurveyFrame &f = Surveys(d);
+  f.open = -1;
+  f.ordinal_of[id & 63] = -1;
+  if (IsRecordingCommandBuffer(device) || f.next >= VideoState::kSurveys)
+    return;
+  const u32 ordinal = f.next++;
+  f.ordinal_of[id & 63] = int(ordinal);
+  f.open = int(ordinal);
+  FlushDeferredVertices(device);
+  render_thread::Queue([ordinal] { Video::SurveyLocked(ordinal, true); });
+  if (VizLogDue())
+    RGPU_INFO("[viz] survey begin id {} ordinal {}", id & 63, ordinal);
+}
+
+void EndSurvey(u32 device) {
+  native::Device d = native::DeviceAt(device);
+  if (!d)
+    return;
+  SurveyFrame &f = Surveys(d);
+  if (f.open < 0)
+    return;
+  const u32 ordinal = u32(f.open);
+  f.open = -1;
+  FlushDeferredVertices(device);
+  render_thread::Queue([ordinal] { Video::SurveyLocked(ordinal, false); });
+}
+
+// False when the draw is to be dropped.
+bool ConditionalDraw(u32 device) {
+  static const std::string mode = REXCVAR_GET(shh_renut_conditional_draws);
+  if (mode == "draw")
+    return true;
+  native::Device d = native::DeviceAt(device);
+  if (!d)
+    return true;
+  const u32 depth = d.B(kDeviceOffsetConditionalDepth);
+  if (!depth)
+    return true;
+  if (mode == "skip")
+    return false;
+  const u32 id = d.B(kDeviceOffsetConditionalIds + depth) & 63;
+  const int ordinal = Surveys(d).ordinal_of[id];
+  const int visible = ordinal >= 0 ? Video::SurveyVisible(u32(ordinal)) : -1;
+  if (VizLogDue())
+    RGPU_INFO("[viz] conditional id {} ordinal {}: {}", id, ordinal,
+              visible < 0 ? "unknown, drawn" : visible ? "seen, drawn" : "hidden, dropped");
+  return visible != 0;
+}
+
 void QueueOrRecord(u32 device, DrawCall &call) {
   if (IsRecordingCommandBuffer(device))
     RecordDraw(device, call, 0, 0);
@@ -148,6 +255,8 @@ void D3DDevice_DrawVertices_hook(u32 device, u32 primitive, u32 start_vertex, u3
   call.start_vertex = start_vertex;
   call.count = vertex_count;
   SmallDrawLog(device, "vertices", primitive, vertex_count);
+  if (!ConditionalDraw(device))
+    return;
   QueueOrRecord(device, call);
 }
 
@@ -163,6 +272,8 @@ void D3DDevice_DrawIndexedVertices_hook(u32 device, u32 primitive, u32 base_vert
   call.start_index = start_index;
   call.count = index_count;
   SmallDrawLog(device, "indices", primitive, index_count);
+  if (!ConditionalDraw(device))
+    return;
   QueueOrRecord(device, call);
 }
 
@@ -402,6 +513,20 @@ u32 D3DDevice_EndTiling(u32 device, u32 resolve_flags, u32 rects_va, u32 dest_te
 BANJO_RENUT_HOOK(sub_82908408, D3DDevice_DrawVertices_hook);         // DrawVertices
 BANJO_RENUT_HOOK(sub_829087F8, D3DDevice_DrawIndexedVertices_hook);  // DrawIndexedVertices
 BANJO_RENUT_HOOK(sub_82907640, D3DDevice_SetIndices_hook);           // SetIndices
+
+// The surveys: the game's own code (the device's stacks and packets), then the renderer's query.
+// void BeginConditionalSurvey(D3DDevice*, DWORD Identifier, DWORD Flags) [sub_82912348]
+BANJO_RENUT_HOOK_RAW(sub_82912348) {
+  const u32 device = ctx.r3.u32, id = ctx.r4.u32;
+  __imp__sub_82912348(ctx, base);
+  BeginSurvey(device, id);
+}
+// void EndConditionalSurvey(D3DDevice*, DWORD Flags) [sub_82912418]
+BANJO_RENUT_HOOK_RAW(sub_82912418) {
+  const u32 device = ctx.r3.u32;
+  __imp__sub_82912418(ctx, base);
+  EndSurvey(device);
+}
 
 // void D3DDevice_BeginTiling(D3DDevice*, DWORD Flags, UINT Count, const D3DRECT *pTileRects,
 //     const D3DVECTOR4 *pClearColor, float ClearZ, DWORD ClearStencil) [sub_82910B70]

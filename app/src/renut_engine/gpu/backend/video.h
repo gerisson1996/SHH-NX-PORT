@@ -44,6 +44,8 @@ constexpr uint32_t kFirstDynamicSamplerSlot = 2;
 // texture, and the guest words for 8_8_8_8 textures over its memory.
 constexpr plume::RenderFormat kDepthResolveFormat = plume::RenderFormat::R32_FLOAT;
 constexpr plume::RenderFormat kDepthResolveWordsFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+// shh-nx (2026-10-31, shh_fsr): FSR 1's EASU output (gamma space, as the game's frame).
+constexpr plume::RenderFormat kFsrTargetFormat = plume::RenderFormat::R8G8B8A8_UNORM;
 
 // Matches UtilityPush in shaders/host/utility.hlsli.
 struct UtilityPush {
@@ -53,8 +55,10 @@ struct UtilityPush {
   uint32_t sampler_index;
   float param0;
   float param1;
+  float param2;  // shh-nx (2026-11-11): present / fsr_rcas: the OLED black floor (scan_out.hlsli)
+  float param3;
 };
-static_assert(sizeof(UtilityPush) == 32);
+static_assert(sizeof(UtilityPush) == 40);
 
 // Matches StreamConvertPush in shaders/host/stream_convert_cs.hlsl.
 constexpr uint32_t kStreamConvertMaxElements = 8;
@@ -137,6 +141,11 @@ struct VideoState {
   std::unique_ptr<plume::RenderQueryPool> timestamps[kFramesInFlight];
   uint32_t timed_lists[kFramesInFlight] = {};  // pairs begun in the slot's frame
   bool timing_open = false;                    // the open list wrote its first timestamp
+  // shh-nx (2026-10-31): the game's conditional surveys (shh_draw.cpp), one occlusion query each, by their order in
+  // the guest frame; read once the slot's fence has been waited. Null where the backend has no occlusion counts.
+  static constexpr uint32_t kSurveys = 128;
+  std::unique_ptr<plume::RenderQueryPool> surveys[kFramesInFlight];
+  uint32_t survey_count[kFramesInFlight] = {};  // queries begun in the slot's frame (ordinal + 1 of the last)
   // Swapchain; present semaphores are per swapchain image (a binary semaphore
   // can only be re-signalled once its image has been re-acquired).
   std::unique_ptr<plume::RenderSwapChain> swap_chain;
@@ -168,6 +177,13 @@ struct VideoState {
   std::unique_ptr<plume::RenderShader> present_vs;
   std::unique_ptr<plume::RenderShader> present_ps;
   std::unique_ptr<plume::RenderPipeline> present_pipeline;
+  // shh-nx (2026-10-31, shh_fsr): FSR 1 at scan-out (present.cpp): EASU into fsr_target (the output viewport's size),
+  // then RCAS with the scan-out's colour steps onto the back buffer. Optional: without them the frame is scaled
+  // bilinearly, as before.
+  std::unique_ptr<plume::RenderShader> fsr_easu_ps;
+  std::unique_ptr<plume::RenderShader> fsr_rcas_ps;
+  std::unique_ptr<plume::RenderPipeline> fsr_easu_pipeline;
+  std::unique_ptr<plume::RenderPipeline> fsr_rcas_pipeline;
   float output_gamma = 1.0f;
   // The guest texture the last Swap scanned out; stall presents (the guest not
   // presenting for a while) show it again rather than a black frame.
@@ -297,6 +313,11 @@ public:
   // delta (the 10-bit values << 6). Silent Hill sets its gamma this way.
   static void SetGammaRamp(const uint8_t *big_endian_words, bool pwl = false);
 
+  // shh-nx (2026-10-31): the conditional surveys' results, any thread: whether the survey with this ordinal in the guest
+  // frame saw a sample the last time a frame's results were read (1), saw none (0), or is unknown (-1: no occlusion
+  // counts, no result yet, or the counter never moved).
+  static int SurveyVisible(uint32_t ordinal);
+
   // The guest D3DDevice (guest VA) created by the Direct3D_CreateDevice hook.
   static void SetGuestDevice(uint32_t device_va);
   static uint32_t GuestDevice();
@@ -311,6 +332,8 @@ public:
   static void KickLocked();
   static void NoteDrawLocked();
   static plume::RenderCommandList *CommandListLocked();
+  // shh-nx (2026-10-31): a conditional survey's begin or end, by its ordinal in the guest frame (in the draws' order).
+  static void SurveyLocked(uint32_t ordinal, bool begin);
   static UploadRing &UploadsLocked();
 
   static uint32_t AllocateTextureSlotLocked();

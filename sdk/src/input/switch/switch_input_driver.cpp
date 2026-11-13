@@ -27,6 +27,9 @@
 
 #include <switch.h>
 
+#include <algorithm>
+#include <cmath>
+
 // Face buttons. By letter (shh-nx, 2026-10-29, the user's choice: the default again): the Switch's A acts as A, B as
 // B, X as X and Y as Y, as in other Switch games. true = by position, as on the Xbox 360 pad the game was made for: the
 // bottom button (B on Switch controllers) acts as A, the right one (A) as B, the left one (Y) as X and the top one (X)
@@ -68,6 +71,19 @@ REX_INPUT_MAP_CVARS(p2, "Player 2");
 // the grip (input_joycon_sideways_stick). SL and SR are the triggers (ZL / ZR: the camera in Sonic Adventure 2), the
 // minus or plus button is Start, the stick is the left stick. false = held upright (the system's default; no
 // remapping).
+// Gyro aiming: the controller's turn rate is added to the right stick.
+// shh-nx: Silent Hill aims with ZL, so the gyro aims while ZL is held.
+REXCVAR_DEFINE_INT32(input_gyro_mode, 1, "Input",
+                     "Gyro aiming: 0 = off, 1 = while ZL is held, 2 = always, 3 = while ZR is held");
+REXCVAR_DEFINE_DOUBLE(input_gyro_speed, 4.0, "Input", "Gyro aiming: speed, as a multiple of kGyroFullStick's");
+REXCVAR_DEFINE_BOOL(input_gyro_invert_y, false, "Input", "Gyro aiming: tilting up looks down");
+REXCVAR_DEFINE_BOOL(input_gyro_invert_x, false, "Input", "Gyro aiming: turning right looks left");
+REXCVAR_DEFINE_DOUBLE(input_gyro_speed_y, 1.0, "Input", "Gyro aiming: vertical speed, as a multiple of the horizontal");
+REXCVAR_DEFINE_DOUBLE(input_gyro_deadzone, 2.0, "Input",
+                      "Gyro aiming: degrees a second ignored as a shaking hand (0 = none)");
+REXCVAR_DEFINE_DOUBLE(input_gyro_smoothing, 0.5, "Input",
+                      "Gyro aiming: smoothing of slow turns, 0 = none, 1 = most (fast turns are never smoothed)");
+
 REXCVAR_DEFINE_BOOL(input_joycon_sideways, true, "Input",
                     "Single Joy-Cons are held sideways, one per player (face buttons, stick and SL/SR turned "
                     "accordingly)")
@@ -313,6 +329,90 @@ enum class RepeatState {
   kWaiting,    // a button is held and the delay is awaited
   kRepeating,  // actively repeating at a rate
 };
+
+// Gyro aiming. angular_velocity is in turns per second. With the console held in front of you x points right, y up and
+// z at you: a turn to the right is negative about y (z too, when it lies flatter), and raising the aim is positive
+// about x.
+constexpr float kGyroFullStick = 0.4f;   // turns per second that are a full stick at speed 1
+constexpr float kGyroNoise = 0.006f;     // about 2 degrees a second: a steady hand, not an aim
+constexpr float kGyroStickFloor = 0.2f;  // games ignore a small stick: a slow turn must still get past that
+// Past this much right stick (of 32767) the stick aims alone: added together, the gyro's floor and the stick's value
+// fought and the aim jumped.
+constexpr float kGyroStickOverride = 0.25f * 32767.0f;
+
+struct GyroSensors {
+  bool started = false;
+  HidSixAxisSensorHandle handheld{};
+  HidSixAxisSensorHandle full_key{};
+  HidSixAxisSensorHandle joy_dual[2]{};
+};
+GyroSensors g_gyro;
+
+void StartGyro() {
+  if (g_gyro.started)
+    return;
+  g_gyro.started = true;
+  Result rc = hidGetSixAxisSensorHandles(&g_gyro.handheld, 1, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
+  if (R_SUCCEEDED(rc))
+    rc = hidGetSixAxisSensorHandles(&g_gyro.full_key, 1, HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey);
+  if (R_SUCCEEDED(rc))
+    rc = hidGetSixAxisSensorHandles(g_gyro.joy_dual, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual);
+  if (R_SUCCEEDED(rc))
+    rc = hidStartSixAxisSensor(g_gyro.handheld);
+  if (R_SUCCEEDED(rc))
+    rc = hidStartSixAxisSensor(g_gyro.full_key);
+  for (HidSixAxisSensorHandle handle : g_gyro.joy_dual) {
+    if (R_SUCCEEDED(rc))
+      rc = hidStartSixAxisSensor(handle);
+  }
+  if (R_FAILED(rc))
+    REXLOG_ERROR("SwitchInputDriver: the gyro did not start: 0x{:08X}", rc);
+  else
+    REXLOG_INFO("SwitchInputDriver: gyro started");
+}
+
+// The turn rate of the controller in this pad, false when it has no gyro we started.
+bool ReadGyro(const PadState& pad, HidVector& rate) {
+  const u32 style = padGetStyleSet(&pad);
+  HidSixAxisSensorHandle handle;
+  if (style & HidNpadStyleTag_NpadHandheld)
+    handle = g_gyro.handheld;
+  else if (style & HidNpadStyleTag_NpadFullKey)
+    handle = g_gyro.full_key;
+  else if (style & HidNpadStyleTag_NpadJoyDual)
+    handle = g_gyro.joy_dual[1];  // the right Joy-Con, in the aiming hand
+  else
+    return false;
+  HidSixAxisSensorState state{};
+  if (hidGetSixAxisSensorStates(handle, &state, 1) == 0)
+    return false;
+  rate = state.angular_velocity;
+  return true;
+}
+
+// Soft tiered smoothing (as gyro mappers do): a slow turn, where the hand shakes, is averaged over the last frames; a
+// fast one passes untouched so a flick stays a flick. state is per pad and axis, reset when the gyro lets go.
+float SmoothGyro(float rate, float& state) {
+  const float amount = std::clamp(float(REXCVAR_GET(input_gyro_smoothing)), 0.0f, 1.0f);
+  if (amount <= 0.0f) {
+    state = rate;
+    return rate;
+  }
+  const float slow = 4.0f * kGyroNoise;  // under this the turn is fully smoothed, over twice it not at all
+  const float direct = std::clamp((std::fabs(rate) - slow) / slow, 0.0f, 1.0f);
+  const float keep = amount * 0.8f * (1.0f - direct);
+  state = state * keep + rate * (1.0f - keep);
+  return state;
+}
+
+// A rate as a stick axis, -1..1: nothing under the noise, and past it from the floor up.
+float GyroStick(float rate, float full) {
+  const float noise = std::max(float(REXCVAR_GET(input_gyro_deadzone)), 0.0f) / 360.0f;
+  if (std::fabs(rate) < noise || rate == 0.0f)
+    return 0.0f;
+  const float amount = std::min(std::fabs(rate) / full, 1.0f);
+  return std::copysign(kGyroStickFloor + amount * (1.0f - kGyroStickFloor), rate);
+}
 
 int16_t ClampStickAxis(s32 value) {
   return static_cast<int16_t>(std::clamp<s32>(value, INT16_MIN, INT16_MAX));
@@ -626,6 +726,27 @@ void SwitchInputDriver::Poll(size_t index) {
   gamepad.thumb_ly = ClampStickAxis(left.y);
   gamepad.thumb_rx = ClampStickAxis(right.x);
   gamepad.thumb_ry = ClampStickAxis(right.y);
+  const int32_t gyro_mode = REXCVAR_GET(input_gyro_mode);
+  if (gyro_mode != 0 && index <= 1) {
+    StartGyro();
+    HidVector rate{};
+    const bool gyro_held = gyro_mode == 2 || (gyro_mode == 1 && (held & table.left_trigger)) ||
+                           (gyro_mode == 3 && (held & table.right_trigger));
+    const bool stick_aims = std::hypot(float(right.x), float(right.y)) > kGyroStickOverride;
+    static float smooth[2][2] = {};
+    float* axes = smooth[index];
+    if (gyro_held && !stick_aims && ReadGyro(slot.pad, rate)) {
+      const float full = kGyroFullStick / std::max(float(REXCVAR_GET(input_gyro_speed)), 0.1f);
+      const float full_y = full / std::max(float(REXCVAR_GET(input_gyro_speed_y)), 0.1f);
+      const float x = GyroStick(SmoothGyro(-(rate.y + rate.z), axes[0]), full) *
+                      (REXCVAR_GET(input_gyro_invert_x) ? -1.0f : 1.0f);
+      const float y = GyroStick(SmoothGyro(rate.x, axes[1]), full_y) * (REXCVAR_GET(input_gyro_invert_y) ? -1.0f : 1.0f);
+      gamepad.thumb_rx = ClampStickAxis(right.x + s32(x * 32767.0f));
+      gamepad.thumb_ry = ClampStickAxis(right.y + s32(y * 32767.0f));
+    } else {
+      axes[0] = axes[1] = 0.0f;
+    }
+  }
   /*
    * With the debug overlay open, L+R and the right stick move it (debug_overlay.cpp,
    * on the UI thread). While L and R are held, the game sees neither those two

@@ -213,6 +213,11 @@ namespace plume {
         virtual void discardTexture(const RenderTexture* texture) = 0; // D3D12 only.
         virtual void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) = 0;
         virtual void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) = 0;
+        // shh-nx (2026-10-31): occlusion counts, for Silent Hill's conditional surveys. On a pool from
+        // createOcclusionQueryPool, query i counts the samples that passed between its begin and its end. Backends
+        // without it do nothing.
+        virtual void beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) { (void)queryPool; (void)queryIndex; }
+        virtual void endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) { (void)queryPool; (void)queryIndex; }
 
         // Concrete implementation shortcuts.
         inline void barriers(RenderBarrierStages stages, const RenderBufferBarrier &barrier) {
@@ -308,6 +313,8 @@ namespace plume {
         virtual std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() = 0;
         virtual std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) = 0;
         virtual std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) = 0;
+        // shh-nx (2026-10-31): null where the backend has no occlusion counts (beginOcclusionQuery).
+        virtual std::unique_ptr<RenderQueryPool> createOcclusionQueryPool(uint32_t queryCount) { (void)queryCount; return nullptr; }
         virtual void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild = true, bool preferFastTrace = false) = 0;
         virtual void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild = true, bool preferFastTrace = false) = 0;
         virtual void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) = 0;

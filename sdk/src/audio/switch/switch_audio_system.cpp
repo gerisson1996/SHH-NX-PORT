@@ -27,6 +27,9 @@
 // Passive counters: the audio thread neither writes reports nor pauses the game.
 extern "C" void RexSwitchPerfAdd(unsigned id, u64 value);
 extern "C" void RexSwitchPerfMax(unsigned id, u64 value);
+// shh-nx (2026-11-11, from mgsv-nx): the system core (core/threading_switch.h clashes with switch.h).
+extern "C" bool RexSwitchMoveCurrentThreadToSystemCore(int priority);
+extern "C" void RexSwitchSampleCoreIdle(void);
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 REXCVAR_DEFINE_BOOL(audio_switch_pump, true, "Audio",
@@ -410,12 +413,16 @@ void SwitchAudioSystem::PumpTick() {
 
 void SwitchAudioSystem::OutputThreadMain() {
   Output& output = *output_;
+  // shh-nx (2026-11-11, from mgsv-nx): on the system core when the process has it (four-core mode), above the Audio
+  // Worker there (Horizon does not preempt between equal priorities); it also samples that core's idle time.
+  const bool on_system_core = RexSwitchMoveCurrentThreadToSystemCore(kOutputThreadPriority - 1);
   for (size_t i = 0; i < output.buffer_count; ++i) {
     FillAndAppend(i);
   }
   const u64 interval = armNsToTicks(kPumpIntervalNs);
   u64 deadline = armGetSystemTick() + interval;
   while (output.running.load(std::memory_order_relaxed)) {
+    if (on_system_core) RexSwitchSampleCoreIdle();  // at most every 100 ms
     u64 timeout_ns = kWaitTimeoutNs;
     if (output.pump) {
       const u64 now = armGetSystemTick();

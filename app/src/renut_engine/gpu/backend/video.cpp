@@ -45,6 +45,8 @@
 #include "host_shaders/depth_resolve_ms_ps.spirv.h"
 #include "host_shaders/depth_resolve_ps.spirv.h"
 #include "host_shaders/present_ps.spirv.h"
+#include "host_shaders/fsr_easu_ps.spirv.h"  // shh-nx (2026-10-31, shh_fsr)
+#include "host_shaders/fsr_rcas_ps.spirv.h"
 #include "host_shaders/present_vs.spirv.h"
 #include "host_shaders/rectangle_list_gs.spirv.h"
 #include "host_shaders/point_sprite_gs.spirv.h"
@@ -56,6 +58,8 @@
 #include "host_shaders/depth_resolve_ms_ps.deko3d.h"
 #include "host_shaders/depth_resolve_ps.deko3d.h"
 #include "host_shaders/present_ps.deko3d.h"
+#include "host_shaders/fsr_easu_ps.deko3d.h"  // shh-nx (2026-10-31, shh_fsr)
+#include "host_shaders/fsr_rcas_ps.deko3d.h"
 #include "host_shaders/present_vs.deko3d.h"
 #include "host_shaders/rectangle_list_gs.deko3d.h"
 #include "host_shaders/point_sprite_gs.deko3d.h"
@@ -68,6 +72,8 @@
 #include "host_shaders/depth_resolve_ms_ps.dxil.h"
 #include "host_shaders/depth_resolve_ps.dxil.h"
 #include "host_shaders/present_ps.dxil.h"
+#include "host_shaders/fsr_easu_ps.dxil.h"  // shh-nx (2026-10-31, shh_fsr)
+#include "host_shaders/fsr_rcas_ps.dxil.h"
 #include "host_shaders/present_vs.dxil.h"
 #include "host_shaders/rectangle_list_gs.dxil.h"
 #include "host_shaders/point_sprite_gs.dxil.h"
@@ -279,6 +285,26 @@ bool BuildPresentPipeline(VideoState &s) {
     return false;
   }
   s.present_pipeline->setName("renut present");
+
+  // shh-nx (2026-10-31, shh_fsr): optional, the plain scan-out stays when they fail.
+  s.fsr_easu_ps = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(fsr_easu_ps), "fsr_easu_ps");
+  s.fsr_rcas_ps = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(fsr_rcas_ps), "fsr_rcas_ps");
+  if (s.fsr_easu_ps && s.fsr_rcas_ps) {
+    desc.pixelShader = s.fsr_easu_ps.get();
+    desc.renderTargetFormat[0] = kFsrTargetFormat;
+    s.fsr_easu_pipeline = s.device->createGraphicsPipeline(desc);
+    desc.pixelShader = s.fsr_rcas_ps.get();
+    desc.renderTargetFormat[0] = kSwapChainFormat;
+    s.fsr_rcas_pipeline = s.device->createGraphicsPipeline(desc);
+  }
+  if (s.fsr_easu_pipeline && s.fsr_rcas_pipeline) {
+    s.fsr_easu_pipeline->setName("shh-nx FSR 1 EASU");
+    s.fsr_rcas_pipeline->setName("shh-nx FSR 1 RCAS");
+  } else {
+    s.fsr_easu_pipeline.reset();
+    s.fsr_rcas_pipeline.reset();
+    RGPU_WARN("FSR 1 pipelines unavailable: the frame is scaled bilinearly");
+  }
   return true;
 }
 
@@ -596,6 +622,40 @@ plume::RenderCommandList *SlotList(VideoState &s, uint32_t slot) {
 
 namespace {
 
+// shh-nx (2026-10-31): the surveys' results, published for the game thread (Video::SurveyVisible). A frame with fewer
+// surveys leaves the later ordinals as they were. If the samples counter never moves (no survey has seen a sample after
+// many), the results are not trusted: every flare is drawn, as before.
+std::atomic<int8_t> g_survey_visible[VideoState::kSurveys];
+std::atomic<uint32_t> g_survey_published{0};
+std::atomic<bool> g_survey_counter_dead{false};
+uint64_t g_survey_total = 0, g_survey_seen = 0;
+
+void CollectSurveys(VideoState &s, uint32_t slot) {
+  const uint32_t count = s.survey_count[slot];
+  s.survey_count[slot] = 0;
+  plume::RenderQueryPool *pool = s.surveys[slot].get();
+  if (!pool || !count)
+    return;
+  pool->queryResults(count);
+  const uint64_t *samples = pool->getResults();
+  for (uint32_t i = 0; i < count; ++i) {
+    const bool visible = samples[i] != 0;
+    g_survey_visible[i].store(visible ? 1 : 0, std::memory_order_relaxed);
+    ++g_survey_total;
+    g_survey_seen += visible;
+  }
+  g_survey_published.store(std::max(g_survey_published.load(std::memory_order_relaxed), count),
+                           std::memory_order_release);
+  static bool logged = false;
+  if (!logged && g_survey_total >= 2000) {
+    logged = true;
+    const bool dead = g_survey_seen == 0;
+    g_survey_counter_dead.store(dead, std::memory_order_release);
+    RGPU_INFO("[viz] occlusion surveys: {} of {} saw samples{}", g_survey_seen, g_survey_total,
+              dead ? " (the counter never moved: every flare is drawn)" : "");
+  }
+}
+
 // After the slot's fence has been waited: its frame's GPU time, the sum of its
 // lists' spans (so the gaps where the GPU waited on the CPU are left out).
 void CollectGpuTime(VideoState &s, uint32_t slot) {
@@ -768,6 +828,7 @@ void WaitSlotLocked(VideoState &s, uint32_t slot) {
   NoteGpuDoneSeenLocked(slot, true);
   s.submitted[slot] = false;
   CollectGpuTime(s, slot);
+  CollectSurveys(s, slot);
   gpu_profile::Collect(s, slot);
   // banjo-nx (2026-10-19, banjo_deko3d_kick_submit): every list of the slot's frame has run: its kick lists are free.
   s.kick_lists_used[slot] = 0;
@@ -929,6 +990,7 @@ bool Video::CreateHostDevice() {
       return false;
     if (s.device->getCapabilities().queryPools)
       s.timestamps[i] = s.device->createQueryPool(2 * VideoState::kTimedLists);
+    s.surveys[i] = s.device->createOcclusionQueryPool(VideoState::kSurveys);  // shh-nx: null without occlusion counts
   }
 
   // One image beyond the frames in flight, so acquiring never waits on scanout.
@@ -1153,6 +1215,26 @@ void Video::KickLocked() {
 
 plume::RenderCommandList *Video::CommandListLocked() {
   return State().command_list;
+}
+
+void Video::SurveyLocked(uint32_t ordinal, bool begin) {
+  auto &s = State();
+  plume::RenderQueryPool *pool = s.surveys[s.frame].get();
+  if (!pool || ordinal >= VideoState::kSurveys || !EnsureCommandListLocked())
+    return;
+  if (begin) {
+    s.command_list->beginOcclusionQuery(pool, ordinal);
+  } else {
+    s.command_list->endOcclusionQuery(pool, ordinal);
+    s.survey_count[s.frame] = std::max(s.survey_count[s.frame], ordinal + 1);
+  }
+}
+
+int Video::SurveyVisible(uint32_t ordinal) {
+  if (ordinal >= VideoState::kSurveys || ordinal >= detail::g_survey_published.load(std::memory_order_acquire) ||
+      detail::g_survey_counter_dead.load(std::memory_order_acquire))
+    return -1;
+  return detail::g_survey_visible[ordinal].load(std::memory_order_relaxed);
 }
 
 UploadRing &Video::UploadsLocked() {

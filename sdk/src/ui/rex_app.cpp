@@ -56,6 +56,9 @@ extern u32 __nx_applet_exit_mode;
 NX_NORETURN void __libnx_exit(int rc);
 void RexSwitchNeonProbe(void);
 void RexSwitchRedirectStderr(void);  // switch_crash_hooks.c
+// shh-nx (2026-11-11, from mgsv-nx): the four-core mode (core/threading_switch.cpp).
+int RexSwitchInitSystemCore(void);
+int RexSwitchEnsureForwarderNpdm(void);
 }
 #endif
 
@@ -189,6 +192,10 @@ bool ReXApp::SetupEnvironment() {
 #if defined(__SWITCH__)
   // sa2-nx: stderr (Mesa's and the SDK's warnings) to logs/rex/rex_stderr.log only with the file log on.
   if (REXCVAR_GET(log_to_file)) RexSwitchRedirectStderr();
+  // shh-nx (2026-11-11, from mgsv-nx): the four-core mode's keys as shh.toml sets them (main read them before the
+  // toml), and the forwarder's NPDM.
+  RexSwitchInitSystemCore();
+  RexSwitchEnsureForwarderNpdm();
 #endif
 
   // Late-phase logging

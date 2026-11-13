@@ -25,6 +25,12 @@ extern "C" {
 // libnx runtime internals used for the exit below.
 extern u32 __nx_applet_exit_mode;
 NX_NORETURN void __libnx_exit(int rc);
+// shh-nx (2026-11-11, from mgsv-nx): the system core (core/threading_switch.cpp).
+int RexSwitchInitSystemCore(void);
+unsigned RexSwitchProcessCoreMask(void);
+int RexSwitchSystemCoreMode(void);
+unsigned RexSwitchAppCoreMask(void);
+int RexSwitchEnsureForwarderNpdm(void);
 }
 
 namespace {
@@ -61,6 +67,15 @@ int main(int argc, char* argv[]) {
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
+
+  // shh-nx (2026-11-11, from mgsv-nx; NetherSX2_nx's 4-core mode): once the cvars are read and before any thread of
+  // ours starts; the main thread leaves the system core.
+  {
+    const int system_core = RexSwitchInitSystemCore();
+    RexSwitchEnsureForwarderNpdm();
+    REXLOG_INFO("Switch: process cores 0x{:X}; system core {} (banjo_system_core {}; game threads on 0x{:X})",
+                RexSwitchProcessCoreMask(), system_core, RexSwitchSystemCoreMode(), RexSwitchAppCoreMask());
+  }
 
   int result;
   {

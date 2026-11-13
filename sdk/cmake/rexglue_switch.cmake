@@ -93,7 +93,9 @@ if(NOT TARGET rexglue_switch_startup)
         "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
         "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx"
         "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
-        "LINKER:--wrap=svcSleepThread")
+        "LINKER:--wrap=svcSleepThread"
+        # shh-nx (2026-11-11, from mgsv-nx): the four-core mode keeps the game threads off the system core.
+        "LINKER:--wrap=svcSetThreadCoreMask")
 endif()
 
 function(rexglue_switch_configure_target target_name)

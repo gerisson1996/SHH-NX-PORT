@@ -512,6 +512,12 @@ X_STATUS XThread::Create() {
     rex::initialize_seh_thread();
 #if REX_PLATFORM_SWITCH
     RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, thread_name_));
+    // shh-nx (2026-11-11, from mgsv-nx): with four cores, the Audio Worker on the system core alone (and the XMA
+    // Decoder with banjo_system_core_xma), at the audio priority; the output thread is above them there.
+    if (!guest_thread_ && (std::string_view(thread_name_).starts_with("Audio Worker") ||
+                           (std::string_view(thread_name_).starts_with("XMA Decoder") && RexSwitchSystemCoreXma()))) {
+      (void)RexSwitchMoveCurrentThreadToSystemCore(REX_SWITCH_PRIO_AUDIO);
+    }
     // sa2-nx (2026-10-20): known to the pthread layer by its kernel handle, so another thread can set its cores
     // (RexSetGuestThreadCoreLayout: the registry was empty, and setting another thread's mask failed quietly).
     RexSwitchRegisterCurrentThread();

@@ -18,7 +18,12 @@ cr_as_local = true
 ctr_as_local = true
 xer_as_local = true
 reserved_as_local = true
-non_volatile_as_local = false
+# CPU, stage 2 (2026-11-11): r14-r31, f14-f31, v14-v31/v64-v127 as C++ locals and no `ctx.lr = ...` before each
+# call (sa2-nx's diet). It crashed in sub_8240AAD0 on 2026-10-30, before gap code reading its owner's live registers
+# was marked share_registers (app/huecos.toml). No hook reads ctx.r14+/f14+/v14+; ctx.lr is read only by
+# switch_perf's caller attribution. Stage 1 code: out/gen_backup_stage1.
+non_volatile_as_local = true
+elide_lr_stores = true
 skip_msr = true
 dform_disp_split = true
 div_inline = true
@@ -47,3 +52,10 @@ longjmp_address = 0x8292CB00
 # analysis did not mark as function starts. The analyzer finds their bounds.
 "0x827EB5B8" = {}   # b from 0x827EBF1C
 "0x8269CC98" = {}   # b from 0x82553448
+
+# Stage 2 (2026-11-11): functions the analysis found that read a non-volatile register before writing it
+# (tools/lee_antes.py), so they keep their caller's registers in ctx. Gap code is marked in app/huecos.toml instead.
+"0x82938D24" = { share_registers = true }   # starts with lwz r20,-29360(r19): r19 from the code before it
+"0x829515D0" = { share_registers = true }   # reads v92 first (vector math with a caller-set constant)
+"0x829518B0" = { share_registers = true }   # same
+"0x82951D08" = { share_registers = true }   # same

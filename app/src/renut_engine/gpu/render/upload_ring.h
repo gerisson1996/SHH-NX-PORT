@@ -25,7 +25,7 @@ namespace renut::gpu {
 // banjo-nx (2026-10-18): 256 registers and a zero register after them (tools/deko3d_glsl_opt.py, pass bonerow: a
 // relative read clamped to 256 reads zeros instead of selecting them).
 constexpr uint32_t kFloatConstantsUboBytes = 256 * 16 + 16;
-constexpr uint32_t kSharedConstantsUboBytes = 1360;  // sizeof(SharedConstants), render/draw.cpp (2026-10-19: + pixel origin)
+constexpr uint32_t kSharedConstantsUboBytes = 1472;  // sizeof(SharedConstants), render/draw.cpp (2026-10-19: + pixel origin; shh-nx 2026-10-31: + the user clip planes)
 
 struct UploadAllocation {
   plume::RenderBufferReference ref;  // buffer + offset, for copies / views

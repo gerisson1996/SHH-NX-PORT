@@ -295,7 +295,8 @@ namespace plume {
         Deko3DDevice *device = nullptr;
         DkMemBlock block = nullptr;
         std::vector<uint64_t> results;
-        Deko3DQueryPool(Deko3DDevice *device, uint32_t count);
+        bool occlusion = false;  // shh-nx (2026-10-31): two SamplesPassed reports a query, begin and end
+        Deko3DQueryPool(Deko3DDevice *device, uint32_t count, bool occlusion = false);
         ~Deko3DQueryPool() override;
         void queryResults() override;
         bool queryResults(uint32_t count) override;
@@ -409,6 +410,8 @@ namespace plume {
         void discardTexture(const RenderTexture *texture) override;
         void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+        void beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+        void endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
 
         // banjo-nx: the blend constant (BLEND_FACTOR), which plume has no call for.
         void setBlendConstant(const float rgba[4]);
@@ -577,6 +580,7 @@ namespace plume {
         std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
         std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
         std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
+        std::unique_ptr<RenderQueryPool> createOcclusionQueryPool(uint32_t queryCount) override;
         void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override;
         void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override;
         void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override;
