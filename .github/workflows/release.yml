@@ -1,6 +1,7 @@
-# Publishes release/shh.nro as the v1.0 release: the NRO, and a zip with the SD card's layout (the NRO and, when
-# release/deko3d_shaders.bin is there, the prebuilt shader cache), with the notes in .github/release-v1.0.md. Runs when
-# one of them or this file is pushed to main; an existing release gets its files and notes replaced.
+# Publishes release/shh.nro as the release named by release/VERSION (for example 1.1 -> tag v1.1): the NRO, and a zip
+# with the SD card's layout (the NRO and, when release/deko3d_shaders.bin is there, the prebuilt shader cache), with the
+# notes in .github/release-v<VERSION>.md. Runs when one of them or this file is pushed to main; an existing release of
+# that version gets its files and notes replaced.
 name: Release
 
 on:
@@ -9,7 +10,8 @@ on:
     paths:
       - release/shh.nro
       - release/deko3d_shaders.bin
-      - .github/release-v1.0.md
+      - release/VERSION
+      - .github/release-v*.md
       - .github/workflows/release.yml
 
 permissions:
@@ -20,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Publish v1.0
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -28,16 +30,24 @@ jobs:
             echo "release/shh.nro is not in the repository: nothing to publish"
             exit 0
           fi
+          VER=1.0
+          if [ -f release/VERSION ]; then
+            VER=$(tr -d ' \r\n' < release/VERSION)
+          fi
+          TAG="v$VER"
+          NOTES=".github/release-v$VER.md"
+          ZIP="SHH-NX-V$VER.zip"
+          TITLE="Silent Hill Homecoming NX - V$VER"
           mkdir -p pkg/switch/shh-nx
           cp release/shh.nro pkg/switch/shh-nx/shh.nro
           if [ -f release/deko3d_shaders.bin ]; then
             cp release/deko3d_shaders.bin pkg/switch/shh-nx/deko3d_shaders.bin
           fi
-          (cd pkg && zip -9 -r ../SHH-NX-V1.0.zip switch)
-          if gh release view v1.0 >/dev/null 2>&1; then
-            gh release upload v1.0 release/shh.nro SHH-NX-V1.0.zip --clobber
-            gh release edit v1.0 --title "Silent Hill Homecoming NX — V1.0" --notes-file .github/release-v1.0.md
+          (cd pkg && zip -9 -r "../$ZIP" switch)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/shh.nro "$ZIP" --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES"
           else
-            gh release create v1.0 release/shh.nro SHH-NX-V1.0.zip --target "$GITHUB_SHA" \
-              --title "Silent Hill Homecoming NX — V1.0" --notes-file .github/release-v1.0.md
+            gh release create "$TAG" release/shh.nro "$ZIP" --target "$GITHUB_SHA" --latest \
+              --title "$TITLE" --notes-file "$NOTES"
           fi
